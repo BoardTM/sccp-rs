@@ -1,4 +1,4 @@
-# sccp-rs -> "Skinny Client Control Protocol" implemented in Rust
+# sccp-rs -> Cisco SCCP implemented in Rust
 
 This is repo contains three things
 
@@ -16,15 +16,35 @@ This project shoots in the same direction as PJSIP by separating the **protocol*
 
 ## SCCP Protocol (sccp-protocol)
 
+The [sccp-protocol](https://crates.io/crates/sccp-protocol) crate provides a typed SCCP wire codec and an asynchronous [Tokio](https://tokio.rs/) server for building call-control applications around Cisco SCCP phones. It handles message framing and serialization, registration and session lifecycle, phone provisioning, call and media control, soft keys, QoS, and Cisco IP Phone XML. Applications receive strongly typed events from connected phones and send typed commands through a cloneable server handle.
+
+The crate deliberately contains no SIP or PBX policy. It can be used as the phone-facing layer of an Asterisk channel driver, a protocol analyzer, or a standalone SCCP application such as the bridge in this repository. See the [API documentation](https://docs.rs/sccp-protocol) for a server example and the lower-level message APIs.
 
 ## Asterisk Module
 
-In `asterisk_module` you will find a completely new module called `chan_sccp2` in Rust. *"But wait? Isn't Asterisk written in C?"* Yes and Rust has great C interop. 
+In `asterisk-module` you will find a completely new channel driver called `chan_sccp2`, written in Rust. It targets Asterisk 22 and 23; production builds select one of those major-version ABI lanes and reject a different major at load time. *"But wait? Isn't Asterisk written in C?"* Yes, and Rust has great C interop, so that's what we used.
 
+The driver exposes SCCP as a native Asterisk channel and connects the protocol server to Asterisk's dialplan, RTP/media, device state, hints, message waiting, parking, pickup, transfers, conferencing, call forwarding, CLI, AMI, and realtime configuration. It is a new **completely new** implementation built on `sccp-protocol`, not a fork of the old `chan_sccp` module.
+
+You can find the latest [pre-compiled release](https://github.com/coral/sccp-rs/releases) if you'd rather just sling an .so from the internet, if not then the easiest way to produce a Linux x86-64 module is with Docker.
+
+```sh
+./asterisk-module/build-linux-x86_64.sh 22
+# or
+./asterisk-module/build-linux-x86_64.sh 23
+```
+
+The artifact is written to `dist/chan_sccp2-asterisk-<major>-linux-x86_64.so`. Install it in Asterisk's module directory as `chan_sccp2.so`, copy `asterisk-module/sccp.conf.example` to Asterisk's configuration directory as `sccp.conf`, and edit the example device and line definitions for your phones.
+
+## SCCP<->SIP app
+
+in progress
 
 ## Developing
 
-`git submodule update --init --recursive`
+- Clone the repo
+- `git submodule update --init --recursive`
+- `cargo build`
 
 ## Contributing
 
