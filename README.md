@@ -29,8 +29,9 @@ The driver exposes SCCP as a native Asterisk channel and connects the protocol s
 You can find the latest [pre-compiled release](https://github.com/coral/sccp-rs/releases) if you'd rather just sling an .so from the internet, if not then the easiest way to produce a Linux x86-64 module is with Docker.
 
 ```sh
+# For Asterisk 22
 ./asterisk-module/build-linux-x86_64.sh 22
-# or
+# or for Asterisk 23
 ./asterisk-module/build-linux-x86_64.sh 23
 ```
 
