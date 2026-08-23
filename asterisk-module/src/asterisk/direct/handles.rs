@@ -121,12 +121,45 @@ impl Drop for RegisteredCli {
     }
 }
 
+/// Module-wide scheduler used by Asterisk's RTP engine for RTCP and other
+/// per-instance timers.
+///
+/// The RTP engine accepts a nullable scheduler in its generic constructor
+/// because engines without timers can operate without one. The `asterisk`
+/// engine schedules RTCP from its first media write, so SCCP must always give
+/// it a live, running context.
+struct OwnedRtpScheduler(NonNull<sys::ast_sched_context>);
+
+impl OwnedRtpScheduler {
+    unsafe fn start() -> Option<Self> {
+        let scheduler = NonNull::new(unsafe { sys::ast_sched_context_create() })?;
+        if unsafe { sys::ast_sched_start_thread(scheduler.as_ptr()) } != 0 {
+            unsafe { sys::ast_sched_context_destroy(scheduler.as_ptr()) };
+            return None;
+        }
+        Some(Self(scheduler))
+    }
+
+    const fn as_non_null(&self) -> NonNull<sys::ast_sched_context> {
+        self.0
+    }
+}
+
+impl Drop for OwnedRtpScheduler {
+    fn drop(&mut self) {
+        unsafe { sys::ast_sched_context_destroy(self.0.as_ptr()) };
+    }
+}
+
 /// Owns every native registration installed for the channel technology.
-/// Rust drops these fields top-to-bottom: CLI, RTP glue, then technology.
+/// Rust drops these fields top-to-bottom: CLI, RTP glue, technology, then the
+/// scheduler. Active channels prevent unload, so every RTP instance is gone
+/// before the scheduler is destroyed.
 pub(super) struct NativeChannelRegistration {
     _cli: RegisteredCli,
     _rtp: RegisteredRtpGlue,
     _technology: RegisteredChannelTechnology,
+    scheduler: OwnedRtpScheduler,
 }
 
 // Registration and removal run only on the serialized module lifecycle, and
@@ -141,6 +174,7 @@ impl NativeChannelRegistration {
         module: *mut sys::ast_module,
         formats: impl IntoIterator<Item = *mut sys::ast_format>,
     ) -> Option<Self> {
+        let scheduler = unsafe { OwnedRtpScheduler::start() }?;
         let capabilities = unsafe { TechnologyCapabilities::new(formats) }?;
         let technology =
             unsafe { RegisteredChannelTechnology::register(technology, capabilities) }?;
@@ -150,7 +184,12 @@ impl NativeChannelRegistration {
             _cli: cli,
             _rtp: rtp,
             _technology: technology,
+            scheduler,
         })
+    }
+
+    pub(super) const fn rtp_scheduler(&self) -> NonNull<sys::ast_sched_context> {
+        self.scheduler.as_non_null()
     }
 }
 

@@ -16,9 +16,9 @@
 //! - The default `development` feature keeps native Asterisk headers out of
 //!   ordinary tests and documentation builds.
 //! - `asterisk-22` and `asterisk-23` are mutually exclusive ABI lanes. A
-//!   production artifact must be built against the configured source and build
-//!   tree for the destination installation; it is not portable across arbitrary
-//!   Asterisk builds.
+//!   production artifact is generated from one configured source tree and may
+//!   run on distribution builds and patch releases in that same major lane.
+//!   Module startup rejects every other Asterisk major.
 //! - The crate emits `libchan_sccp2.so`; installation renames that Cargo output
 //!   to `chan_sccp2.so`. Bindgen's configured Asterisk ABI remains private to
 //!   the Rust-native adapter.

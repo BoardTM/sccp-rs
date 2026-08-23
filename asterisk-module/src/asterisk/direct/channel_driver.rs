@@ -72,6 +72,15 @@ pub unsafe fn technology_ptr() -> *mut sys::ast_channel_tech {
     unsafe { SCCP_TECH.as_ptr() }
 }
 
+/// Returns the running module scheduler required by Asterisk RTP instances.
+/// Channel allocation is unavailable until native registration has installed
+/// this owner, and unload is rejected while any channel remains active.
+pub fn rtp_scheduler() -> Option<NonNull<sys::ast_sched_context>> {
+    native_registration()
+        .as_ref()
+        .map(NativeChannelRegistration::rtp_scheduler)
+}
+
 fn request_from_asterisk(
     capabilities: *mut sys::ast_format_cap,
     assigned_ids: *const sys::ast_assigned_ids,

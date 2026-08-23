@@ -1,6 +1,6 @@
 //! Rust-owned Asterisk module descriptor and ELF registration hooks.
 
-use std::ffi::{c_char, c_int};
+use std::ffi::{CStr, c_int};
 use std::mem;
 use std::ptr;
 
@@ -18,6 +18,9 @@ static MODULE_INFO: StaticDescriptor<sys::ast_module_info> = StaticDescriptor::u
 
 unsafe extern "C" fn load() -> sys::ast_module_load_result {
     callback_guard(sys::AST_MODULE_LOAD_DECLINE, || {
+        if !running_asterisk_matches_lane() {
+            return sys::AST_MODULE_LOAD_DECLINE;
+        }
         channel_driver::load()
             .map(|()| sys::AST_MODULE_LOAD_SUCCESS)
             .unwrap_or(sys::AST_MODULE_LOAD_DECLINE)
@@ -36,17 +39,18 @@ unsafe extern "C" fn reload() -> c_int {
     })
 }
 
-fn buildopt_sum() -> [c_char; 33] {
-    let bytes = env!("SCCP_ASTERISK_BUILDOPT_SUM").as_bytes();
-    assert!(
-        bytes.len() <= 32,
-        "Asterisk build option sum exceeds ABI field"
-    );
-    let mut output = [0; 33];
-    for (target, source) in output.iter_mut().zip(bytes.iter().copied()) {
-        *target = source as c_char;
-    }
-    output
+fn version_matches_lane(version: &[u8]) -> bool {
+    version
+        .split(|byte| *byte == b'.')
+        .next()
+        .is_some_and(|major| major == env!("SCCP_ASTERISK_LANE").as_bytes())
+}
+
+fn running_asterisk_matches_lane() -> bool {
+    // SAFETY: Asterisk owns this static NUL-terminated version string for the
+    // lifetime of the process.
+    let version = unsafe { sys::ast_get_version() };
+    !version.is_null() && version_matches_lane(unsafe { CStr::from_ptr(version) }.to_bytes())
 }
 
 unsafe extern "C" fn register_module() {
@@ -61,7 +65,10 @@ unsafe extern "C" fn register_module() {
         info.description = DESCRIPTION.as_ptr().cast();
         info.key = GPL_KEY.as_ptr().cast();
         info.flags = sys::AST_MODFLAG_LOAD_ORDER;
-        info.buildopt_sum = buildopt_sum();
+        // An empty sum is Asterisk's supported opt-out from its exact build
+        // option checksum. Release modules intentionally span distribution
+        // builds and patch releases within one explicitly checked major lane.
+        info.buildopt_sum = [0; 33];
         info.load_pri = sys::AST_MODPRI_CHANNEL_DRIVER as u8;
         info.support_level = sys::AST_MODULE_SUPPORT_EXTENDED;
 
@@ -106,4 +113,20 @@ pub unsafe extern "C" fn __internal_chan_sccp2_self() -> *mut sys::ast_module {
 pub unsafe fn module_self() -> *mut sys::ast_module {
     // SAFETY: callers use this only while the module is registered.
     unsafe { __internal_chan_sccp2_self() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_matches_lane;
+
+    #[test]
+    fn release_lane_accepts_patch_versions_and_rejects_other_majors() {
+        let lane = env!("SCCP_ASTERISK_LANE");
+        assert!(version_matches_lane(format!("{lane}.0.0").as_bytes()));
+        assert!(version_matches_lane(format!("{lane}.99.1-rc1").as_bytes()));
+
+        let other = if lane == "22" { "23.4.1" } else { "22.7.0" };
+        assert!(!version_matches_lane(other.as_bytes()));
+        assert!(!version_matches_lane(b""));
+    }
 }

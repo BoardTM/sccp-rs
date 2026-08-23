@@ -11,7 +11,7 @@ use sccp_protocol::{
     SocketQosFailure, SocketQosPolicy, apply_socket_qos as apply_platform_socket_qos,
 };
 
-use crate::asterisk::direct::channel_driver::technology_ptr;
+use crate::asterisk::direct::channel_driver::{rtp_scheduler, technology_ptr};
 use crate::asterisk::direct::module_info::module_self;
 use crate::asterisk::raw::handles::{
     Ao2Object, BorrowedChannelLock, ModuleReference, NativeStatus,
@@ -235,10 +235,11 @@ pub(super) struct OwnedRtpInstance(NonNull<sys::ast_rtp_instance>);
 
 impl OwnedRtpInstance {
     pub(super) unsafe fn create(local_address: &sys::ast_sockaddr) -> Option<Self> {
+        let scheduler = rtp_scheduler()?;
         NonNull::new(unsafe {
             sys::ast_rtp_instance_new(
                 c"asterisk".as_ptr(),
-                ptr::null_mut(),
+                scheduler.as_ptr(),
                 local_address,
                 ptr::null_mut(),
             )
