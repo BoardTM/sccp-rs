@@ -9,3 +9,5 @@ we're about to cook some SCCP here
 
 `git submodule update --init --recursive`
 
+## Contributing
+
