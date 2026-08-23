@@ -36,7 +36,7 @@ You can find the latest [pre-compiled release](https://github.com/coral/sccp-rs/
 
 The artifact is written to `dist/chan_sccp2-asterisk-<major>-linux-x86_64.so`. Install it in Asterisk's module directory as `chan_sccp2.so`, copy `asterisk-module/sccp.conf.example` ( or [copy it from here](https://github.com/coral/sccp-rs/blob/master/asterisk-module/sccp.conf.example)) to Asterisk's configuration directory as `sccp.conf`, and edit the example device and line definitions for your phones.
 
-*Why are there only one .so file? Don't Asterisk modules normally need to be compiled for each distribution and exact Asterisk build?*
+*Why is there only one .so file? Don't Asterisk modules normally need to be compiled for each distribution and exact Asterisk build?*
 
 Many Asterisk modules depend heavily on Asterisk internals and compile-time features, which ties their binaries to the distribution's particular Asterisk package and build options. `chan_sccp2` keeps that dependency behind a deliberately narrow native adapter. The SCCP wire protocol, Cisco IP Phone XML, TCP/TLS servers, runtime, thread pool, call state machines, and most feature policy are implemented independently in Rust rather than inherited from the host Asterisk build.
 
