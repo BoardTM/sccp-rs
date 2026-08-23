@@ -138,6 +138,11 @@ pub const HANDSET_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound for the writer acknowledgement used to serialize commands whose
 /// resources must remain owned until their complete frame reaches the socket.
 pub const ORDERING_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+// A 79x1 normally follows the active accessory's Off event with OnHook within
+// a few dozen milliseconds.  A route change instead reports the replacement
+// accessory On immediately.  Keep the release pending long enough to
+// distinguish those two transactions when firmware omits the final OnHook.
+const MEDIA_PATH_RELEASE_GRACE: Duration = Duration::from_millis(150);
 // A timeout only releases pending correlation state; statistics are never polled.
 const CONNECTION_STATISTICS_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_CONNECTION_STATISTICS: usize = 32;
@@ -2514,6 +2519,14 @@ struct SessionState {
     headset_enabled: bool,
     media_path_states:
         HashMap<crate::message::values::MediaPathId, crate::message::values::MediaPathEvent>,
+    pending_media_path_release: Option<PendingMediaPathRelease>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingMediaPathRelease {
+    call_id: CallId,
+    path: crate::message::values::MediaPathId,
+    deadline: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2734,7 +2747,7 @@ async fn run_session(
                             DeviceEventKind::Registered(device_registration.clone()),
                         )).await.map_err(|_| ServerError::Stopped)?;
                         info!(device_id = %registration.device_id, %protocol, peer = %context.peer, "SCCP device registered");
-                        state = Some(SessionState { device: definition, registration: device_registration, features, generation, calls_by_id: HashMap::new(), calls_by_wire: HashMap::new(), media_capabilities: StationMediaCapabilities::default(), next_media_token: MediaRequestToken::new(1), next_multicast_generation: 0, multicast: HashMap::new(), pending_connection_statistics: HashMap::new(), statistics_references: HashSet::new(), cancelled_calls: HashSet::new(), last_number_by_line: HashMap::new(), forwarding_by_line: HashMap::new(), feature_states: HashMap::new(), mwi_by_line: HashMap::new(), mobility_appearances: HashMap::new(), active_key_mode: KeyMode::OnHook, active_call_id: None, pending_parking_menu: None, persistent_status_message: false, headset_enabled: false, media_path_states: HashMap::new() });
+                        state = Some(SessionState { device: definition, registration: device_registration, features, generation, calls_by_id: HashMap::new(), calls_by_wire: HashMap::new(), media_capabilities: StationMediaCapabilities::default(), next_media_token: MediaRequestToken::new(1), next_multicast_generation: 0, multicast: HashMap::new(), pending_connection_statistics: HashMap::new(), statistics_references: HashSet::new(), cancelled_calls: HashSet::new(), last_number_by_line: HashMap::new(), forwarding_by_line: HashMap::new(), feature_states: HashMap::new(), mwi_by_line: HashMap::new(), mobility_appearances: HashMap::new(), active_key_mode: KeyMode::OnHook, active_call_id: None, pending_parking_menu: None, persistent_status_message: false, headset_enabled: false, media_path_states: HashMap::new(), pending_media_path_release: None });
                         last_keepalive = Instant::now();
                     } else if let Some(state) = state.as_mut() {
                         if matches!(message, ClientMessage::KeepAlive) { last_keepalive = Instant::now(); }
@@ -2853,6 +2866,35 @@ async fn run_session(
                             ))
                             .await
                             .map_err(|_| ServerError::Stopped)?;
+                    }
+                    if let Some(pending) = state
+                        .pending_media_path_release
+                        .filter(|pending| pending.deadline <= now)
+                    {
+                        state.pending_media_path_release = None;
+                        let still_released = state.media_path_states.get(&pending.path)
+                            == Some(&crate::message::values::MediaPathEvent::Off)
+                            && !has_active_media_path(state)
+                            && active_media_path_call(state) == Some(pending.call_id);
+                        if still_released
+                            && let Some(call) = state.calls_by_id.get(&pending.call_id).cloned()
+                        {
+                            debug!(
+                                device_id = %state.device.id,
+                                call_id = ?call.call_id,
+                                path = ?pending.path,
+                                "completing unpaired media-path release as OnHook"
+                            );
+                            let line_instance = call.line_instance;
+                            complete_on_hook(
+                                &mut stream,
+                                state,
+                                &context,
+                                call,
+                                line_instance,
+                            )
+                            .await?;
+                        }
                     }
                     prune_connection_statistics(
                         &mut state.pending_connection_statistics,
@@ -3274,6 +3316,22 @@ async fn handle_client_message(
             line_instance,
             call_reference,
         } => {
+            if let Some(active_call) = find_call(state, call_reference)
+                && !matches!(
+                    active_call.state,
+                    CallState::RingIn | CallState::CallWaiting | CallState::OnHook
+                )
+            {
+                debug!(
+                    device_id = %state.device.id,
+                    call_id = ?active_call.call_id,
+                    call_state = ?active_call.state,
+                    line_instance,
+                    call_reference,
+                    "ignoring duplicate OffHook while a call is already active"
+                );
+                return Ok(());
+            }
             let line = normalize_line(state, line_instance);
             let answer = find_answer_call(
                 state,
@@ -3316,49 +3374,14 @@ async fn handle_client_message(
             line_instance,
             call_reference,
         } => {
+            state.pending_media_path_release = None;
             if let Some(call) = find_call(state, call_reference).cloned() {
                 let line = if line_instance == 0 {
                     call.line_instance
                 } else {
                     line_instance
                 };
-                context
-                    .event_tx
-                    .send(Event::device(
-                        state.device.id.clone(),
-                        state.generation,
-                        DeviceEventKind::OnHook {
-                            call_id: call.call_id,
-                            line_instance: LineInstance::new(line),
-                        },
-                    ))
-                    .await
-                    .map_err(|_| ServerError::Stopped)?;
-                state.active_key_mode = KeyMode::OnHook;
-                stop_call_multicast(stream, state, call.call_id, protocol).await?;
-                close_call_media_messages(stream, &call, protocol).await?;
-                close_call_messages(
-                    stream,
-                    &call,
-                    &state.device.soft_keys,
-                    protocol,
-                    context.config.timezone_offset_minutes,
-                )
-                .await?;
-                request_connection_statistics(stream, state, &call, context).await?;
-                if let Some(stored) = state.calls_by_id.get_mut(&call.call_id) {
-                    stored.state = CallState::OnHook;
-                    stored.media.receive.state = MediaChannelState::Closed;
-                    stored.media.receive.deadline = None;
-                    stored.media.transmit.state = MediaChannelState::Closed;
-                    stored.media.transmit.deadline = None;
-                    stored.media.coupled_transmit_endpoint = None;
-                    stored.video_receive.leg = None;
-                    stored.video_transmit.leg = None;
-                }
-                if state.active_call_id == Some(call.call_id) {
-                    state.active_call_id = None;
-                }
+                complete_on_hook(stream, state, context, call, line).await?;
             }
         }
         ClientMessage::HookFlash {
@@ -4325,6 +4348,19 @@ async fn handle_client_message(
         } => {
             if state.media_path_states.get(&path) != Some(&media_path_event) {
                 state.media_path_states.insert(path, media_path_event);
+                if media_path_event == crate::message::values::MediaPathEvent::On {
+                    state.pending_media_path_release = None;
+                } else if media_path_event == crate::message::values::MediaPathEvent::Off
+                    && is_local_audio_path(path)
+                    && !has_active_media_path(state)
+                    && let Some(call_id) = active_media_path_call(state)
+                {
+                    state.pending_media_path_release = Some(PendingMediaPathRelease {
+                        call_id,
+                        path,
+                        deadline: Instant::now() + MEDIA_PATH_RELEASE_GRACE,
+                    });
+                }
                 context
                     .event_tx
                     .send(Event::device(
@@ -4598,6 +4634,85 @@ async fn handle_client_message(
         ClientMessage::Register(_) | ClientMessage::RegisterToken(_) => {
             warn!(device_id = %state.device.id, "ignoring registration message on registered session");
         }
+    }
+    Ok(())
+}
+
+const fn is_local_audio_path(path: crate::message::values::MediaPathId) -> bool {
+    matches!(
+        path,
+        crate::message::values::MediaPathId::Headset
+            | crate::message::values::MediaPathId::Handset
+            | crate::message::values::MediaPathId::Speaker
+    )
+}
+
+fn has_active_media_path(state: &SessionState) -> bool {
+    state.media_path_states.iter().any(|(path, event)| {
+        is_local_audio_path(*path) && *event == crate::message::values::MediaPathEvent::On
+    })
+}
+
+fn active_media_path_call(state: &SessionState) -> Option<CallId> {
+    state.active_call_id.filter(|call_id| {
+        state.calls_by_id.get(call_id).is_some_and(|call| {
+            !matches!(
+                call.state,
+                CallState::OnHook
+                    | CallState::RingIn
+                    | CallState::CallWaiting
+                    | CallState::Hold
+                    | CallState::HoldYellow
+                    | CallState::HoldRed
+            )
+        })
+    })
+}
+
+async fn complete_on_hook(
+    stream: &mut dyn StationIo,
+    state: &mut SessionState,
+    context: &SessionContext,
+    call: SessionCall,
+    line_instance: u32,
+) -> Result<(), ServerError> {
+    state.pending_media_path_release = None;
+    context
+        .event_tx
+        .send(Event::device(
+            state.device.id.clone(),
+            state.generation,
+            DeviceEventKind::OnHook {
+                call_id: call.call_id,
+                line_instance: LineInstance::new(line_instance),
+            },
+        ))
+        .await
+        .map_err(|_| ServerError::Stopped)?;
+    state.active_key_mode = KeyMode::OnHook;
+    stop_call_multicast(stream, state, call.call_id, state.registration.protocol).await?;
+    close_call_media_messages(stream, &call, state.registration.protocol).await?;
+    close_call_messages(
+        stream,
+        &call,
+        &state.device.soft_keys,
+        state.registration.protocol,
+        context.config.timezone_offset_minutes,
+    )
+    .await?;
+    request_connection_statistics(stream, state, &call, context).await?;
+    if let Some(stored) = state.calls_by_id.get_mut(&call.call_id) {
+        stored.state = CallState::OnHook;
+        stored.media.receive.state = MediaChannelState::Closed;
+        stored.media.receive.deadline = None;
+        stored.media.transmit.state = MediaChannelState::Closed;
+        stored.media.transmit.deadline = None;
+        stored.media.coupled_transmit_endpoint = None;
+        stored.video_receive.leg = None;
+        stored.video_transmit.leg = None;
+    }
+    if state.active_call_id == Some(call.call_id) {
+        state.active_call_id = None;
     }
     Ok(())
 }
@@ -9054,6 +9169,7 @@ mod tests {
             persistent_status_message: false,
             headset_enabled: false,
             media_path_states: HashMap::new(),
+            pending_media_path_release: None,
         }
     }
 
@@ -18422,6 +18538,7 @@ mod tests {
             persistent_status_message: false,
             headset_enabled: false,
             media_path_states: HashMap::new(),
+            pending_media_path_release: None,
         };
         let replacement = insert_call(&mut state, CallId(42), 1, Codec::Pcmu, CallState::OffHook);
         assert_eq!(replacement.wire_reference, 43);
@@ -18494,6 +18611,7 @@ mod tests {
             persistent_status_message: false,
             headset_enabled: false,
             media_path_states: HashMap::new(),
+            pending_media_path_release: None,
         };
         let first = insert_call(
             &mut state,
@@ -20022,6 +20140,30 @@ mod tests {
 
             phone
                 .write_all(
+                    &ClientMessage::OffHook {
+                        line_instance: 1,
+                        call_reference: incoming.0 as u32,
+                    }
+                    .encode(protocol)
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), phone.read_u8())
+                    .await
+                    .is_err(),
+                "duplicate OffHook rewrote a connected call's handset UI"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), events.recv())
+                    .await
+                    .is_err(),
+                "duplicate OffHook emitted a second application event"
+            );
+
+            phone
+                .write_all(
                     &ClientMessage::SoftKeyEvent {
                         event: SoftKey::Hold.wire_value(),
                         line_instance: 1,
@@ -21064,6 +21206,197 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), events.recv())
                 .await
                 .is_err()
+        );
+
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unpaired_active_media_path_release_completes_on_hook_after_grace() {
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            advertised_address: Ipv4Addr::LOCALHOST,
+            ..ServerConfig::default()
+        };
+        let (server, handle, mut events) = Server::bind(config, [definition()]).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(server.run());
+        let mut phone = TcpStream::connect(address).await.unwrap();
+        let mut decoder = FrameDecoder::new();
+        let protocol = ProtocolVersion::V22;
+        let device_id = DeviceId::new("SEP001122334455").unwrap();
+        let call_id = CallId(7101);
+
+        phone.write_all(&register_bytes(protocol)).await.unwrap();
+        read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::Registered(_),
+                ..
+            }))
+        ));
+        handle
+            .send(Command::new(
+                device_id.clone(),
+                CommandAction::BeginCall {
+                    line_instance: LineInstance::new(1),
+                    call_id,
+                    codec: Codec::Pcmu,
+                },
+            ))
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+        handle
+            .send(Command::new(
+                device_id,
+                CommandAction::SetCallState {
+                    call_id,
+                    state: CallState::Connected,
+                },
+            ))
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+
+        for event in [crate::MediaPathEvent::On, crate::MediaPathEvent::Off] {
+            phone
+                .write_all(
+                    &ClientMessage::MediaPathEvent {
+                        path: crate::MediaPathId::Speaker,
+                        event,
+                    }
+                    .encode(protocol)
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                events.recv().await,
+                Some(Event::Device(DeviceEvent {
+                    event: DeviceEventKind::MediaPathChanged {
+                        path: crate::MediaPathId::Speaker,
+                        event: actual,
+                    },
+                    ..
+                })) if actual == event
+            ));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .is_err(),
+            "media-path release bypassed its route-change grace period"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(300), events.recv()).await,
+            Ok(Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::OnHook {
+                    call_id: ended,
+                    line_instance: LineInstance(1),
+                },
+                ..
+            }))) if ended == call_id
+        ));
+        let frames = read_until_message(&mut phone, &mut decoder, id::SET_RINGER).await;
+        assert!(frames.into_iter().any(|frame| matches!(
+            ServerMessage::decode(frame, protocol),
+            Ok(ServerMessage::CallState {
+                state: CallState::OnHook,
+                ..
+            })
+        )));
+
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_media_path_cancels_pending_on_hook_completion() {
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            advertised_address: Ipv4Addr::LOCALHOST,
+            ..ServerConfig::default()
+        };
+        let (server, handle, mut events) = Server::bind(config, [definition()]).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(server.run());
+        let mut phone = TcpStream::connect(address).await.unwrap();
+        let mut decoder = FrameDecoder::new();
+        let protocol = ProtocolVersion::V22;
+        let device_id = DeviceId::new("SEP001122334455").unwrap();
+        let call_id = CallId(7102);
+
+        phone.write_all(&register_bytes(protocol)).await.unwrap();
+        read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::Registered(_),
+                ..
+            }))
+        ));
+        handle
+            .send(Command::new(
+                device_id.clone(),
+                CommandAction::BeginCall {
+                    line_instance: LineInstance::new(1),
+                    call_id,
+                    codec: Codec::Pcmu,
+                },
+            ))
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+        handle
+            .send(Command::new(
+                device_id,
+                CommandAction::SetCallState {
+                    call_id,
+                    state: CallState::Connected,
+                },
+            ))
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+
+        for (path, event) in [
+            (crate::MediaPathId::Speaker, crate::MediaPathEvent::On),
+            (crate::MediaPathId::Speaker, crate::MediaPathEvent::Off),
+            (crate::MediaPathId::Headset, crate::MediaPathEvent::On),
+        ] {
+            phone
+                .write_all(
+                    &ClientMessage::MediaPathEvent { path, event }
+                        .encode(protocol)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                events.recv().await,
+                Some(Event::Device(DeviceEvent {
+                    event: DeviceEventKind::MediaPathChanged {
+                        path: actual_path,
+                        event: actual_event,
+                    },
+                    ..
+                })) if actual_path == path && actual_event == event
+            ));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(350), events.recv())
+                .await
+                .is_err(),
+            "a replacement audio path was mistaken for terminal OnHook"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), phone.read_u8())
+                .await
+                .is_err(),
+            "route switching emitted terminal handset UI"
         );
 
         handle.shutdown().await.unwrap();
