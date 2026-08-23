@@ -42,6 +42,7 @@ RUN git clone --depth 1 --branch "${ASTERISK_VERSION}" \
         --without-jansson-bundled \
     && make menuselect.makeopts \
     && menuselect/menuselect \
+        --disable BUILD_NATIVE \
         --enable res_config_sqlite3 \
         --enable res_config_pgsql \
         --enable res_config_mysql \
