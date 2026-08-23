@@ -121,10 +121,10 @@ type = softkey_profile
 ; that mode. Modes omitted from a custom profile are also empty.
 on_hook = redial, new_call
 connected = hold, end_call, transfer, conference, park
-on_hold = resume, new_call, end_call
+on_hold = resume, new_call, end_call, transfer, conference_list, select, direct_transfer
 ring_in = answer, immediate_divert, end_call
 off_hook = end_call
-connected_transfer = direct_transfer, end_call
+connected_transfer = hold, end_call, transfer, conference, park, select, direct_transfer
 digits_following = backspace, end_call, dial
 connected_conference = hold, conference_list, join, end_call
 ring_out = callback, end_call
