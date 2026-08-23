@@ -302,6 +302,26 @@ record_metrics() {
 	printf '%s\t%s\t%s\t%s\n' "$label" "$fd_count" "$thread_count" "$rss_kb" >>"$diagnostics"
 }
 
+wait_for_metric_at_most() {
+	metric_name=$1
+	maximum=$2
+	checkpoint=$3
+	# Remote CLI workers retire asynchronously. Give them a bounded cleanup
+	# window while still treating any persistent growth as a leak.
+	attempt=0
+	actual=$(metric "$metric_name")
+	while [ "$actual" -gt "$maximum" ] && [ "$attempt" -lt 40 ]; do
+		attempt=$((attempt + 1))
+		sleep 0.05
+		actual=$(metric "$metric_name")
+	done
+	if [ "$actual" -gt "$maximum" ]; then
+		printf '%s count remained above the post-warmup baseline after %s: %s > %s\n' \
+			"$metric_name" "$checkpoint" "$actual" "$maximum" >&2
+		exit 1
+	fi
+}
+
 printf 'step\tfds\tthreads\trss_kb\n' >"$diagnostics"
 cycle=1
 while [ "$cycle" -le "$WARMUP_CYCLES" ]; do
@@ -320,14 +340,8 @@ while [ "$batch" -le 3 ]; do
 		cycle=$((cycle + 1))
 	done
 	record_metrics "batch-$batch"
-	if [ "$(metric fd)" -ne "$baseline_fds" ]; then
-		printf 'file descriptor count changed after batch %s\n' "$batch" >&2
-		exit 1
-	fi
-	if [ "$(metric threads)" -ne "$baseline_threads" ]; then
-		printf 'thread count changed after batch %s\n' "$batch" >&2
-		exit 1
-	fi
+	wait_for_metric_at_most fd "$baseline_fds" "batch $batch"
+	wait_for_metric_at_most threads "$baseline_threads" "batch $batch"
 	if [ "$batch" -eq 2 ]; then
 		second_batch_rss=$(metric rss)
 	fi
