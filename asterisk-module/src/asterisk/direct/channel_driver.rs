@@ -41,7 +41,7 @@ use super::module_info::module_self;
 use crate::asterisk::StaticDescriptor;
 
 const SCCP_TYPE: &CStr = c"SCCP";
-const SCCP_DESCRIPTION: &[u8] = b"Rust Cisco Skinny Client Control Protocol channel driver\0";
+const SCCP_DESCRIPTION: &[u8] = b"Modern Cisco SCCP channel driver\0";
 const SOURCE_FILE: &CStr = c"asterisk/direct/channel_driver.rs";
 const SOURCE_FUNCTION: &CStr = c"sccp_channel_driver";
 const CC_GENERIC_MONITOR: &CStr = c"generic";
