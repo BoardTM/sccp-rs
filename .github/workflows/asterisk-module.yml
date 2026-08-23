@@ -15,6 +15,7 @@ on:
       - "Cargo.lock"
       - ".gitmodules"
       - ".github/workflows/asterisk-module.yml"
+      - ".github/workflows/asterisk-distro-compatibility.yml"
       - "!**/*.md"
       - "!**/LICENSE*"
   pull_request:
@@ -29,6 +30,7 @@ on:
       - "Cargo.lock"
       - ".gitmodules"
       - ".github/workflows/asterisk-module.yml"
+      - ".github/workflows/asterisk-distro-compatibility.yml"
       - "!**/*.md"
       - "!**/LICENSE*"
 

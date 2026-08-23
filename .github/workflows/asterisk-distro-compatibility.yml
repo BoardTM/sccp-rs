@@ -1,0 +1,66 @@
+name: chan_sccp2 distro compatibility
+
+on:
+  workflow_run:
+    workflows:
+      - chan_sccp2 ABI matrix
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  packaged-asterisk:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: Ubuntu 26.04
+            image: ubuntu:26.04
+            package_family: deb
+            asterisk_major: "22"
+            artifact: chan_sccp2-asterisk-22.7.0-linux-x86_64
+          - distro: Debian testing
+            image: debian:testing-slim
+            package_family: deb
+            asterisk_major: "22"
+            artifact: chan_sccp2-asterisk-22.7.0-linux-x86_64
+          - distro: Fedora 45
+            image: fedora:45
+            package_family: rpm
+            asterisk_major: "23"
+            artifact: chan_sccp2-asterisk-23.4.1-linux-x86_64
+
+    name: ${{ matrix.distro }} / Asterisk ${{ matrix.asterisk_major }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Load release artifact with packaged Asterisk
+        env:
+          ARTIFACT: ${{ matrix.artifact }}.so
+          ASTERISK_MAJOR: ${{ matrix.asterisk_major }}
+          DISTRO_IMAGE: ${{ matrix.image }}
+          PACKAGE_FAMILY: ${{ matrix.package_family }}
+        run: >-
+          docker run --rm --pull always
+          --volume "${GITHUB_WORKSPACE}:/workspace:ro"
+          "$DISTRO_IMAGE"
+          /workspace/asterisk-module/distro-tests/test-package.sh
+          "$PACKAGE_FAMILY" "$ASTERISK_MAJOR" "/workspace/dist/$ARTIFACT"
