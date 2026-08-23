@@ -4,14 +4,33 @@ on:
   push:
     branches:
       - master
+    paths:
+      - "asterisk-module/**"
+      - "sccp-protocol/**"
+      - "tools/chan-sccp2-config-checker/**"
+      - ".cargo/**"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".gitmodules"
+      - ".github/workflows/asterisk-module.yml"
+      - "!**/*.md"
+      - "!**/LICENSE*"
   pull_request:
     paths:
       - "asterisk-module/**"
       - "sccp-protocol/**"
       - "tools/chan-sccp2-config-checker/**"
+      - ".cargo/**"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".gitmodules"
       - ".github/workflows/asterisk-module.yml"
+      - "!**/*.md"
+      - "!**/LICENSE*"
 
 jobs:
   realtime:

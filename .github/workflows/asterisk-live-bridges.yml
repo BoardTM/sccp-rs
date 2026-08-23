@@ -6,20 +6,34 @@ on:
     paths:
       - "asterisk-module/live-tests/**"
       - "asterisk-module/src/**"
+      - "asterisk-module/build.rs"
       - "asterisk-module/test-native-lifecycle.sh"
       - "asterisk-module/Cargo.toml"
+      - "sccp-protocol/**"
+      - ".cargo/**"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/asterisk-live-bridges.yml"
+      - "!**/*.md"
+      - "!**/LICENSE*"
   pull_request:
     paths:
       - "asterisk-module/live-tests/**"
       - "asterisk-module/src/**"
+      - "asterisk-module/build.rs"
       - "asterisk-module/test-native-lifecycle.sh"
       - "asterisk-module/Cargo.toml"
+      - "sccp-protocol/**"
+      - ".cargo/**"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/asterisk-live-bridges.yml"
+      - "!**/*.md"
+      - "!**/LICENSE*"
 
 jobs:
   bridges:
