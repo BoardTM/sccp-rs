@@ -168,7 +168,7 @@ linetable = sccp_lines
 EOF
 
 SCCP_CONFIG="$test_root/etc/sccp.conf" \
-	"$asterisk_bin" -C "$test_root/etc/asterisk.conf" -f -g -q \
+	"$asterisk_bin" -C "$test_root/etc/asterisk.conf" -f -g -vvv \
 	>"$asterisk_log" 2>&1 &
 asterisk_pid=$!
 
@@ -189,7 +189,14 @@ ready=0
 attempt=0
 while [ "$attempt" -lt 100 ]; do
 	if ! kill -0 "$asterisk_pid" 2>/dev/null; then
-		printf 'Asterisk exited during startup\n' >&2
+		if wait "$asterisk_pid"; then
+			asterisk_status=0
+		else
+			asterisk_status=$?
+		fi
+		asterisk_pid=
+		printf 'Asterisk exited during startup (status %s)\n' \
+			"$asterisk_status" >&2
 		exit 1
 	fi
 	if "$asterisk_bin" -C "$test_root/etc/asterisk.conf" -rx 'core show uptime' \

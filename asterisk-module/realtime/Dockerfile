@@ -65,21 +65,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/workspace/target \
     cargo build --locked --release -p asterisk-module --no-default-features \
         --features asterisk-22 \
-    && service postgresql start \
-    && service mariadb start \
-    && su postgres -c 'createuser root' \
-    && su postgres -c 'createdb --owner=root sccp2_realtime' \
-    && mysql --user=root --execute 'CREATE DATABASE sccp2_realtime CHARACTER SET utf8mb4' \
     && ASTERISK_BIN=/opt/asterisk-live/sbin/asterisk \
         ASTERISK_MODULE_DIR=/opt/asterisk-live/lib/asterisk/modules \
         ASTERISK_DATA_DIR=/opt/asterisk-live/var/lib/asterisk \
         ./asterisk-module/realtime/test-live-provider.sh \
             sqlite target/release/libchan_sccp2.so \
+    && service postgresql start \
+    && su postgres -c 'createuser root' \
+    && su postgres -c 'createdb --owner=root sccp2_realtime' \
     && ASTERISK_BIN=/opt/asterisk-live/sbin/asterisk \
         ASTERISK_MODULE_DIR=/opt/asterisk-live/lib/asterisk/modules \
         ASTERISK_DATA_DIR=/opt/asterisk-live/var/lib/asterisk \
         ./asterisk-module/realtime/test-live-provider.sh \
             postgresql target/release/libchan_sccp2.so \
+    && service postgresql stop \
+    && service mariadb start \
+    && mysql --user=root --execute 'CREATE DATABASE sccp2_realtime CHARACTER SET utf8mb4' \
     && ASTERISK_BIN=/opt/asterisk-live/sbin/asterisk \
         ASTERISK_MODULE_DIR=/opt/asterisk-live/lib/asterisk/modules \
         ASTERISK_DATA_DIR=/opt/asterisk-live/var/lib/asterisk \
