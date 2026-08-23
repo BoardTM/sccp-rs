@@ -34,7 +34,7 @@ You can find the latest [pre-compiled release](https://github.com/coral/sccp-rs/
 ./asterisk-module/build-linux-x86_64.sh 23
 ```
 
-The artifact is written to `dist/chan_sccp2-asterisk-<major>-linux-x86_64.so`. Install it in Asterisk's module directory as `chan_sccp2.so`, copy `asterisk-module/sccp.conf.example` to Asterisk's configuration directory as `sccp.conf`, and edit the example device and line definitions for your phones.
+The artifact is written to `dist/chan_sccp2-asterisk-<major>-linux-x86_64.so`. Install it in Asterisk's module directory as `chan_sccp2.so`, copy `asterisk-module/sccp.conf.example` ( or [copy it from here](https://github.com/coral/sccp-rs/blob/master/asterisk-module/sccp.conf.example)) to Asterisk's configuration directory as `sccp.conf`, and edit the example device and line definitions for your phones.
 
 ## SCCP<->SIP app
 
