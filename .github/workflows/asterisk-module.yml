@@ -1,0 +1,122 @@
+name: chan_sccp2 ABI matrix
+
+on:
+  push:
+    paths:
+      - "asterisk-module/**"
+      - "sccp-protocol/**"
+      - "tools/chan-sccp2-config-checker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/asterisk-module.yml"
+  pull_request:
+    paths:
+      - "asterisk-module/**"
+      - "sccp-protocol/**"
+      - "tools/chan-sccp2-config-checker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/asterisk-module.yml"
+
+jobs:
+  realtime:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test SQLite, PostgreSQL, and MySQL realtime migrations
+        run: ./asterisk-module/realtime/test-backends.sh
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Exercise live realtime provider refreshes
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: asterisk-module/realtime/Dockerfile
+          cache-from: type=gha,scope=asterisk-ci-22.7.0
+          cache-to: type=gha,mode=max,scope=asterisk-ci-22.7.0
+          pull: true
+          push: false
+
+  config-checker:
+    runs-on: ubuntu-26.04
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test configuration checker
+        run: cargo test --locked -p chan-sccp2-config-checker
+
+      - name: Validate distributed configuration
+        run: >-
+          cargo run --locked -p chan-sccp2-config-checker --
+          asterisk-module/sccp.conf.example
+
+  build:
+    runs-on: ubuntu-26.04
+    env:
+      RUSTFLAGS: -Dwarnings
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asterisk: 22.7.0
+            feature: asterisk-22
+          - asterisk: 23.4.1
+            feature: asterisk-23
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Asterisk header prerequisites
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          build-essential libedit-dev libjansson-dev libsqlite3-dev
+          libssl-dev libxml2-dev uuid-dev
+
+      - name: Select and configure Asterisk
+        working-directory: asterisk-module/asterisk
+        run: |
+          git fetch --tags origin "refs/tags/${{ matrix.asterisk }}:refs/tags/${{ matrix.asterisk }}"
+          git checkout --detach "${{ matrix.asterisk }}"
+          ./configure --without-pjproject-bundled --without-jansson-bundled
+          make include/asterisk/buildopts.h
+
+      - name: Test Rust state and configuration
+        run: cargo test -p asterisk-module --lib
+
+      - name: Build exact Asterisk module
+        env:
+          ASTERISK_SOURCE_DIR: ${{ github.workspace }}/asterisk-module/asterisk
+          ASTERISK_BUILD_DIR: ${{ github.workspace }}/asterisk-module/asterisk
+          ASTERISK_VERSION: ${{ matrix.asterisk }}
+        run: >-
+          cargo build --release -p asterisk-module --no-default-features
+          --features ${{ matrix.feature }}
+
+      - name: Verify and package ELF module
+        run: |
+          readelf -h target/release/libchan_sccp2.so > /tmp/chan-sccp2-elf-header
+          grep -q 'Machine:.*Advanced Micro Devices X86-64' /tmp/chan-sccp2-elf-header
+          readelf -d target/release/libchan_sccp2.so > /tmp/chan-sccp2-elf-dynamic
+          grep -q 'SONAME.*chan_sccp2.so' /tmp/chan-sccp2-elf-dynamic
+          nm -D --defined-only target/release/libchan_sccp2.so > /tmp/chan-sccp2-exported-symbols
+          grep -q ' T __internal_chan_sccp2_self$' /tmp/chan-sccp2-exported-symbols
+          if grep -Eq ' [TDB] (rust_sccp_|sccp_ast_)' /tmp/chan-sccp2-exported-symbols; then
+            printf 'legacy adapter symbols escaped the private Rust boundary\n' >&2
+            exit 1
+          fi
+          cp target/release/libchan_sccp2.so "chan_sccp2-asterisk-${{ matrix.asterisk }}-linux-x86_64.so"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chan_sccp2-asterisk-${{ matrix.asterisk }}-linux-x86_64
+          path: chan_sccp2-asterisk-${{ matrix.asterisk }}-linux-x86_64.so

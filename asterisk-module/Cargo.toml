@@ -1,0 +1,45 @@
+[package]
+name = "asterisk-module"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Rust SCCP channel driver for Asterisk 22 and 23"
+publish = false
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "chan_sccp2"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Ordinary workspace builds exercise the Asterisk-independent parts of the
+# adapter. A release module must disable this feature and select exactly one
+# Asterisk ABI lane.
+default = ["development"]
+development = []
+asterisk-22 = []
+asterisk-23 = []
+live-asterisk-tests = []
+
+[dependencies]
+sccp-protocol = { path = "../sccp-protocol" }
+form_urlencoded.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+
+[build-dependencies]
+bindgen = "0.72"
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true

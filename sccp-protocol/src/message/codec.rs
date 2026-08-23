@@ -1,0 +1,12053 @@
+//! Private SCCP codec implementation and declarative payload layouts.
+//!
+//! Public message types describe protocol meaning. These types describe byte
+//! layout only, which keeps reserved fields and version-specific structure out
+//! of the application API. Some message identifiers support multiple body
+//! sizes independently of the negotiated frame version.
+//!
+//! Decoder failures deliberately distinguish truncation, unsupported body
+//! length, non-word-aligned station strings, non-zero/trailing padding, count
+//! bounds, and invalid field values. Alternate layouts are selected by
+//! protocol and/or exact body length so a typed decode does not silently turn
+//! a valid frame into a different wire body.
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU16;
+
+use binrw::{BinRead, BinWrite};
+
+use super::capabilities::{CapabilityUpdate, CapabilityUpdateVariant};
+use super::catalog::{CodecSupport, MessageRoute};
+use super::values::{
+    AddParticipantResult, AlarmSeverity, AnnouncementPlayMode, AnnouncementPlayStatus,
+    AuditParticipantResult, BusyLampFieldState, ButtonType, CallHistoryDisposition, CallState,
+    Codec, ConferenceResourceType, CreateConferenceResult, DeleteConferenceResult, DeviceType,
+    Digit, DynamicCallInfoLayout, EchoCancellation, EncryptionMethod, EndOfAnnouncementAck,
+    G723BitRate, IpAddressType, KeyMode, LampMode, MediaPathCapability, MediaPathEvent,
+    MediaPathId, MediaStatus, MediaTransport, MediaType, MessageWaitingResult, MicrophoneMode,
+    ModifyConferenceResult, NotificationPriority, PartyInformationRestrictions, PhoneFeatures,
+    ProtocolVersion, QosDirection, QosErrorCode, QosReservationStyle, ResetType, RingDuration,
+    RingerMode, RsvpErrorCode, SilenceSuppression, SoftKey, SpeakerMode, StationSessionContext,
+    StatisticsProcessing, Stimulus, SubscriptionCause, Tone, ToneDirection,
+};
+use super::wire::{CodecError, Frame};
+use super::*;
+use crate::types::{
+    CallInfo, DateTemplate, DeviceId, LegacyCodePage, MediaEndpoint, MediaTrafficClass,
+    SoftKeyProfile,
+};
+
+mod fixed_text;
+mod io;
+use fixed_text::{WireFixedText, station_text_bytes};
+use io::{
+    decode, decode_prefix, decode_zero_padded, encode, usize_from_wire, validate_exact_payload,
+    validate_payload_bounds, validate_zero_payload, wire_count,
+};
+
+fn ensure_station_route(
+    frame: &Frame,
+    expected: MessageRoute,
+    expected_name: &'static str,
+) -> Result<(), CodecError> {
+    let Some(actual) = frame.message_type().route() else {
+        return Ok(());
+    };
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CodecError::UnexpectedRoute {
+            message_id: frame.message_id,
+            actual,
+            expected: expected_name,
+        })
+    }
+}
+
+fn preserve_known_message(frame: Frame, id: MessageId) -> Result<KnownOpaqueMessage, CodecError> {
+    ensure_preserve_only(id)?;
+    let payload = BoundedBytes::try_from(frame.payload).map_err(|error| {
+        CodecError::FrameTooLarge(error.actual.saturating_add(super::wire::HEADER_SIZE))
+    })?;
+    Ok(KnownOpaqueMessage {
+        id,
+        protocol_version: frame.protocol_version,
+        payload,
+    })
+}
+
+fn ensure_preserve_only(id: MessageId) -> Result<(), CodecError> {
+    if id
+        .contract()
+        .is_some_and(|contract| contract.codec == CodecSupport::OpaqueOnly)
+    {
+        Ok(())
+    } else {
+        Err(CodecError::InvalidValue {
+            message_id: id.wire_value(),
+            field: "opaque preservation requires an opaque-only contract",
+            value: u64::from(id.wire_value()),
+        })
+    }
+}
+
+fn pad_typed_payload(message_id: u32, payload: &mut Vec<u8>) {
+    use super::catalog::PayloadLayout;
+
+    let Some(contract) = MessageId::from(message_id).contract() else {
+        return;
+    };
+    if !matches!(
+        contract.payload_layout,
+        PayloadLayout::Opaque
+            | PayloadLayout::BoundedOpaque
+            | PayloadLayout::BoundedPreserved
+            | PayloadLayout::VersionAndLengthSelected
+            | PayloadLayout::MinimumLengthPreserved
+    ) {
+        pad_dynamic_payload(payload);
+    }
+}
+
+fn canonical_open_receive_wire(
+    call_reference: u32,
+    source_address: IpAddr,
+    protocol: ProtocolVersion,
+) -> OpenReceiveChannelWire {
+    OpenReceiveChannelWire {
+        conference_id: call_reference,
+        g723_bitrate: 0,
+        stream_passthrough_id: 0,
+        associated_stream_id: 0,
+        dtmf_type: 10,
+        mixing_mode: 0,
+        direction: u32::from(protocol.wire() >= 12),
+        requested_address_type: u32::from(
+            protocol.wire() >= 17 && matches!(source_address, IpAddr::V6(_)),
+        ),
+        audio_level_adjustment: 0,
+        latent_capabilities: [0; 36],
+    }
+}
+
+fn canonical_start_media_wire(
+    call_reference: u32,
+    protocol: ProtocolVersion,
+) -> StartMediaTransmissionWire {
+    StartMediaTransmissionWire {
+        conference_id: call_reference,
+        g723_bitrate: 0,
+        stream_passthrough_id: 0,
+        associated_stream_id: 0,
+        dtmf_type: 10,
+        mixing_mode: 0,
+        direction: u32::from(protocol.wire() >= 12),
+        latent_capabilities: [0; 36],
+    }
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Default, Eq, PartialEq)]
+#[brw(little)]
+struct WireEncryptionInfo {
+    algorithm: u32,
+    key_length: u16,
+    salt_length: u16,
+    key: [u8; 16],
+    salt: [u8; 16],
+    mki_present: u32,
+    key_derivation_rate: u32,
+}
+
+impl std::fmt::Debug for WireEncryptionInfo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WireEncryptionInfo")
+            .field("algorithm", &EncryptionMethod::from(self.algorithm))
+            .field("key", &"<redacted>")
+            .field("key_length", &self.key_length)
+            .field("salt", &"<redacted>")
+            .field("salt_length", &self.salt_length)
+            .field("mki_present", &self.mki_present)
+            .field("key_derivation_rate", &self.key_derivation_rate)
+            .finish()
+    }
+}
+
+impl WireEncryptionInfo {
+    fn from_public(encryption: Option<&MediaEncryption>) -> Self {
+        let Some(encryption) = encryption else {
+            return Self::default();
+        };
+        Self {
+            algorithm: encryption.algorithm.wire_value(),
+            key_length: u16::from(encryption.key_length),
+            salt_length: u16::from(encryption.salt_length),
+            key: encryption.key,
+            salt: encryption.salt,
+            mki_present: encryption.mki_present,
+            key_derivation_rate: encryption.key_derivation_rate,
+        }
+    }
+
+    fn to_public(self, _message_id: u32) -> Result<Option<MediaEncryption>, CodecError> {
+        if usize::from(self.key_length) > self.key.len() {
+            return Err(CodecError::SecretTooLong {
+                field: "media encryption key",
+                actual: usize::from(self.key_length),
+                maximum: self.key.len(),
+            });
+        }
+        if usize::from(self.salt_length) > self.salt.len() {
+            return Err(CodecError::SecretTooLong {
+                field: "media encryption salt",
+                actual: usize::from(self.salt_length),
+                maximum: self.salt.len(),
+            });
+        }
+        if self.algorithm == 0
+            && self.key_length == 0
+            && self.salt_length == 0
+            && self.mki_present == 0
+            && self.key_derivation_rate == 0
+        {
+            return Ok(None);
+        }
+        Ok(Some(MediaEncryption::from_wire(
+            EncryptionMethod::from(self.algorithm),
+            self.key,
+            self.key_length as u8,
+            self.salt,
+            self.salt_length as u8,
+            self.mki_present,
+            self.key_derivation_rate,
+        )))
+    }
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireLatentCapabilities {
+    bytes: [u8; 36],
+}
+
+impl Default for WireLatentCapabilities {
+    fn default() -> Self {
+        Self { bytes: [0; 36] }
+    }
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireExtendedAddress {
+    family: u32,
+    bytes: [u8; 16],
+}
+
+impl WireExtendedAddress {
+    fn from_ip(address: IpAddr) -> Self {
+        match address {
+            IpAddr::V4(address) => {
+                let mut bytes = [0; 16];
+                bytes[..4].copy_from_slice(&address.octets());
+                Self { family: 0, bytes }
+            }
+            IpAddr::V6(address) => Self {
+                family: 1,
+                bytes: address.octets(),
+            },
+        }
+    }
+
+    fn to_ip(self, message_id: u32) -> Result<IpAddr, CodecError> {
+        match self.family {
+            0 => Ok(IpAddr::V4(Ipv4Addr::new(
+                self.bytes[0],
+                self.bytes[1],
+                self.bytes[2],
+                self.bytes[3],
+            ))),
+            1 => Ok(IpAddr::V6(Ipv6Addr::from(self.bytes))),
+            value => Err(CodecError::InvalidValue {
+                message_id,
+                field: "IP address family",
+                value: u64::from(value),
+            }),
+        }
+    }
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMulticastReceptionV3 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    address: [u8; 4],
+    port: u32,
+    packet_millis: u32,
+    codec: u32,
+    echo_cancellation: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMulticastReceptionV17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    address: WireExtendedAddress,
+    port: u32,
+    packet_millis: u32,
+    codec: u32,
+    echo_cancellation: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMulticastTransmissionV3 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    address: [u8; 4],
+    port: u32,
+    packet_millis: u32,
+    codec: u32,
+    precedence: u32,
+    silence_suppression: u32,
+    max_frames_per_packet: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMulticastTransmissionV17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    address: WireExtendedAddress,
+    port: u32,
+    packet_millis: u32,
+    codec: u32,
+    precedence: u32,
+    silence_suppression: u32,
+    max_frames_per_packet: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenReceiveV11 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    packet_millis: u32,
+    codec: u32,
+    vad: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+    rfc2833_payload: u32,
+    dtmf_type: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenReceiveV12 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    packet_millis: u32,
+    codec: u32,
+    vad: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+    rfc2833_payload: u32,
+    dtmf_type: u32,
+    mixing_mode: u32,
+    direction: u32,
+    remote_ipv4: [u8; 4],
+    remote_port: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenReceiveV17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    packet_millis: u32,
+    codec: u32,
+    vad: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+    rfc2833_payload: u32,
+    dtmf_type: u32,
+    mixing_mode: u32,
+    direction: u32,
+    remote: WireExtendedAddress,
+    remote_port: u32,
+    requested_address_type: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenReceiveV18 {
+    base: WireOpenReceiveV17,
+    audio_level_adjustment: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenReceiveV21 {
+    base: WireOpenReceiveV18,
+    latent_capabilities: WireLatentCapabilities,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMediaV11 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    remote_ipv4: [u8; 4],
+    remote_port: u32,
+    packet_millis: u32,
+    codec: u32,
+    precedence: u32,
+    silence_suppression: u32,
+    max_frames_per_packet: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+    rfc2833_payload: u32,
+    dtmf_type: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMediaV12 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    remote_ipv4: [u8; 4],
+    remote_port: u32,
+    packet_millis: u32,
+    codec: u32,
+    precedence: u32,
+    silence_suppression: u32,
+    max_frames_per_packet: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+    rfc2833_payload: u32,
+    dtmf_type: u32,
+    mixing_mode: u32,
+    direction: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMediaV17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    remote: WireExtendedAddress,
+    remote_port: u32,
+    packet_millis: u32,
+    codec: u32,
+    precedence: u32,
+    silence_suppression: u32,
+    max_frames_per_packet: u32,
+    g723_bitrate: u32,
+    call_reference: u32,
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+    rfc2833_payload: u32,
+    dtmf_type: u32,
+    mixing_mode: u32,
+    direction: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMediaV21 {
+    base: WireStartMediaV17,
+    latent_capabilities: WireLatentCapabilities,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMediaAckV3 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    call_reference: u32,
+    address: [u8; 4],
+    port: u32,
+    status: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMediaAckV17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    call_reference: u32,
+    address: WireExtendedAddress,
+    port: u32,
+    status: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMediaAckV20 {
+    base: WireStartMediaAckV17,
+    extension: [u8; 8],
+}
+
+macro_rules! words {
+    ($name:ident { $($field:ident),+ $(,)? }) => {
+        #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+        #[brw(little)]
+        struct $name {
+            $($field: u32),+
+        }
+    };
+}
+
+words!(WireOneWord { value });
+words!(WireMulticastReceptionAck {
+    status,
+    passthrough_party_id,
+    call_reference
+});
+words!(WireLineCall {
+    line_instance,
+    call_reference
+});
+words!(WireCallParty {
+    call_reference,
+    passthrough_party_id
+});
+words!(WireAudioStreamControl {
+    conference_id,
+    passthrough_party_id,
+    call_reference,
+    port_handling_flag
+});
+words!(WireSelectSoftKeys {
+    line_instance,
+    call_reference,
+    set,
+    valid_mask
+});
+words!(WireCallState {
+    state,
+    line_instance,
+    call_reference,
+    visibility,
+    precedence,
+    domain
+});
+words!(WireCallInfoDynamicHeader {
+    line_instance,
+    call_reference,
+    call_type,
+    original_redirect_reason,
+    last_redirect_reason,
+    call_instance,
+    security_status,
+    party_restrictions
+});
+words!(WireDynamicPromptHeader {
+    timeout_seconds,
+    line_instance,
+    call_reference
+});
+words!(WireModeLineCall {
+    mode,
+    duration,
+    line_instance,
+    call_reference
+});
+words!(WireToneLineCall {
+    tone,
+    direction,
+    line_instance,
+    call_reference
+});
+words!(WireLampState {
+    stimulus,
+    instance,
+    mode
+});
+words!(WirePortRequestPre20 {
+    conference_id,
+    call_reference,
+    passthrough_party_id,
+    transport
+});
+words!(WirePortRequestFrom20 {
+    conference_id,
+    call_reference,
+    passthrough_party_id,
+    transport,
+    address_type,
+    media_type
+});
+words!(WirePortClosePre20 {
+    conference_id,
+    call_reference,
+    passthrough_party_id
+});
+words!(WirePortCloseFrom20 {
+    conference_id,
+    call_reference,
+    passthrough_party_id,
+    media_type
+});
+words!(WireSubscriptionStatus {
+    transaction_id,
+    feature_id,
+    timer_seconds,
+    cause
+});
+words!(WireCallSelectStatus {
+    status,
+    call_reference,
+    line_instance
+});
+words!(WireRecordingStatus {
+    call_reference,
+    active
+});
+words!(WireFeatureStatusRequest {
+    index,
+    capabilities
+});
+words!(WireLineStatusDynamicHeader {
+    line_instance,
+    line_type
+});
+words!(WireStopToneV12 {
+    line_instance,
+    call_reference,
+    tone
+});
+words!(WireCallHistoryDisposition {
+    disposition,
+    line_instance,
+    call_reference
+});
+words!(WireAnnouncementFinish {
+    conference_id,
+    play_status
+});
+words!(WireStopMulticast {
+    conference_id,
+    passthrough_party_id,
+    call_reference
+});
+words!(WireAddParticipantResponseHeader {
+    conference_id,
+    call_reference,
+    result
+});
+words!(WireAuditParticipantResponseHeader {
+    result,
+    last,
+    conference_id,
+    number_of_entries
+});
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[brw(little)]
+struct WireAnnouncementEntry {
+    locale: u32,
+    country: u32,
+    tone: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartAnnouncement {
+    announcements: [WireAnnouncementEntry; 32],
+    end_of_ack: u32,
+    conference_id: u32,
+    matrix_conference_party_ids: [u32; 16],
+    hearing_conference_party_mask: u32,
+    play_mode: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireCreateConferenceRequest {
+    conference_id: u32,
+    reserved_participants: u32,
+    resource_type: u32,
+    application_id: u32,
+    application_conference_id: WireFixedText<32>,
+    application_data: WireFixedText<24>,
+    data_length: u32,
+    #[br(count = data_length)]
+    passthrough_data: Vec<u8>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireModifyConferenceRequest {
+    conference_id: u32,
+    reserved_participants: u32,
+    application_id: u32,
+    application_conference_id: WireFixedText<32>,
+    application_data: WireFixedText<24>,
+    data_length: u32,
+    #[br(count = data_length)]
+    passthrough_data: Vec<u8>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConferenceResponse {
+    conference_id: u32,
+    result: u32,
+    data_length: u32,
+    #[br(count = data_length)]
+    passthrough_data: Vec<u8>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireAuditConferenceEntry {
+    conference_id: u32,
+    resource_type: u32,
+    reserved_participants: u32,
+    active_participants: u32,
+    application_id: u32,
+    application_conference_id: WireFixedText<32>,
+    application_data: WireFixedText<24>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireAuditConferenceResponse {
+    last: u32,
+    number_of_entries: u32,
+    #[br(count = number_of_entries)]
+    entries: Vec<WireAuditConferenceEntry>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireParticipantRequest {
+    conference_id: u32,
+    call_reference: u32,
+    presentation_restrictions: u32,
+    participant_name: WireFixedText<40>,
+    participant_number: WireFixedText<24>,
+    conference_name: WireFixedText<32>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireQosFlow {
+    conference_id: u32,
+    call_reference: u32,
+    passthrough_party_id: u32,
+    address: [u8; 4],
+    port: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireQosApplicationIdentifier {
+    vendor_id: WireFixedText<32>,
+    version: WireFixedText<16>,
+    application_name: WireFixedText<32>,
+    sub_application_id: WireFixedText<32>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireQosReservationNotify {
+    flow: WireQosFlow,
+    direction: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireUpdateDscp {
+    flow: WireQosFlow,
+    dscp: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireQosErrorNotify {
+    flow: WireQosFlow,
+    direction: u32,
+    error_code: u32,
+    failure_node: u32,
+    rsvp_error_code: u32,
+    rsvp_error_subcode: u32,
+    rsvp_error_flags: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireQosListen {
+    flow: WireQosFlow,
+    reservation_style: u32,
+    maximum_retries: u32,
+    retry_timer: u32,
+    confirmation_required: u32,
+    preemption_priority: u32,
+    defending_priority: u32,
+    compression_type: u32,
+    average_bit_rate: u32,
+    burst_size: u32,
+    peak_rate: u32,
+    application: WireQosApplicationIdentifier,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireQosPath {
+    flow: WireQosFlow,
+    reservation_style: u32,
+    maximum_retries: u32,
+    retry_timer: u32,
+    preemption_priority: u32,
+    defending_priority: u32,
+    compression_type: u32,
+    average_bit_rate: u32,
+    burst_size: u32,
+    peak_rate: u32,
+    application: WireQosApplicationIdentifier,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireQosModify {
+    flow: WireQosFlow,
+    direction: u32,
+    compression_type: u32,
+    average_bit_rate: u32,
+    burst_size: u32,
+    peak_rate: u32,
+    application: WireQosApplicationIdentifier,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireMessageWaitingNotification {
+    target_number: WireFixedText<25>,
+    control_number: WireFixedText<25>,
+    alignment: [u8; 2],
+    messages_waiting: u32,
+    total_voicemail_new: u32,
+    total_voicemail_old: u32,
+    priority_voicemail_new: u32,
+    priority_voicemail_old: u32,
+    total_fax_new: u32,
+    total_fax_old: u32,
+    priority_fax_new: u32,
+    priority_fax_old: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireMessageWaitingResponse {
+    target_number: WireFixedText<25>,
+    alignment: [u8; 3],
+    result: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireRegisterAck {
+    keepalive_seconds: u32,
+    date_template: [u8; 6],
+    alignment: [u8; 2],
+    secondary_keepalive_seconds: u32,
+    protocol_features: [u8; 4],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConfigStatus {
+    device_id: WireFixedText<16>,
+    station_user_id: u32,
+    station_instance: u32,
+    user_name: WireFixedText<40>,
+    server_name: WireFixedText<40>,
+    line_count: u32,
+    speed_dial_count: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireLineStatus {
+    line_instance: u32,
+    directory_number: WireFixedText<24>,
+    display_name: WireFixedText<40>,
+    display_label: WireFixedText<40>,
+    reserved: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WireButtonDefinition {
+    instance: u8,
+    button_type: u8,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireButtonTemplate {
+    offset: u32,
+    count: u32,
+    total: u32,
+    definitions: [WireButtonDefinition; 42],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireServerResponseV3 {
+    names: [WireFixedText<48>; 5],
+    ports: [u32; 5],
+    addresses: [[u8; 4]; 5],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireServerResponseV17 {
+    names: [WireFixedText<48>; 5],
+    ports: [u32; 5],
+    addresses: [WireExtendedAddress; 5],
+}
+
+words!(WireTimeDate {
+    year,
+    month,
+    weekday,
+    day,
+    hour,
+    minute,
+    second,
+    milliseconds,
+    unix_seconds
+});
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireSoftKeyDefinition {
+    label: [u8; 16],
+    event: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireSoftKeyTemplate {
+    offset: u32,
+    count: u32,
+    total: u32,
+    definitions: [WireSoftKeyDefinition; 32],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[brw(little)]
+struct WireSoftKeySetDefinition {
+    template_indexes: [u8; 16],
+    info: [u16; 16],
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireSoftKeySet {
+    offset: u32,
+    count: u32,
+    total: u32,
+    #[br(count = 16)]
+    sets: Vec<WireSoftKeySetDefinition>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireCallInfo {
+    calling_name: WireFixedText<40>,
+    calling_number: WireFixedText<24>,
+    called_name: WireFixedText<40>,
+    called_number: WireFixedText<24>,
+    line_instance: u32,
+    call_reference: u32,
+    call_type: u32,
+    original_called_name: WireFixedText<40>,
+    original_called_number: WireFixedText<24>,
+    last_redirecting_name: WireFixedText<40>,
+    last_redirecting_number: WireFixedText<24>,
+    original_redirect_reason: u32,
+    last_redirect_reason: u32,
+    voice_mailboxes: [WireFixedText<24>; 4],
+    call_instance: u32,
+    security_status: u32,
+    party_restrictions: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WirePromptStatus {
+    timeout_seconds: u32,
+    text: WireFixedText<32>,
+    line_instance: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireNotify {
+    timeout_seconds: u32,
+    text: WireFixedText<32>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireDynamicNotifyHeader {
+    timeout_seconds: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WirePriorityNotify {
+    timeout_seconds: u32,
+    priority: u32,
+    text: WireFixedText<32>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireDynamicPriorityNotifyHeader {
+    timeout_seconds: u32,
+    priority: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsRequestV3 {
+    directory_number: WireFixedText<24>,
+    call_reference: u32,
+    processing: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsRequestV19 {
+    directory_number: WireFixedText<25>,
+    alignment: [u8; 3],
+    call_reference: u32,
+    processing: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireForwardStatusV3 {
+    active: u32,
+    line_instance: u32,
+    all_active: u32,
+    all_number: WireFixedText<24>,
+    busy_active: u32,
+    busy_number: WireFixedText<24>,
+    no_answer_active: u32,
+    no_answer_number: WireFixedText<24>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireForwardStatusV19 {
+    active: u32,
+    line_instance: u32,
+    all_active: u32,
+    all_number: WireFixedText<25>,
+    all_alignment: [u8; 3],
+    busy_active: u32,
+    busy_number: WireFixedText<25>,
+    busy_alignment: [u8; 3],
+    no_answer_active: u32,
+    no_answer_number: WireFixedText<25>,
+    no_answer_alignment: [u8; 3],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireSpeedDialStatus {
+    instance: u32,
+    number: WireFixedText<24>,
+    display_name: WireFixedText<40>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireDialedNumberV3 {
+    number: WireFixedText<24>,
+    line_instance: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireDialedNumberV19 {
+    number: WireFixedText<25>,
+    alignment: [u8; 3],
+    line_instance: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireFeatureStatus {
+    instance: u32,
+    button_type: u32,
+    label: WireFixedText<40>,
+    state: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireFeatureStatusDynamic {
+    instance: u32,
+    button_type: u32,
+    state: u32,
+    label: WireFixedText<121>,
+    padding: [u8; 3],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireServiceUrlStatus {
+    index: u32,
+    url: WireFixedText<256>,
+    label: WireFixedText<40>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireNotification {
+    transaction_id: u32,
+    feature_id: u32,
+    status: u32,
+    text: WireFixedText<100>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireRegister {
+    device_id: WireFixedText<16>,
+    station_user_id: u32,
+    station_instance: u32,
+    reported_address: [u8; 4],
+    device_type: u32,
+    max_streams: u32,
+    active_streams: u32,
+    protocol_features: [u8; 4],
+    max_conferences: u32,
+    active_conferences: u32,
+    mac_address: [u8; 12],
+    ipv4_address_scope: u32,
+    max_lines: u32,
+    ipv6_address: [u8; 16],
+    ipv6_address_scope: u32,
+    firmware: WireFixedText<32>,
+}
+
+words!(WireKeypadButton {
+    button,
+    line_instance,
+    call_reference,
+    keypad_union,
+    reserved
+});
+
+words!(WireKeypadButtonWithCall {
+    button,
+    line_instance,
+    call_reference
+});
+
+words!(WireKeypadButtonLegacy { button });
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireEnblocBefore19 {
+    called_party: WireFixedText<24>,
+    line_instance: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireEnblocFrom19 {
+    called_party: WireFixedText<25>,
+    alignment: [u8; 3],
+    line_instance: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOffHookWithCallingPartyBefore19 {
+    calling_party_number: WireFixedText<24>,
+    voice_mailbox: WireFixedText<24>,
+    line_instance: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOffHookWithCallingPartyFrom19 {
+    calling_party_number: WireFixedText<25>,
+    voice_mailbox: WireFixedText<25>,
+    alignment: [u8; 2],
+    line_instance: u32,
+}
+
+words!(WireStimulus {
+    stimulus,
+    instance,
+    call_reference,
+    status
+});
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireMediaCapability {
+    codec: u32,
+    max_frames_per_packet: u32,
+    codec_parameters: [u8; 8],
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireCapabilitiesResponse {
+    count: u32,
+    #[br(count = count)]
+    capabilities: Vec<WireMediaCapability>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireAlarmLegacy {
+    severity: u32,
+    text: WireFixedText<80>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireAlarm {
+    severity: u32,
+    text: WireFixedText<80>,
+    parameter_1: u32,
+    parameter_2: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireLocationInfo {
+    xml: WireFixedText<2401>,
+    alignment: [u8; 3],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenReceiveAckV3 {
+    status: u32,
+    address: [u8; 4],
+    port: u32,
+    passthrough_party_id: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenReceiveAckV17 {
+    status: u32,
+    address: WireExtendedAddress,
+    port: u32,
+    passthrough_party_id: u32,
+    call_reference: u32,
+}
+
+words!(WireSoftKeyEvent {
+    event,
+    line_instance,
+    call_reference
+});
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireRegisterToken {
+    device_id: WireFixedText<16>,
+    device_instance: u32,
+    ipv4_address: [u8; 4],
+    device_type: u32,
+    ipv6_address: [u8; 16],
+    flags: u32,
+}
+
+words!(WireMediaResourceNotification {
+    device_type,
+    in_service_streams,
+    max_streams_per_conference,
+    out_of_service_streams
+});
+words!(WireAccessoryStatus { accessory, state });
+words!(WireDtmfToneControl {
+    tone,
+    conference_id,
+    passthrough_party_id
+});
+words!(WireDtmfPayloadIdentity {
+    payload_type,
+    conference_id,
+    passthrough_party_id
+});
+words!(WireDtmfPayloadRequest {
+    payload_type,
+    conference_id,
+    passthrough_party_id,
+    dtmf_type
+});
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireMediaFailureDetection {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    packet_millis: u32,
+    codec: u32,
+    echo_cancellation: u32,
+    codec_qualifier: [u8; 4],
+    call_reference: u32,
+}
+words!(WireMultimediaStreamControl {
+    conference_id,
+    passthrough_party_id,
+    call_reference,
+    port_handling_flag
+});
+words!(WireVideoFlowControl {
+    conference_id,
+    passthrough_party_id,
+    call_reference,
+    maximum_bit_rate
+});
+words!(WireVideoDisplayCommand {
+    conference_id,
+    call_reference,
+    layout_id
+});
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenMultimediaAckPre17 {
+    status: u32,
+    address: [u8; 4],
+    port: u32,
+    passthrough_party_id: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenMultimediaAckFrom17 {
+    status: u32,
+    address: WireExtendedAddress,
+    port: u32,
+    passthrough_party_id: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMultimediaAckPre17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    call_reference: u32,
+    address: [u8; 4],
+    port: u32,
+    status: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMultimediaAckFrom17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    call_reference: u32,
+    address: WireExtendedAddress,
+    port: u32,
+    status: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireSessionTransmissionPre17 {
+    remote_address: [u8; 4],
+    session_type: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireSessionTransmissionFrom17 {
+    remote_address: WireExtendedAddress,
+    session_type: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireMultimediaPayloadDescriptor {
+    payload_rfc_number: u32,
+    payload_type: u32,
+}
+
+impl From<MultimediaPayloadDescriptor> for WireMultimediaPayloadDescriptor {
+    fn from(value: MultimediaPayloadDescriptor) -> Self {
+        Self {
+            payload_rfc_number: value.rfc_number(),
+            payload_type: value.payload_number().into(),
+        }
+    }
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenMultimediaV11 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    compression_type: u32,
+    line_instance: u32,
+    call_reference: u32,
+    payload_type: WireMultimediaPayloadDescriptor,
+    conference_creator: u32,
+    capability: [u8; MULTIMEDIA_CAPABILITY_BYTES],
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenMultimediaV12 {
+    base: WireOpenMultimediaV11,
+    source_address: [u8; 4],
+    source_port: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireOpenMultimediaV17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    compression_type: u32,
+    line_instance: u32,
+    call_reference: u32,
+    payload_type: WireMultimediaPayloadDescriptor,
+    conference_creator: u32,
+    capability: [u8; MULTIMEDIA_CAPABILITY_BYTES],
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+    source_address: WireExtendedAddress,
+    source_port: u32,
+    requested_address_type: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMultimediaPre17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    compression_type: u32,
+    remote_address: [u8; 4],
+    remote_port: u32,
+    call_reference: u32,
+    payload_type: WireMultimediaPayloadDescriptor,
+    dscp: u32,
+    capability: [u8; MULTIMEDIA_CAPABILITY_BYTES],
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireStartMultimediaFrom17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    compression_type: u32,
+    remote_address: WireExtendedAddress,
+    remote_port: u32,
+    call_reference: u32,
+    payload_type: WireMultimediaPayloadDescriptor,
+    dscp: u32,
+    capability: [u8; MULTIMEDIA_CAPABILITY_BYTES],
+    encryption: WireEncryptionInfo,
+    stream_passthrough_id: u32,
+    associated_stream_id: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireMiscellaneousCommand {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    call_reference: u32,
+    command: u32,
+    data: [u8; 36],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireExtensionDeviceCapabilities {
+    unknown_1: u32,
+    unknown_2: u32,
+    unknown_3: u32,
+    description: WireFixedText<152>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireMediaFailureV3 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    address: [u8; 4],
+    port: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireMediaFailureV17 {
+    conference_id: u32,
+    passthrough_party_id: u32,
+    address: WireExtendedAddress,
+    port: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireUserData {
+    application_id: u32,
+    line_instance: u32,
+    call_reference: u32,
+    transaction_id: u32,
+    data_length: u32,
+    #[br(count = data_length)]
+    data: Vec<u8>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireUserDataV1 {
+    application_id: u32,
+    line_instance: u32,
+    call_reference: u32,
+    transaction_id: u32,
+    data_length: u32,
+    sequence_flag: u32,
+    display_priority: u32,
+    conference_id: u32,
+    application_instance_id: u32,
+    routing: u32,
+    #[br(count = data_length)]
+    data: Vec<u8>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WirePortResponseV3 {
+    conference_id: u32,
+    call_reference: u32,
+    passthrough_party_id: u32,
+    address: [u8; 4],
+    rtp_port: u32,
+    rtcp_port: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WirePortResponseV20 {
+    conference_id: u32,
+    call_reference: u32,
+    passthrough_party_id: u32,
+    address: WireExtendedAddress,
+    rtp_port: u32,
+    rtcp_port: u32,
+    media_type: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireSubscriptionRequest {
+    transaction_id: u32,
+    feature_id: u32,
+    timer_seconds: u32,
+    subscription_id: WireFixedText<256>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsTail {
+    packets_sent: u32,
+    octets_sent: u32,
+    packets_received: u32,
+    octets_received: u32,
+    packets_lost: u32,
+    jitter_millis: u32,
+    latency_millis: u32,
+    quality_size: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsV3 {
+    directory_number: WireFixedText<24>,
+    call_reference: u32,
+    processing: u32,
+    statistics: WireConnectionStatisticsTail,
+    #[br(count = statistics.quality_size)]
+    quality: Vec<u8>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsV19 {
+    directory_number: WireFixedText<25>,
+    alignment: [u8; 3],
+    call_reference: u32,
+    processing: u32,
+    statistics: WireConnectionStatisticsTail,
+    #[br(count = statistics.quality_size)]
+    quality: Vec<u8>,
+}
+
+impl ClientMessage {
+    /// Decodes a station-originated frame with an explicit negotiated version.
+    ///
+    /// Use this after registration when the session version is authoritative,
+    /// especially for layouts whose header version is zero or ambiguous.
+    pub fn decode_with_version(
+        frame: Frame,
+        protocol: ProtocolVersion,
+    ) -> Result<Self, CodecError> {
+        ensure_station_route(&frame, MessageRoute::StationToControl, "station-to-control")?;
+        Self::decode_using_protocol(frame, protocol.wire())
+    }
+
+    /// Decodes a station-originated frame using its header version.
+    ///
+    /// This is suitable for initial messages that carry a meaningful header
+    /// version. Established sessions should prefer [`Self::decode_with_version`].
+    pub fn decode(frame: Frame) -> Result<Self, CodecError> {
+        ensure_station_route(&frame, MessageRoute::StationToControl, "station-to-control")?;
+        let protocol_version = frame.protocol_version;
+        Self::decode_using_protocol(frame, protocol_version)
+    }
+
+    fn decode_using_protocol(frame: Frame, protocol_version: u32) -> Result<Self, CodecError> {
+        let p = &frame.payload;
+        match frame.message_id {
+            id::KEEP_ALIVE => Ok(Self::KeepAlive),
+            id::REGISTER => {
+                const REQUIRED_BYTES: usize = 124;
+                const MAXIMUM_BYTES: usize = REQUIRED_BYTES + 48;
+                if p.len() < REQUIRED_BYTES {
+                    return Err(CodecError::Truncated {
+                        message_id: frame.message_id,
+                        needed: REQUIRED_BYTES,
+                        actual: p.len(),
+                    });
+                }
+                if p.len() > MAXIMUM_BYTES {
+                    return Err(CodecError::TrailingBytes {
+                        message_id: frame.message_id,
+                        count: p.len() - MAXIMUM_BYTES,
+                    });
+                }
+                let value: WireRegister = decode(frame.message_id, &p[..REQUIRED_BYTES])?;
+                let reported_address = if value.reported_address.iter().any(|byte| *byte != 0) {
+                    Some(Ipv4Addr::from(value.reported_address))
+                } else {
+                    None
+                };
+                let reported_ipv6_address = if value.ipv6_address.iter().any(|byte| *byte != 0) {
+                    Some(Ipv6Addr::from(value.ipv6_address))
+                } else {
+                    None
+                };
+                let advertised_protocol = u32::from(value.protocol_features[0]);
+                Ok(Self::Register(RegistrationMessage {
+                    device_id: DeviceId::new(value.device_id.text()?)?,
+                    reported_address,
+                    reported_ipv6_address,
+                    device_type: DeviceType::from(value.device_type),
+                    advertised_protocol,
+                    features: PhoneFeatures::from_bits_retain(
+                        u32::from_le_bytes(value.protocol_features) & !0xff,
+                    ),
+                    firmware: value.firmware.text()?,
+                    configuration_version_stamp: BoundedBytes::try_from(
+                        p[REQUIRED_BYTES..].to_vec(),
+                    )
+                    .expect("registration suffix length was bounded before allocation"),
+                    wire: Some(RegistrationWireDetails {
+                        station_user_id: value.station_user_id,
+                        station_instance: value.station_instance,
+                        max_streams: value.max_streams,
+                        active_streams: value.active_streams,
+                        mac_address_and_padding: value.mac_address,
+                        max_conferences: value.max_conferences,
+                        active_conferences: value.active_conferences,
+                        ipv4_address_scope: value.ipv4_address_scope,
+                        max_lines: value.max_lines,
+                        ipv6_address_scope: value.ipv6_address_scope,
+                    }),
+                }))
+            }
+            id::IP_PORT => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::IpPort {
+                    rtp_port: decode_port(value.value, frame.message_id, "RTP port")?,
+                })
+            }
+            id::KEYPAD_BUTTON => {
+                let (button, line_instance, call_reference, wire_layout) = match p.len() {
+                    4 => {
+                        let value: WireKeypadButtonLegacy = decode(frame.message_id, p)?;
+                        (
+                            value.button,
+                            0,
+                            0,
+                            Some(KeypadButtonWireLayout::LegacyButtonOnly),
+                        )
+                    }
+                    12 => {
+                        let value: WireKeypadButtonWithCall = decode(frame.message_id, p)?;
+                        (
+                            value.button,
+                            value.line_instance,
+                            value.call_reference,
+                            Some(KeypadButtonWireLayout::WithCallIdentity),
+                        )
+                    }
+                    20 => {
+                        let value: WireKeypadButton = decode(frame.message_id, p)?;
+                        if value.keypad_union != 0 || value.reserved != 0 {
+                            return Err(CodecError::InvalidValue {
+                                message_id: frame.message_id,
+                                field: "keypad reserved fields",
+                                value: 1,
+                            });
+                        }
+                        (
+                            value.button,
+                            value.line_instance,
+                            value.call_reference,
+                            None,
+                        )
+                    }
+                    _ => return Err(CodecError::InvalidLength(frame.message_id)),
+                };
+                Ok(Self::KeypadButton {
+                    button: Digit::from_keypad(button),
+                    line_instance,
+                    call_reference,
+                    wire_layout,
+                })
+            }
+            id::ENBLOC_CALL => {
+                let (called_party, line_instance) = if protocol_version >= 19 {
+                    let value: WireEnblocFrom19 = decode(frame.message_id, p)?;
+                    validate_zero_payload(&value.alignment, frame.message_id, 3)?;
+                    (value.called_party.text()?, value.line_instance)
+                } else {
+                    let value: WireEnblocBefore19 = decode(frame.message_id, p)?;
+                    (value.called_party.text()?, value.line_instance)
+                };
+                Ok(Self::EnblocCall {
+                    called_party,
+                    line_instance,
+                })
+            }
+            id::STIMULUS => {
+                let value: WireStimulus = decode(frame.message_id, p)?;
+                Ok(Self::Stimulus {
+                    stimulus: Stimulus::from(value.stimulus),
+                    instance: value.instance,
+                    call_reference: value.call_reference,
+                    status: value.status,
+                })
+            }
+            id::OFF_HOOK => {
+                let value: WireLineCall = decode(frame.message_id, p)?;
+                Ok(Self::OffHook {
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::ON_HOOK => {
+                let value: WireLineCall = decode(frame.message_id, p)?;
+                Ok(Self::OnHook {
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::OFF_HOOK_WITH_CALLING_PARTY => {
+                let (calling_party_number, voice_mailbox, line_instance) = if protocol_version >= 19
+                {
+                    let value: WireOffHookWithCallingPartyFrom19 = decode(frame.message_id, p)?;
+                    validate_zero_payload(&value.alignment, frame.message_id, 2)?;
+                    (
+                        value.calling_party_number.text()?,
+                        value.voice_mailbox.text()?,
+                        value.line_instance,
+                    )
+                } else {
+                    let value: WireOffHookWithCallingPartyBefore19 = decode(frame.message_id, p)?;
+                    (
+                        value.calling_party_number.text()?,
+                        value.voice_mailbox.text()?,
+                        value.line_instance,
+                    )
+                };
+                Ok(Self::OffHookWithCallingParty {
+                    calling_party_number,
+                    voice_mailbox,
+                    line_instance,
+                })
+            }
+            id::LINE_STAT_REQ => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::LineStatRequest {
+                    line_instance: value.value,
+                })
+            }
+            id::CONFIG_STAT_REQ => Ok(Self::ConfigStatRequest),
+            id::TIME_DATE_REQ => Ok(Self::TimeDateRequest),
+            id::BUTTON_TEMPLATE_REQ => Ok(Self::ButtonTemplateRequest),
+            id::VERSION_REQ => Ok(Self::VersionRequest),
+            id::CAPABILITIES_RES => {
+                let count = usize_from_wire(
+                    frame.message_id,
+                    "audio capabilities",
+                    decode_prefix::<WireOneWord>(frame.message_id, p)?.value,
+                )?;
+                if count > 18 {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: frame.message_id,
+                        field: "audio capabilities",
+                        count,
+                        maximum: 18,
+                    });
+                }
+                let value: WireCapabilitiesResponse = decode(frame.message_id, p)?;
+                let caps = value
+                    .capabilities
+                    .into_iter()
+                    .map(|capability| MediaCapability {
+                        codec: Codec::from(capability.codec),
+                        max_frames_per_packet: capability.max_frames_per_packet,
+                        codec_parameters: capability.codec_parameters,
+                    })
+                    .collect();
+                Ok(Self::CapabilitiesResponse(caps))
+            }
+            id::UPDATE_CAPABILITIES => {
+                let expanded_layout = CapabilityUpdateVariant::Version1ExpandedVideo;
+                let variant = if protocol_version >= 16
+                    && p.len() >= expanded_layout.minimum_payload_bytes(protocol_version)
+                {
+                    expanded_layout
+                } else {
+                    CapabilityUpdateVariant::Version1
+                };
+                CapabilityUpdate::decode(variant, protocol_version, p).map(Self::CapabilitiesUpdate)
+            }
+            id::UPDATE_CAPABILITIES_V2 => {
+                CapabilityUpdate::decode(CapabilityUpdateVariant::Version2, protocol_version, p)
+                    .map(Self::CapabilitiesUpdate)
+            }
+            id::UPDATE_CAPABILITIES_V3 => {
+                CapabilityUpdate::decode(CapabilityUpdateVariant::Version3, protocol_version, p)
+                    .map(Self::CapabilitiesUpdate)
+            }
+            id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK => {
+                decode_open_multimedia_ack(p, protocol_version, frame.message_id)
+                    .map(Self::OpenMultimediaReceiveChannelAck)
+            }
+            id::SERVER_REQ => Ok(Self::ServerRequest),
+            id::ALARM => match p.len() {
+                84 => {
+                    let value: WireAlarmLegacy = decode(frame.message_id, p)?;
+                    Ok(Self::Alarm {
+                        severity: AlarmSeverity::from(value.severity),
+                        text: value.text.text()?,
+                        parameters: None,
+                    })
+                }
+                92 => {
+                    let value: WireAlarm = decode(frame.message_id, p)?;
+                    Ok(Self::Alarm {
+                        severity: AlarmSeverity::from(value.severity),
+                        text: value.text.text()?,
+                        parameters: Some([value.parameter_1, value.parameter_2]),
+                    })
+                }
+                _ => Err(CodecError::InvalidLength(frame.message_id)),
+            },
+            id::MULTICAST_MEDIA_RECEPTION_ACK => {
+                validate_exact_payload(p, frame.message_id, 12)?;
+                let value: WireMulticastReceptionAck = decode(frame.message_id, p)?;
+                Ok(Self::MulticastMediaReceptionAck {
+                    status: MediaStatus::from(value.status),
+                    passthrough_party_id: value.passthrough_party_id.into(),
+                    call_reference: value.call_reference.into(),
+                })
+            }
+            id::OPEN_RECEIVE_CHANNEL_ACK => {
+                if protocol_version >= 17 {
+                    let value: WireOpenReceiveAckV17 = decode(frame.message_id, p)?;
+                    Ok(Self::OpenReceiveChannelAck {
+                        status: MediaStatus::from(value.status),
+                        address: value.address.to_ip(frame.message_id)?,
+                        port: decode_port(value.port, frame.message_id, "RTP port")?,
+                        passthrough_party_id: value.passthrough_party_id,
+                        call_reference: value.call_reference,
+                    })
+                } else {
+                    let value: WireOpenReceiveAckV3 = decode(frame.message_id, p)?;
+                    Ok(Self::OpenReceiveChannelAck {
+                        status: MediaStatus::from(value.status),
+                        address: IpAddr::V4(Ipv4Addr::from(value.address)),
+                        port: decode_port(value.port, frame.message_id, "RTP port")?,
+                        passthrough_party_id: value.passthrough_party_id,
+                        call_reference: value.call_reference,
+                    })
+                }
+            }
+            id::SOFT_KEY_SET_REQ => Ok(Self::SoftKeySetRequest),
+            id::SOFT_KEY_TEMPLATE_REQ => Ok(Self::SoftKeyTemplateRequest),
+            id::SOFT_KEY_EVENT => {
+                let value: WireSoftKeyEvent = decode(frame.message_id, p)?;
+                Ok(Self::SoftKeyEvent {
+                    event: value.event,
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::UNREGISTER => {
+                let reason = if p.is_empty() {
+                    0
+                } else {
+                    decode::<WireOneWord>(frame.message_id, p)?.value
+                };
+                Ok(Self::Unregister { reason })
+            }
+            id::REGISTER_TOKEN_REQ => {
+                let value: WireRegisterToken = decode(frame.message_id, p)?;
+                let address = if value.ipv6_address.iter().any(|byte| *byte != 0) {
+                    IpAddr::V6(Ipv6Addr::from(value.ipv6_address))
+                } else {
+                    IpAddr::V4(Ipv4Addr::from(value.ipv4_address))
+                };
+                Ok(Self::RegisterToken(RegisterTokenMessage {
+                    device_id: DeviceId::new(value.device_id.text()?)?,
+                    device_instance: value.device_instance,
+                    address,
+                    device_type: DeviceType::from(value.device_type),
+                    flags: value.flags,
+                }))
+            }
+            id::HOOK_FLASH => {
+                let value: WireLineCall = decode(frame.message_id, p)?;
+                Ok(Self::HookFlash {
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::FORWARD_STAT_REQ => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::ForwardStatusRequest {
+                    line_instance: value.value,
+                })
+            }
+            id::SPEED_DIAL_STAT_REQ => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::SpeedDialStatusRequest {
+                    speed_dial_instance: value.value,
+                })
+            }
+            id::HEADSET_STATUS => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::HeadsetStatus {
+                    enabled: value.value == 1,
+                })
+            }
+            id::MEDIA_RESOURCE_NOTIFICATION => {
+                let value: WireMediaResourceNotification = decode(frame.message_id, p)?;
+                Ok(Self::MediaResourceNotification(MediaResourceNotification {
+                    device_type: DeviceType::from(value.device_type),
+                    in_service_streams: value.in_service_streams,
+                    max_streams_per_conference: value.max_streams_per_conference,
+                    out_of_service_streams: value.out_of_service_streams,
+                }))
+            }
+            id::ACCESSORY_STATUS => {
+                let value: WireAccessoryStatus = decode(frame.message_id, p)?;
+                Ok(Self::MediaPathEvent {
+                    path: MediaPathId::from(value.accessory),
+                    event: MediaPathEvent::from(value.state),
+                })
+            }
+            id::MEDIA_PATH_CAPABILITY => {
+                let value: WireAccessoryStatus = decode(frame.message_id, p)?;
+                Ok(Self::MediaPathCapability {
+                    path: MediaPathId::from(value.accessory),
+                    capability: MediaPathCapability::from(value.state),
+                })
+            }
+            id::REGISTER_AVAILABLE_LINES => {
+                let lines = if p.len() >= std::mem::size_of::<u32>() {
+                    decode::<WireOneWord>(frame.message_id, p)?.value
+                } else {
+                    0
+                };
+                Ok(Self::RegisterAvailableLines { lines })
+            }
+            id::DEVICE_TO_USER_DATA => {
+                decode_user_data(p, frame.message_id).map(Self::DeviceToUserData)
+            }
+            id::DEVICE_TO_USER_DATA_RESPONSE => {
+                decode_user_data(p, frame.message_id).map(Self::DeviceToUserDataResponse)
+            }
+            id::DEVICE_TO_USER_DATA_V1 => {
+                decode_user_data_v1(p, frame.message_id).map(Self::DeviceToUserDataV1)
+            }
+            id::DEVICE_TO_USER_DATA_RESPONSE_V1 => {
+                decode_user_data_v1(p, frame.message_id).map(Self::DeviceToUserDataResponseV1)
+            }
+            id::PORT_RESPONSE => {
+                decode_port_response(p, protocol_version, frame.message_id).map(Self::PortResponse)
+            }
+            id::SUBSCRIPTION_STAT_REQ => {
+                let value: WireSubscriptionRequest = decode(frame.message_id, p)?;
+                Ok(Self::SubscriptionStatusRequest(SubscriptionRequest {
+                    transaction_id: value.transaction_id,
+                    feature_id: value.feature_id,
+                    timer_seconds: value.timer_seconds,
+                    subscription_id: value.subscription_id.text()?,
+                }))
+            }
+            id::SUBSCRIBE_DTMF_PAYLOAD_RES => {
+                let value: WireDtmfPayloadIdentity = decode(frame.message_id, p)?;
+                Ok(Self::SubscribeDtmfPayloadResponse(
+                    dtmf_payload_identity_from_wire(value),
+                ))
+            }
+            id::UNSUBSCRIBE_DTMF_PAYLOAD_RES => {
+                let value: WireDtmfPayloadIdentity = decode(frame.message_id, p)?;
+                Ok(Self::UnsubscribeDtmfPayloadResponse(
+                    dtmf_payload_identity_from_wire(value),
+                ))
+            }
+            id::SERVICE_URL_STAT_REQ => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::ServiceUrlStatusRequest { index: value.value })
+            }
+            id::FEATURE_STAT_REQ => {
+                let value: WireFeatureStatusRequest = decode(frame.message_id, p)?;
+                Ok(Self::FeatureStatusRequest {
+                    index: value.index,
+                    capabilities: value.capabilities,
+                })
+            }
+            id::MEDIA_TRANSMISSION_FAILURE => {
+                if protocol_version >= 17 {
+                    let value: WireMediaFailureV17 = decode(frame.message_id, p)?;
+                    Ok(Self::MediaTransmissionFailure {
+                        conference_id: value.conference_id,
+                        passthrough_party_id: value.passthrough_party_id,
+                        address: value.address.to_ip(frame.message_id)?,
+                        port: decode_port(value.port, frame.message_id, "RTP port")?,
+                        call_reference: value.call_reference,
+                        status: MediaStatus::UnspecifiedError,
+                    })
+                } else {
+                    let value: WireMediaFailureV3 = decode(frame.message_id, p)?;
+                    Ok(Self::MediaTransmissionFailure {
+                        conference_id: value.conference_id,
+                        passthrough_party_id: value.passthrough_party_id,
+                        address: IpAddr::V4(Ipv4Addr::from(value.address)),
+                        port: decode_port(value.port, frame.message_id, "RTP port")?,
+                        call_reference: value.call_reference,
+                        status: MediaStatus::UnspecifiedError,
+                    })
+                }
+            }
+            id::CONNECTION_STATISTICS_RES => {
+                decode_connection_statistics(p, protocol_version, frame.message_id)
+                    .map(Self::ConnectionStatisticsResponse)
+            }
+            id::START_MEDIA_TRANSMISSION_ACK => {
+                decode_start_media_ack(p, protocol_version, frame.message_id)
+                    .map(Self::StartMediaTransmissionAck)
+            }
+            id::START_MULTIMEDIA_TRANSMISSION_ACK => {
+                decode_start_multimedia_ack(p, protocol_version, frame.message_id)
+                    .map(Self::StartMultimediaTransmissionAck)
+            }
+            id::EXTENSION_DEVICE_CAPABILITIES => {
+                let value: WireExtensionDeviceCapabilities = decode(frame.message_id, p)?;
+                Ok(Self::ExtensionDeviceCapabilities(
+                    ExtensionDeviceCapabilities {
+                        unknown_1: value.unknown_1,
+                        unknown_2: value.unknown_2,
+                        unknown_3: value.unknown_3,
+                        description: value.description.text()?,
+                    },
+                ))
+            }
+            id::LOCATION_INFO => {
+                let value: WireLocationInfo = decode(frame.message_id, p)?;
+                validate_zero_payload(&value.alignment, frame.message_id, 3)?;
+                Ok(Self::LocationInfo {
+                    xml: value.xml.text()?,
+                })
+            }
+            id::XML_ALARM => XmlAlarmMessage::from_wire_payload(p.to_vec()).map(Self::XmlAlarm),
+            id::CALL_COUNT_REQ => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::CallCountRequest { value: value.value })
+            }
+            id::CREATE_CONFERENCE_RES => {
+                validate_conference_data_length(p, frame.message_id, 12, 8)?;
+                let value: WireConferenceResponse = decode_zero_padded(frame.message_id, p)?;
+                Ok(Self::CreateConferenceResponse(CreateConferenceResponse {
+                    conference_id: value.conference_id.into(),
+                    result: CreateConferenceResult::from(value.result),
+                    passthrough_data: value.passthrough_data,
+                }))
+            }
+            id::DELETE_CONFERENCE_RES => {
+                validate_exact_payload(p, frame.message_id, 8)?;
+                let value: WireCallParty = decode(frame.message_id, p)?;
+                Ok(Self::DeleteConferenceResponse {
+                    conference_id: value.call_reference.into(),
+                    result: DeleteConferenceResult::from(value.passthrough_party_id),
+                })
+            }
+            id::MODIFY_CONFERENCE_RES => {
+                validate_conference_data_length(p, frame.message_id, 12, 8)?;
+                let value: WireConferenceResponse = decode_zero_padded(frame.message_id, p)?;
+                Ok(Self::ModifyConferenceResponse(ModifyConferenceResponse {
+                    conference_id: value.conference_id.into(),
+                    result: ModifyConferenceResult::from(value.result),
+                    passthrough_data: value.passthrough_data,
+                }))
+            }
+            id::AUDIT_CONFERENCE_RES => {
+                if p.len() < 8 {
+                    return Err(CodecError::Truncated {
+                        message_id: frame.message_id,
+                        needed: 8,
+                        actual: p.len(),
+                    });
+                }
+                let number_of_entries = usize_from_wire(
+                    frame.message_id,
+                    "conference audit entries",
+                    u32::from_le_bytes(p[4..8].try_into().expect("validated audit header")),
+                )?;
+                if number_of_entries > MAX_AUDIT_CONFERENCE_ENTRIES {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: frame.message_id,
+                        field: "conference audit entries",
+                        count: number_of_entries,
+                        maximum: MAX_AUDIT_CONFERENCE_ENTRIES,
+                    });
+                }
+                validate_exact_payload(p, frame.message_id, 8 + number_of_entries * 76)?;
+                let value: WireAuditConferenceResponse = decode(frame.message_id, p)?;
+                Ok(Self::AuditConferenceResponse(AuditConferenceResponse {
+                    last: value.last,
+                    entries: value
+                        .entries
+                        .into_iter()
+                        .map(|entry| {
+                            Ok(AuditConferenceEntry {
+                                conference_id: entry.conference_id.into(),
+                                resource_type: ConferenceResourceType::from(entry.resource_type),
+                                reserved_participants: entry.reserved_participants,
+                                active_participants: entry.active_participants,
+                                application_id: entry.application_id.into(),
+                                application_conference_id: entry
+                                    .application_conference_id
+                                    .text()?,
+                                application_data: entry.application_data.text()?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, CodecError>>()?,
+                }))
+            }
+            id::ADD_PARTICIPANT_RES => {
+                validate_payload_bounds(p, frame.message_id, 12, 272)?;
+                let value: WireAddParticipantResponseHeader = decode_prefix(frame.message_id, p)?;
+                let identifier_end = if p.len() == 272 {
+                    if p[269..].iter().any(|byte| *byte != 0) {
+                        return Err(CodecError::InvalidValue {
+                            message_id: frame.message_id,
+                            field: "AddParticipantResponse alignment",
+                            value: 1,
+                        });
+                    }
+                    269
+                } else {
+                    p.len()
+                };
+                let identifier = &p[12..identifier_end];
+                let bridge_participant_id =
+                    BoundedBytes::try_from(identifier).map_err(|error| {
+                        CodecError::CountTooLarge {
+                            message_id: frame.message_id,
+                            field: "bridge participant identifier",
+                            count: error.actual,
+                            maximum: error.maximum,
+                        }
+                    })?;
+                Ok(Self::AddParticipantResponse(AddParticipantResponse {
+                    conference_id: value.conference_id.into(),
+                    call_reference: value.call_reference.into(),
+                    result: AddParticipantResult::from(value.result),
+                    bridge_participant_id,
+                }))
+            }
+            id::AUDIT_PARTICIPANT_RES => {
+                if p.len() < 16 {
+                    return Err(CodecError::Truncated {
+                        message_id: frame.message_id,
+                        needed: 16,
+                        actual: p.len(),
+                    });
+                }
+                let participant_entries = &p[16..];
+                if participant_entries.len() > MAX_AUDIT_PARTICIPANT_DATA {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: frame.message_id,
+                        field: "participant audit data",
+                        count: participant_entries.len(),
+                        maximum: MAX_AUDIT_PARTICIPANT_DATA,
+                    });
+                }
+                let value: WireAuditParticipantResponseHeader = decode(frame.message_id, &p[..16])?;
+                Ok(Self::AuditParticipantResponse(AuditParticipantResponse {
+                    result: AuditParticipantResult::from(value.result),
+                    last: value.last,
+                    conference_id: value.conference_id.into(),
+                    number_of_entries: value.number_of_entries,
+                    participant_entries: participant_entries.to_vec(),
+                }))
+            }
+            _ => {
+                let id = frame.message_type();
+                if id.is_known() {
+                    preserve_known_message(frame, id).map(Self::KnownOpaque)
+                } else {
+                    Ok(Self::Unknown(RawMessage {
+                        message_id: frame.message_id,
+                        protocol_version: frame.protocol_version,
+                        payload: frame.payload,
+                    }))
+                }
+            }
+        }
+    }
+
+    /// Canonically encode a phone-to-server message.
+    pub fn encode(&self, protocol: ProtocolVersion) -> Result<Vec<u8>, CodecError> {
+        let (message_id, payload, header_protocol) = self.payload(protocol)?;
+        reject_non_station_route(
+            message_id,
+            MessageRoute::StationToControl,
+            "station-to-control",
+        )?;
+        Frame::new(header_protocol, message_id, payload).encode()
+    }
+
+    fn encode_unchecked(&self, protocol: ProtocolVersion) -> Result<Vec<u8>, CodecError> {
+        let (message_id, payload, header_protocol) = self.payload(protocol)?;
+        Frame::new(header_protocol, message_id, payload).encode()
+    }
+
+    fn payload(&self, protocol: ProtocolVersion) -> Result<(u32, Vec<u8>, u32), CodecError> {
+        let mut payload = Vec::new();
+        let mut header_protocol = protocol.wire();
+        let message_id = match self {
+            Self::KeepAlive => {
+                header_protocol = 0;
+                id::KEEP_ALIVE
+            }
+            Self::Register(registration) => {
+                header_protocol = 0;
+                let feature_bytes = registration.features.bits().to_le_bytes();
+                let wire = registration.wire.unwrap_or(RegistrationWireDetails {
+                    station_user_id: 0,
+                    station_instance: 1,
+                    max_streams: 0,
+                    active_streams: 0,
+                    mac_address_and_padding: [0; 12],
+                    max_conferences: 0,
+                    active_conferences: 0,
+                    ipv4_address_scope: 0,
+                    max_lines: 0,
+                    ipv6_address_scope: 0,
+                });
+                payload = encode(
+                    id::REGISTER,
+                    &WireRegister {
+                        device_id: WireFixedText::new(
+                            id::REGISTER,
+                            "device ID",
+                            registration.device_id.as_str(),
+                        )?,
+                        station_user_id: wire.station_user_id,
+                        station_instance: wire.station_instance,
+                        reported_address: registration
+                            .reported_address
+                            .unwrap_or(Ipv4Addr::UNSPECIFIED)
+                            .octets(),
+                        device_type: registration.device_type.wire_value(),
+                        max_streams: wire.max_streams,
+                        active_streams: wire.active_streams,
+                        protocol_features: [
+                            registration.advertised_protocol.min(u32::from(u8::MAX)) as u8,
+                            feature_bytes[1],
+                            feature_bytes[2],
+                            feature_bytes[3],
+                        ],
+                        max_conferences: wire.max_conferences,
+                        active_conferences: wire.active_conferences,
+                        mac_address: wire.mac_address_and_padding,
+                        ipv4_address_scope: wire.ipv4_address_scope,
+                        max_lines: wire.max_lines,
+                        ipv6_address: registration
+                            .reported_ipv6_address
+                            .unwrap_or(Ipv6Addr::UNSPECIFIED)
+                            .octets(),
+                        ipv6_address_scope: wire.ipv6_address_scope,
+                        firmware: WireFixedText::new(
+                            id::REGISTER,
+                            "firmware",
+                            &registration.firmware,
+                        )?,
+                    },
+                )?;
+                payload.extend_from_slice(registration.configuration_version_stamp.as_bytes());
+                id::REGISTER
+            }
+            Self::IpPort { rtp_port } => {
+                payload = encode(
+                    id::IP_PORT,
+                    &WireOneWord {
+                        value: u32::from(*rtp_port),
+                    },
+                )?;
+                id::IP_PORT
+            }
+            Self::KeypadButton {
+                button,
+                line_instance,
+                call_reference,
+                wire_layout,
+            } => {
+                payload = match wire_layout {
+                    Some(KeypadButtonWireLayout::LegacyButtonOnly) => encode(
+                        id::KEYPAD_BUTTON,
+                        &WireKeypadButtonLegacy {
+                            button: button.keypad_value(),
+                        },
+                    )?,
+                    Some(KeypadButtonWireLayout::WithCallIdentity) => encode(
+                        id::KEYPAD_BUTTON,
+                        &WireKeypadButtonWithCall {
+                            button: button.keypad_value(),
+                            line_instance: *line_instance,
+                            call_reference: *call_reference,
+                        },
+                    )?,
+                    None => encode(
+                        id::KEYPAD_BUTTON,
+                        &WireKeypadButton {
+                            button: button.keypad_value(),
+                            line_instance: *line_instance,
+                            call_reference: *call_reference,
+                            keypad_union: 0,
+                            reserved: 0,
+                        },
+                    )?,
+                };
+                id::KEYPAD_BUTTON
+            }
+            Self::EnblocCall {
+                called_party,
+                line_instance,
+            } => {
+                if protocol.wire() >= 19 {
+                    payload = encode(
+                        id::ENBLOC_CALL,
+                        &WireEnblocFrom19 {
+                            called_party: WireFixedText::new(
+                                id::ENBLOC_CALL,
+                                "called party",
+                                called_party,
+                            )?,
+                            alignment: [0; 3],
+                            line_instance: *line_instance,
+                        },
+                    )?;
+                } else {
+                    payload = encode(
+                        id::ENBLOC_CALL,
+                        &WireEnblocBefore19 {
+                            called_party: WireFixedText::new(
+                                id::ENBLOC_CALL,
+                                "called party",
+                                called_party,
+                            )?,
+                            line_instance: *line_instance,
+                        },
+                    )?;
+                }
+                id::ENBLOC_CALL
+            }
+            Self::Stimulus {
+                stimulus,
+                instance,
+                call_reference,
+                status,
+            } => {
+                payload = encode(
+                    id::STIMULUS,
+                    &WireStimulus {
+                        stimulus: stimulus.wire_value(),
+                        instance: *instance,
+                        call_reference: *call_reference,
+                        status: *status,
+                    },
+                )?;
+                id::STIMULUS
+            }
+            Self::OffHook {
+                line_instance,
+                call_reference,
+            } => {
+                payload = encode(
+                    id::OFF_HOOK,
+                    &WireLineCall {
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                    },
+                )?;
+                id::OFF_HOOK
+            }
+            Self::OnHook {
+                line_instance,
+                call_reference,
+            } => {
+                payload = encode(
+                    id::ON_HOOK,
+                    &WireLineCall {
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                    },
+                )?;
+                id::ON_HOOK
+            }
+            Self::OffHookWithCallingParty {
+                calling_party_number,
+                voice_mailbox,
+                line_instance,
+            } => {
+                payload = if protocol.wire() >= 19 {
+                    encode(
+                        id::OFF_HOOK_WITH_CALLING_PARTY,
+                        &WireOffHookWithCallingPartyFrom19 {
+                            calling_party_number: WireFixedText::new(
+                                id::OFF_HOOK_WITH_CALLING_PARTY,
+                                "calling party number",
+                                calling_party_number,
+                            )?,
+                            voice_mailbox: WireFixedText::new(
+                                id::OFF_HOOK_WITH_CALLING_PARTY,
+                                "voice mailbox",
+                                voice_mailbox,
+                            )?,
+                            alignment: [0; 2],
+                            line_instance: *line_instance,
+                        },
+                    )?
+                } else {
+                    encode(
+                        id::OFF_HOOK_WITH_CALLING_PARTY,
+                        &WireOffHookWithCallingPartyBefore19 {
+                            calling_party_number: WireFixedText::new(
+                                id::OFF_HOOK_WITH_CALLING_PARTY,
+                                "calling party number",
+                                calling_party_number,
+                            )?,
+                            voice_mailbox: WireFixedText::new(
+                                id::OFF_HOOK_WITH_CALLING_PARTY,
+                                "voice mailbox",
+                                voice_mailbox,
+                            )?,
+                            line_instance: *line_instance,
+                        },
+                    )?
+                };
+                id::OFF_HOOK_WITH_CALLING_PARTY
+            }
+            Self::HookFlash {
+                line_instance,
+                call_reference,
+            } => {
+                payload = encode(
+                    id::HOOK_FLASH,
+                    &WireLineCall {
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                    },
+                )?;
+                id::HOOK_FLASH
+            }
+            Self::ForwardStatusRequest { line_instance } => {
+                payload = encode(
+                    id::FORWARD_STAT_REQ,
+                    &WireOneWord {
+                        value: *line_instance,
+                    },
+                )?;
+                id::FORWARD_STAT_REQ
+            }
+            Self::SpeedDialStatusRequest {
+                speed_dial_instance,
+            } => {
+                payload = encode(
+                    id::SPEED_DIAL_STAT_REQ,
+                    &WireOneWord {
+                        value: *speed_dial_instance,
+                    },
+                )?;
+                id::SPEED_DIAL_STAT_REQ
+            }
+            Self::LineStatRequest { line_instance } => {
+                payload = encode(
+                    id::LINE_STAT_REQ,
+                    &WireOneWord {
+                        value: *line_instance,
+                    },
+                )?;
+                id::LINE_STAT_REQ
+            }
+            Self::ConfigStatRequest => id::CONFIG_STAT_REQ,
+            Self::TimeDateRequest => id::TIME_DATE_REQ,
+            Self::ButtonTemplateRequest => id::BUTTON_TEMPLATE_REQ,
+            Self::VersionRequest => id::VERSION_REQ,
+            Self::CapabilitiesResponse(capabilities) => {
+                if capabilities.len() > 18 {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: id::CAPABILITIES_RES,
+                        field: "audio capabilities",
+                        count: capabilities.len(),
+                        maximum: 18,
+                    });
+                }
+                payload = encode(
+                    id::CAPABILITIES_RES,
+                    &WireCapabilitiesResponse {
+                        count: wire_count(
+                            id::CAPABILITIES_RES,
+                            "audio capabilities",
+                            capabilities.len(),
+                        )?,
+                        capabilities: capabilities
+                            .iter()
+                            .map(|capability| WireMediaCapability {
+                                codec: capability.codec.wire_value(),
+                                max_frames_per_packet: capability.max_frames_per_packet,
+                                codec_parameters: capability.codec_parameters,
+                            })
+                            .collect(),
+                    },
+                )?;
+                id::CAPABILITIES_RES
+            }
+            Self::CapabilitiesUpdate(update) => {
+                payload.extend_from_slice(update.raw_payload());
+                update.variant().message_id()
+            }
+            Self::OpenMultimediaReceiveChannelAck(ack) => {
+                payload = encode_open_multimedia_ack(*ack, protocol)?;
+                id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK
+            }
+            Self::ServerRequest => id::SERVER_REQ,
+            Self::Alarm {
+                severity,
+                text,
+                parameters,
+            } => {
+                let text = WireFixedText::new(id::ALARM, "alarm text", text)?;
+                payload = if let Some([parameter_1, parameter_2]) = parameters {
+                    encode(
+                        id::ALARM,
+                        &WireAlarm {
+                            severity: severity.wire_value(),
+                            text,
+                            parameter_1: *parameter_1,
+                            parameter_2: *parameter_2,
+                        },
+                    )?
+                } else {
+                    encode(
+                        id::ALARM,
+                        &WireAlarmLegacy {
+                            severity: severity.wire_value(),
+                            text,
+                        },
+                    )?
+                };
+                id::ALARM
+            }
+            Self::MulticastMediaReceptionAck {
+                status,
+                passthrough_party_id,
+                call_reference,
+            } => {
+                payload = encode(
+                    id::MULTICAST_MEDIA_RECEPTION_ACK,
+                    &WireMulticastReceptionAck {
+                        status: status.wire_value(),
+                        passthrough_party_id: passthrough_party_id.get(),
+                        call_reference: call_reference.get(),
+                    },
+                )?;
+                id::MULTICAST_MEDIA_RECEPTION_ACK
+            }
+            Self::OpenReceiveChannelAck {
+                status,
+                address,
+                port,
+                passthrough_party_id,
+                call_reference,
+            } => {
+                if protocol.wire() >= 17 {
+                    payload = encode(
+                        id::OPEN_RECEIVE_CHANNEL_ACK,
+                        &WireOpenReceiveAckV17 {
+                            status: status.wire_value(),
+                            address: WireExtendedAddress::from_ip(*address),
+                            port: u32::from(*port),
+                            passthrough_party_id: *passthrough_party_id,
+                            call_reference: *call_reference,
+                        },
+                    )?;
+                } else {
+                    let IpAddr::V4(address) = address else {
+                        return Err(CodecError::InvalidValue {
+                            message_id: id::OPEN_RECEIVE_CHANNEL_ACK,
+                            field: "IP address family for this protocol version",
+                            value: 1,
+                        });
+                    };
+                    payload = encode(
+                        id::OPEN_RECEIVE_CHANNEL_ACK,
+                        &WireOpenReceiveAckV3 {
+                            status: status.wire_value(),
+                            address: address.octets(),
+                            port: u32::from(*port),
+                            passthrough_party_id: *passthrough_party_id,
+                            call_reference: *call_reference,
+                        },
+                    )?;
+                }
+                id::OPEN_RECEIVE_CHANNEL_ACK
+            }
+            Self::SoftKeySetRequest => id::SOFT_KEY_SET_REQ,
+            Self::SoftKeyTemplateRequest => id::SOFT_KEY_TEMPLATE_REQ,
+            Self::SoftKeyEvent {
+                event,
+                line_instance,
+                call_reference,
+            } => {
+                payload = encode(
+                    id::SOFT_KEY_EVENT,
+                    &WireSoftKeyEvent {
+                        event: *event,
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                    },
+                )?;
+                id::SOFT_KEY_EVENT
+            }
+            Self::Unregister { reason } => {
+                payload = encode(id::UNREGISTER, &WireOneWord { value: *reason })?;
+                id::UNREGISTER
+            }
+            Self::RegisterToken(token) => {
+                let (ipv4_address, ipv6_address) = match token.address {
+                    IpAddr::V4(address) => (address.octets(), [0; 16]),
+                    IpAddr::V6(address) => ([0; 4], address.octets()),
+                };
+                payload = encode(
+                    id::REGISTER_TOKEN_REQ,
+                    &WireRegisterToken {
+                        device_id: WireFixedText::new(
+                            id::REGISTER_TOKEN_REQ,
+                            "device ID",
+                            token.device_id.as_str(),
+                        )?,
+                        device_instance: token.device_instance,
+                        ipv4_address,
+                        device_type: token.device_type.wire_value(),
+                        ipv6_address,
+                        flags: token.flags,
+                    },
+                )?;
+                id::REGISTER_TOKEN_REQ
+            }
+            Self::ConnectionStatisticsResponse(statistics) => {
+                payload = encode_connection_statistics(statistics, protocol)?;
+                id::CONNECTION_STATISTICS_RES
+            }
+            Self::HeadsetStatus { enabled } => {
+                payload = encode(
+                    id::HEADSET_STATUS,
+                    &WireOneWord {
+                        value: u32::from(*enabled),
+                    },
+                )?;
+                id::HEADSET_STATUS
+            }
+            Self::MediaResourceNotification(notification) => {
+                payload = encode(
+                    id::MEDIA_RESOURCE_NOTIFICATION,
+                    &WireMediaResourceNotification {
+                        device_type: notification.device_type.wire_value(),
+                        in_service_streams: notification.in_service_streams,
+                        max_streams_per_conference: notification.max_streams_per_conference,
+                        out_of_service_streams: notification.out_of_service_streams,
+                    },
+                )?;
+                id::MEDIA_RESOURCE_NOTIFICATION
+            }
+            Self::MediaPathEvent { path, event } => {
+                payload = encode(
+                    id::ACCESSORY_STATUS,
+                    &WireAccessoryStatus {
+                        accessory: path.wire_value(),
+                        state: event.wire_value(),
+                    },
+                )?;
+                id::ACCESSORY_STATUS
+            }
+            Self::MediaPathCapability { path, capability } => {
+                payload = encode(
+                    id::MEDIA_PATH_CAPABILITY,
+                    &WireAccessoryStatus {
+                        accessory: path.wire_value(),
+                        state: capability.wire_value(),
+                    },
+                )?;
+                id::MEDIA_PATH_CAPABILITY
+            }
+            Self::MediaTransmissionFailure {
+                conference_id,
+                passthrough_party_id,
+                address,
+                port,
+                call_reference,
+                ..
+            } => {
+                if protocol.wire() >= 17 {
+                    payload = encode(
+                        id::MEDIA_TRANSMISSION_FAILURE,
+                        &WireMediaFailureV17 {
+                            conference_id: *conference_id,
+                            passthrough_party_id: *passthrough_party_id,
+                            address: WireExtendedAddress::from_ip(*address),
+                            port: u32::from(*port),
+                            call_reference: *call_reference,
+                        },
+                    )?;
+                } else {
+                    let IpAddr::V4(address) = address else {
+                        return Err(CodecError::InvalidValue {
+                            message_id: id::MEDIA_TRANSMISSION_FAILURE,
+                            field: "IP address family for this protocol version",
+                            value: 1,
+                        });
+                    };
+                    payload = encode(
+                        id::MEDIA_TRANSMISSION_FAILURE,
+                        &WireMediaFailureV3 {
+                            conference_id: *conference_id,
+                            passthrough_party_id: *passthrough_party_id,
+                            address: address.octets(),
+                            port: u32::from(*port),
+                            call_reference: *call_reference,
+                        },
+                    )?;
+                }
+                id::MEDIA_TRANSMISSION_FAILURE
+            }
+            Self::RegisterAvailableLines { lines } => {
+                payload = encode(id::REGISTER_AVAILABLE_LINES, &WireOneWord { value: *lines })?;
+                id::REGISTER_AVAILABLE_LINES
+            }
+            Self::ServiceUrlStatusRequest { index } => {
+                payload = encode(id::SERVICE_URL_STAT_REQ, &WireOneWord { value: *index })?;
+                id::SERVICE_URL_STAT_REQ
+            }
+            Self::FeatureStatusRequest {
+                index,
+                capabilities,
+            } => {
+                payload = encode(
+                    id::FEATURE_STAT_REQ,
+                    &WireFeatureStatusRequest {
+                        index: *index,
+                        capabilities: *capabilities,
+                    },
+                )?;
+                id::FEATURE_STAT_REQ
+            }
+            Self::StartMediaTransmissionAck(ack) => {
+                payload = encode_start_media_ack(ack, protocol)?;
+                id::START_MEDIA_TRANSMISSION_ACK
+            }
+            Self::StartMultimediaTransmissionAck(ack) => {
+                payload = encode_start_multimedia_ack(*ack, protocol)?;
+                id::START_MULTIMEDIA_TRANSMISSION_ACK
+            }
+            Self::ExtensionDeviceCapabilities(capabilities) => {
+                payload = encode(
+                    id::EXTENSION_DEVICE_CAPABILITIES,
+                    &WireExtensionDeviceCapabilities {
+                        unknown_1: capabilities.unknown_1,
+                        unknown_2: capabilities.unknown_2,
+                        unknown_3: capabilities.unknown_3,
+                        description: WireFixedText::new(
+                            id::EXTENSION_DEVICE_CAPABILITIES,
+                            "extension-device capability description",
+                            &capabilities.description,
+                        )?,
+                    },
+                )?;
+                id::EXTENSION_DEVICE_CAPABILITIES
+            }
+            Self::DeviceToUserData(data) => {
+                payload = encode_user_data(data, id::DEVICE_TO_USER_DATA)?;
+                id::DEVICE_TO_USER_DATA
+            }
+            Self::DeviceToUserDataResponse(data) => {
+                payload = encode_user_data(data, id::DEVICE_TO_USER_DATA_RESPONSE)?;
+                id::DEVICE_TO_USER_DATA_RESPONSE
+            }
+            Self::DeviceToUserDataV1(data) => {
+                payload = encode_user_data_v1(data, id::DEVICE_TO_USER_DATA_V1)?;
+                id::DEVICE_TO_USER_DATA_V1
+            }
+            Self::DeviceToUserDataResponseV1(data) => {
+                payload = encode_user_data_v1(data, id::DEVICE_TO_USER_DATA_RESPONSE_V1)?;
+                id::DEVICE_TO_USER_DATA_RESPONSE_V1
+            }
+            Self::PortResponse(endpoint) => {
+                payload = encode_port_response(endpoint, protocol)?;
+                id::PORT_RESPONSE
+            }
+            Self::SubscriptionStatusRequest(subscription) => {
+                payload = encode(
+                    id::SUBSCRIPTION_STAT_REQ,
+                    &WireSubscriptionRequest {
+                        transaction_id: subscription.transaction_id,
+                        feature_id: subscription.feature_id,
+                        timer_seconds: subscription.timer_seconds,
+                        subscription_id: WireFixedText::new(
+                            id::SUBSCRIPTION_STAT_REQ,
+                            "subscription ID",
+                            &subscription.subscription_id,
+                        )?,
+                    },
+                )?;
+                id::SUBSCRIPTION_STAT_REQ
+            }
+            Self::SubscribeDtmfPayloadResponse(identity) => {
+                payload = encode(
+                    id::SUBSCRIBE_DTMF_PAYLOAD_RES,
+                    &dtmf_payload_identity_to_wire(*identity),
+                )?;
+                id::SUBSCRIBE_DTMF_PAYLOAD_RES
+            }
+            Self::UnsubscribeDtmfPayloadResponse(identity) => {
+                payload = encode(
+                    id::UNSUBSCRIBE_DTMF_PAYLOAD_RES,
+                    &dtmf_payload_identity_to_wire(*identity),
+                )?;
+                id::UNSUBSCRIBE_DTMF_PAYLOAD_RES
+            }
+            Self::LocationInfo { xml } => {
+                payload = encode(
+                    id::LOCATION_INFO,
+                    &WireLocationInfo {
+                        xml: WireFixedText::new(id::LOCATION_INFO, "location XML", xml)?,
+                        alignment: [0; 3],
+                    },
+                )?;
+                id::LOCATION_INFO
+            }
+            Self::XmlAlarm(message) => {
+                payload = message.wire_payload().to_vec();
+                id::XML_ALARM
+            }
+            Self::CallCountRequest { value } => {
+                payload = encode(id::CALL_COUNT_REQ, &WireOneWord { value: *value })?;
+                id::CALL_COUNT_REQ
+            }
+            Self::CreateConferenceResponse(response) => {
+                payload = encode(
+                    id::CREATE_CONFERENCE_RES,
+                    &WireConferenceResponse {
+                        conference_id: response.conference_id.get(),
+                        result: response.result.wire_value(),
+                        data_length: validate_conference_data_for_encode(
+                            id::CREATE_CONFERENCE_RES,
+                            &response.passthrough_data,
+                        )?,
+                        passthrough_data: response.passthrough_data.clone(),
+                    },
+                )?;
+                id::CREATE_CONFERENCE_RES
+            }
+            Self::DeleteConferenceResponse {
+                conference_id,
+                result,
+            } => {
+                payload = encode(
+                    id::DELETE_CONFERENCE_RES,
+                    &WireCallParty {
+                        call_reference: conference_id.get(),
+                        passthrough_party_id: result.wire_value(),
+                    },
+                )?;
+                id::DELETE_CONFERENCE_RES
+            }
+            Self::ModifyConferenceResponse(response) => {
+                payload = encode(
+                    id::MODIFY_CONFERENCE_RES,
+                    &WireConferenceResponse {
+                        conference_id: response.conference_id.get(),
+                        result: response.result.wire_value(),
+                        data_length: validate_conference_data_for_encode(
+                            id::MODIFY_CONFERENCE_RES,
+                            &response.passthrough_data,
+                        )?,
+                        passthrough_data: response.passthrough_data.clone(),
+                    },
+                )?;
+                id::MODIFY_CONFERENCE_RES
+            }
+            Self::AuditConferenceResponse(response) => {
+                if response.entries.len() > MAX_AUDIT_CONFERENCE_ENTRIES {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: id::AUDIT_CONFERENCE_RES,
+                        field: "conference audit entries",
+                        count: response.entries.len(),
+                        maximum: MAX_AUDIT_CONFERENCE_ENTRIES,
+                    });
+                }
+                payload = encode(
+                    id::AUDIT_CONFERENCE_RES,
+                    &WireAuditConferenceResponse {
+                        last: response.last,
+                        number_of_entries: wire_count(
+                            id::AUDIT_CONFERENCE_RES,
+                            "conference audit entries",
+                            response.entries.len(),
+                        )?,
+                        entries: response
+                            .entries
+                            .iter()
+                            .map(|entry| {
+                                Ok(WireAuditConferenceEntry {
+                                    conference_id: entry.conference_id.get(),
+                                    resource_type: entry.resource_type.wire_value(),
+                                    reserved_participants: entry.reserved_participants,
+                                    active_participants: entry.active_participants,
+                                    application_id: entry.application_id.get(),
+                                    application_conference_id: WireFixedText::new(
+                                        id::AUDIT_CONFERENCE_RES,
+                                        "application conference ID",
+                                        &entry.application_conference_id,
+                                    )?,
+                                    application_data: WireFixedText::new(
+                                        id::AUDIT_CONFERENCE_RES,
+                                        "application data",
+                                        &entry.application_data,
+                                    )?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, CodecError>>()?,
+                    },
+                )?;
+                id::AUDIT_CONFERENCE_RES
+            }
+            Self::AddParticipantResponse(response) => {
+                payload = encode(
+                    id::ADD_PARTICIPANT_RES,
+                    &WireAddParticipantResponseHeader {
+                        conference_id: response.conference_id.get(),
+                        call_reference: response.call_reference.get(),
+                        result: response.result.wire_value(),
+                    },
+                )?;
+                payload.extend_from_slice(response.bridge_participant_id.as_bytes());
+                payload.resize(269, 0);
+                payload.extend_from_slice(&[0; 3]);
+                id::ADD_PARTICIPANT_RES
+            }
+            Self::AuditParticipantResponse(response) => {
+                if response.participant_entries.len() > MAX_AUDIT_PARTICIPANT_DATA {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: id::AUDIT_PARTICIPANT_RES,
+                        field: "participant audit data",
+                        count: response.participant_entries.len(),
+                        maximum: MAX_AUDIT_PARTICIPANT_DATA,
+                    });
+                }
+                payload = encode(
+                    id::AUDIT_PARTICIPANT_RES,
+                    &WireAuditParticipantResponseHeader {
+                        result: response.result.wire_value(),
+                        last: response.last,
+                        conference_id: response.conference_id.get(),
+                        number_of_entries: response.number_of_entries,
+                    },
+                )?;
+                payload.extend_from_slice(&response.participant_entries);
+                id::AUDIT_PARTICIPANT_RES
+            }
+            Self::KnownOpaque(message) => {
+                ensure_preserve_only(message.id)?;
+                return Ok((
+                    message.id.wire_value(),
+                    message.payload.as_bytes().to_vec(),
+                    message.protocol_version,
+                ));
+            }
+            Self::Unknown(message) => {
+                return Ok((
+                    message.message_id,
+                    message.payload.clone(),
+                    message.protocol_version,
+                ));
+            }
+        };
+        pad_typed_payload(message_id, &mut payload);
+        Ok((message_id, payload, header_protocol))
+    }
+}
+
+fn decode_connection_statistics(
+    payload: &[u8],
+    protocol: u32,
+    message_id: u32,
+) -> Result<ConnectionStatistics, CodecError> {
+    let (directory_number, call_reference, processing, statistics, quality) = if protocol >= 19 {
+        let value: WireConnectionStatisticsV19 = decode_zero_padded(message_id, payload)?;
+        validate_zero_payload(&value.alignment, message_id, 3)?;
+        (
+            value.directory_number.text()?,
+            value.call_reference,
+            StatisticsProcessing::from(value.processing),
+            value.statistics,
+            value.quality,
+        )
+    } else {
+        let value: WireConnectionStatisticsV3 = decode_zero_padded(message_id, payload)?;
+        (
+            value.directory_number.text()?,
+            value.call_reference,
+            StatisticsProcessing::from(value.processing),
+            value.statistics,
+            value.quality,
+        )
+    };
+    Ok(ConnectionStatistics {
+        directory_number,
+        call_reference,
+        processing,
+        packets_sent: statistics.packets_sent,
+        octets_sent: statistics.octets_sent,
+        packets_received: statistics.packets_received,
+        octets_received: statistics.octets_received,
+        packets_lost: statistics.packets_lost,
+        jitter_millis: statistics.jitter_millis,
+        latency_millis: statistics.latency_millis,
+        quality: ConnectionQualityStatistics::new(quality)?,
+    })
+}
+
+fn decode_start_media_ack(
+    payload: &[u8],
+    protocol: u32,
+    message_id: u32,
+) -> Result<MediaTransmissionAck, CodecError> {
+    if protocol >= 17 {
+        let (value, v20_extension) = match payload.len() {
+            40 => (decode::<WireStartMediaAckV17>(message_id, payload)?, None),
+            48 => {
+                let value = decode::<WireStartMediaAckV20>(message_id, payload)?;
+                (value.base, Some(value.extension))
+            }
+            actual => {
+                return Err(if actual < 40 {
+                    CodecError::Truncated {
+                        message_id,
+                        needed: 40,
+                        actual,
+                    }
+                } else {
+                    CodecError::TrailingBytes {
+                        message_id,
+                        count: actual - 40,
+                    }
+                });
+            }
+        };
+        let wire = MediaTransmissionAckWire {
+            extension: v20_extension,
+        };
+        Ok(MediaTransmissionAck {
+            conference_id: value.conference_id,
+            passthrough_party_id: value.passthrough_party_id,
+            call_reference: value.call_reference,
+            status: MediaStatus::from(value.status),
+            address: value.address.to_ip(message_id)?,
+            port: decode_port(value.port, message_id, "RTP port")?,
+            wire: wire.extension.is_some().then_some(wire),
+        })
+    } else {
+        let value: WireStartMediaAckV3 = decode(message_id, payload)?;
+        Ok(MediaTransmissionAck {
+            conference_id: value.conference_id,
+            passthrough_party_id: value.passthrough_party_id,
+            call_reference: value.call_reference,
+            status: MediaStatus::from(value.status),
+            address: IpAddr::V4(Ipv4Addr::from(value.address)),
+            port: decode_port(value.port, message_id, "RTP port")?,
+            wire: None,
+        })
+    }
+}
+
+fn decode_user_data(payload: &[u8], message_id: u32) -> Result<UserDataMessage, CodecError> {
+    let value: WireUserData = decode_zero_padded(message_id, payload)?;
+    if value.data.len() > 2000 {
+        return Err(CodecError::CountTooLarge {
+            message_id,
+            field: "user data",
+            count: value.data.len(),
+            maximum: 2000,
+        });
+    }
+    Ok(UserDataMessage {
+        application_id: value.application_id,
+        line_instance: value.line_instance,
+        call_reference: value.call_reference,
+        transaction_id: value.transaction_id,
+        data: value.data,
+    })
+}
+
+fn decode_open_multimedia_ack(
+    payload: &[u8],
+    protocol: u32,
+    message_id: u32,
+) -> Result<OpenMultimediaReceiveChannelAck, CodecError> {
+    let (status, address, port, passthrough_party_id, call_reference) = if protocol >= 17 {
+        let value: WireOpenMultimediaAckFrom17 = decode(message_id, payload)?;
+        (
+            value.status,
+            value.address.to_ip(message_id)?,
+            value.port,
+            value.passthrough_party_id,
+            value.call_reference,
+        )
+    } else {
+        let value: WireOpenMultimediaAckPre17 = decode(message_id, payload)?;
+        (
+            value.status,
+            IpAddr::V4(Ipv4Addr::from(value.address)),
+            value.port,
+            value.passthrough_party_id,
+            value.call_reference,
+        )
+    };
+    Ok(OpenMultimediaReceiveChannelAck {
+        status: MediaStatus::from(status),
+        endpoint: MediaEndpointAddress {
+            address,
+            port: decode_port(port, message_id, "multimedia port")?,
+        },
+        passthrough_party_id: passthrough_party_id.into(),
+        call_reference: call_reference.into(),
+    })
+}
+
+fn encode_open_multimedia_ack(
+    value: OpenMultimediaReceiveChannelAck,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    if protocol.wire() >= 17 {
+        encode(
+            id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
+            &WireOpenMultimediaAckFrom17 {
+                status: value.status.wire_value(),
+                address: WireExtendedAddress::from_ip(value.endpoint.address),
+                port: u32::from(value.endpoint.port),
+                passthrough_party_id: value.passthrough_party_id.get(),
+                call_reference: value.call_reference.get(),
+            },
+        )
+    } else {
+        let IpAddr::V4(address) = value.endpoint.address else {
+            return Err(CodecError::InvalidValue {
+                message_id: id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
+                field: "IP address family for this protocol version",
+                value: 1,
+            });
+        };
+        encode(
+            id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
+            &WireOpenMultimediaAckPre17 {
+                status: value.status.wire_value(),
+                address: address.octets(),
+                port: u32::from(value.endpoint.port),
+                passthrough_party_id: value.passthrough_party_id.get(),
+                call_reference: value.call_reference.get(),
+            },
+        )
+    }
+}
+
+fn decode_start_multimedia_ack(
+    payload: &[u8],
+    protocol: u32,
+    message_id: u32,
+) -> Result<StartMultimediaTransmissionAck, CodecError> {
+    let (conference_id, party_id, call_reference, address, port, status) = if protocol >= 17 {
+        let value: WireStartMultimediaAckFrom17 = decode(message_id, payload)?;
+        (
+            value.conference_id,
+            value.passthrough_party_id,
+            value.call_reference,
+            value.address.to_ip(message_id)?,
+            value.port,
+            value.status,
+        )
+    } else {
+        let value: WireStartMultimediaAckPre17 = decode(message_id, payload)?;
+        (
+            value.conference_id,
+            value.passthrough_party_id,
+            value.call_reference,
+            IpAddr::V4(Ipv4Addr::from(value.address)),
+            value.port,
+            value.status,
+        )
+    };
+    Ok(StartMultimediaTransmissionAck {
+        conference_id: conference_id.into(),
+        passthrough_party_id: party_id.into(),
+        call_reference: call_reference.into(),
+        endpoint: MediaEndpointAddress {
+            address,
+            port: decode_port(port, message_id, "multimedia port")?,
+        },
+        status: MediaStatus::from(status),
+    })
+}
+
+fn encode_start_multimedia_ack(
+    value: StartMultimediaTransmissionAck,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    if protocol.wire() >= 17 {
+        encode(
+            id::START_MULTIMEDIA_TRANSMISSION_ACK,
+            &WireStartMultimediaAckFrom17 {
+                conference_id: value.conference_id.get(),
+                passthrough_party_id: value.passthrough_party_id.get(),
+                call_reference: value.call_reference.get(),
+                address: WireExtendedAddress::from_ip(value.endpoint.address),
+                port: u32::from(value.endpoint.port),
+                status: value.status.wire_value(),
+            },
+        )
+    } else {
+        let IpAddr::V4(address) = value.endpoint.address else {
+            return Err(CodecError::InvalidValue {
+                message_id: id::START_MULTIMEDIA_TRANSMISSION_ACK,
+                field: "IP address family for this protocol version",
+                value: 1,
+            });
+        };
+        encode(
+            id::START_MULTIMEDIA_TRANSMISSION_ACK,
+            &WireStartMultimediaAckPre17 {
+                conference_id: value.conference_id.get(),
+                passthrough_party_id: value.passthrough_party_id.get(),
+                call_reference: value.call_reference.get(),
+                address: address.octets(),
+                port: u32::from(value.endpoint.port),
+                status: value.status.wire_value(),
+            },
+        )
+    }
+}
+
+fn decode_session_transmission(
+    payload: &[u8],
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<SessionTransmission, CodecError> {
+    if protocol.wire() >= 17 {
+        let value: WireSessionTransmissionFrom17 = decode(message_id, payload)?;
+        Ok(SessionTransmission {
+            remote_address: value.remote_address.to_ip(message_id)?,
+            session_type: value.session_type,
+        })
+    } else {
+        let value: WireSessionTransmissionPre17 = decode(message_id, payload)?;
+        Ok(SessionTransmission {
+            remote_address: IpAddr::V4(Ipv4Addr::from(value.remote_address)),
+            session_type: value.session_type,
+        })
+    }
+}
+
+fn encode_session_transmission(
+    value: SessionTransmission,
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<Vec<u8>, CodecError> {
+    if protocol.wire() >= 17 {
+        encode(
+            message_id,
+            &WireSessionTransmissionFrom17 {
+                remote_address: WireExtendedAddress::from_ip(value.remote_address),
+                session_type: value.session_type,
+            },
+        )
+    } else {
+        let IpAddr::V4(address) = value.remote_address else {
+            return Err(CodecError::InvalidValue {
+                message_id,
+                field: "IP address family for this protocol version",
+                value: 1,
+            });
+        };
+        encode(
+            message_id,
+            &WireSessionTransmissionPre17 {
+                remote_address: address.octets(),
+                session_type: value.session_type,
+            },
+        )
+    }
+}
+
+fn fixed_bounded_bytes<const MAX: usize>(value: &BoundedBytes<MAX>) -> [u8; MAX] {
+    let mut bytes = [0; MAX];
+    bytes[..value.len()].copy_from_slice(value.as_bytes());
+    bytes
+}
+
+fn bounded_from_fixed<const MAX: usize>(value: [u8; MAX]) -> BoundedBytes<MAX> {
+    BoundedBytes::try_from(value.as_slice()).expect("fixed wire field fits its public bound")
+}
+
+fn multimedia_capability_words(
+    value: [u8; MULTIMEDIA_CAPABILITY_BYTES],
+) -> [u32; MULTIMEDIA_CAPABILITY_BYTES / 4] {
+    std::array::from_fn(|index| {
+        let offset = index * 4;
+        u32::from_le_bytes([
+            value[offset],
+            value[offset + 1],
+            value[offset + 2],
+            value[offset + 3],
+        ])
+    })
+}
+
+fn multimedia_capability_bytes(
+    words: [u32; MULTIMEDIA_CAPABILITY_BYTES / 4],
+) -> [u8; MULTIMEDIA_CAPABILITY_BYTES] {
+    let mut bytes = [0; MULTIMEDIA_CAPABILITY_BYTES];
+    for (word, target) in words.iter().zip(bytes.as_chunks_mut::<4>().0) {
+        target.copy_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_multimedia_descriptor(
+    value: WireMultimediaPayloadDescriptor,
+    message_id: u32,
+) -> Result<MultimediaPayloadDescriptor, CodecError> {
+    let payload_number =
+        RtpPayloadNumber::new(value.payload_type).map_err(|error| CodecError::InvalidValue {
+            message_id,
+            field: "RTP payload number",
+            value: u64::from(error.actual),
+        })?;
+    Ok(MultimediaPayloadDescriptor::new(
+        value.payload_rfc_number,
+        payload_number,
+    ))
+}
+
+fn decoded_multimedia_capability(
+    value: [u8; MULTIMEDIA_CAPABILITY_BYTES],
+    codec: Codec,
+) -> MultimediaCapabilityState {
+    let words = multimedia_capability_words(value);
+    let Ok(picture_count) = usize::try_from(words[1]) else {
+        return MultimediaCapabilityState::Preserved(value);
+    };
+    if picture_count > MAX_MULTIMEDIA_PICTURE_FORMATS {
+        return MultimediaCapabilityState::Preserved(value);
+    }
+    let arm = match codec {
+        Codec::H261 if words[15..].iter().all(|word| *word == 0) => {
+            MultimediaVideoCapabilityArm::H261 {
+                temporal_spatial_trade_off_capability: words[13],
+                still_image_transmission: words[14],
+            }
+        }
+        Codec::H263 if words[15..].iter().all(|word| *word == 0) => {
+            MultimediaVideoCapabilityArm::H263 {
+                capability_bitfield: words[13],
+                annex_n_and_w_future_use: words[14],
+            }
+        }
+        Codec::H263Plus if words[15..].iter().all(|word| *word == 0) => {
+            MultimediaVideoCapabilityArm::H263Plus {
+                model_number: words[13],
+                bandwidth: words[14],
+            }
+        }
+        Codec::H264 => MultimediaVideoCapabilityArm::H264 {
+            profile: words[13],
+            level: words[14],
+            custom_max_mbps: words[15],
+            custom_max_fs: words[16],
+            custom_max_dpb: words[17],
+            custom_max_br_and_cpb: words[18],
+        },
+        _ => {
+            return MultimediaCapabilityState::Preserved(value);
+        }
+    };
+    let picture_formats = (0..picture_count)
+        .map(|index| MultimediaPictureFormat {
+            format: VideoFormat::from(words[2 + index * 2]),
+            minimum_picture_interval: words[3 + index * 2],
+        })
+        .collect();
+    MultimediaCapabilityState::Video(MultimediaVideoCapability {
+        bit_rate: words[0],
+        picture_formats,
+        conference_service_number: words[12],
+        arm,
+        preserved_wire: Some(value),
+    })
+}
+
+fn multimedia_capability_to_wire(payload: &MultimediaPayload) -> [u8; MULTIMEDIA_CAPABILITY_BYTES] {
+    let capability = match &payload.capability {
+        MultimediaCapabilityState::Preserved(bytes) => return *bytes,
+        MultimediaCapabilityState::Video(capability) => capability,
+    };
+    if let Some(value) = capability.preserved_wire {
+        return value;
+    }
+
+    let mut words = [0; MULTIMEDIA_CAPABILITY_BYTES / 4];
+    words[0] = capability.bit_rate;
+    words[1] = capability.picture_formats.len() as u32;
+    for (index, format) in capability.picture_formats.iter().enumerate() {
+        words[2 + index * 2] = format.format.wire_value();
+        words[3 + index * 2] = format.minimum_picture_interval;
+    }
+    words[12] = capability.conference_service_number;
+    match capability.arm {
+        MultimediaVideoCapabilityArm::H261 {
+            temporal_spatial_trade_off_capability,
+            still_image_transmission,
+        } => {
+            words[13] = temporal_spatial_trade_off_capability;
+            words[14] = still_image_transmission;
+        }
+        MultimediaVideoCapabilityArm::H263 {
+            capability_bitfield,
+            annex_n_and_w_future_use,
+        } => {
+            words[13] = capability_bitfield;
+            words[14] = annex_n_and_w_future_use;
+        }
+        MultimediaVideoCapabilityArm::H263Plus {
+            model_number,
+            bandwidth,
+        } => {
+            words[13] = model_number;
+            words[14] = bandwidth;
+        }
+        MultimediaVideoCapabilityArm::H264 {
+            profile,
+            level,
+            custom_max_mbps,
+            custom_max_fs,
+            custom_max_dpb,
+            custom_max_br_and_cpb,
+        } => {
+            words[13] = profile;
+            words[14] = level;
+            words[15] = custom_max_mbps;
+            words[16] = custom_max_fs;
+            words[17] = custom_max_dpb;
+            words[18] = custom_max_br_and_cpb;
+        }
+    }
+    multimedia_capability_bytes(words)
+}
+
+fn decode_multimedia_payload(
+    descriptor: WireMultimediaPayloadDescriptor,
+    capability: [u8; MULTIMEDIA_CAPABILITY_BYTES],
+    compression_codec: Codec,
+    direction: MultimediaPayloadDirection,
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<MultimediaPayload, CodecError> {
+    let descriptor = decode_multimedia_descriptor(descriptor, message_id)?;
+    let capability = decoded_multimedia_capability(capability, compression_codec);
+    Ok(MultimediaPayload::from_decoded(
+        descriptor,
+        capability,
+        direction,
+        protocol,
+        compression_codec,
+    ))
+}
+
+fn validate_multimedia_payload(
+    payload: &MultimediaPayload,
+    direction: MultimediaPayloadDirection,
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<(), CodecError> {
+    if payload.is_valid_for(direction, protocol) {
+        Ok(())
+    } else {
+        Err(CodecError::InvalidValue {
+            message_id,
+            field: "multimedia payload provenance",
+            value: 1,
+        })
+    }
+}
+
+fn open_multimedia_from_common(
+    value: WireOpenMultimediaV11,
+    source: MediaEndpointAddress,
+    requested_address_type: IpAddressType,
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<OpenMultimediaChannel, CodecError> {
+    let codec = Codec::from(value.compression_type);
+    Ok(OpenMultimediaChannel {
+        conference_id: value.conference_id.into(),
+        passthrough_party_id: value.passthrough_party_id.into(),
+        line_instance: value.line_instance,
+        call_reference: value.call_reference.into(),
+        payload: decode_multimedia_payload(
+            value.payload_type,
+            value.capability,
+            codec,
+            MultimediaPayloadDirection::Receive,
+            protocol,
+            message_id,
+        )?,
+        conference_creator: decode_bool_word(
+            value.conference_creator,
+            message_id,
+            "conference creator",
+        )?,
+        encryption: value.encryption.to_public(message_id)?,
+        stream_passthrough_id: value.stream_passthrough_id,
+        associated_stream_id: value.associated_stream_id,
+        source,
+        requested_address_type,
+    })
+}
+
+fn decode_open_multimedia(
+    payload: &[u8],
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<OpenMultimediaChannel, CodecError> {
+    match protocol.wire() {
+        17.. => {
+            let value: WireOpenMultimediaV17 = decode(message_id, payload)?;
+            let common = WireOpenMultimediaV11 {
+                conference_id: value.conference_id,
+                passthrough_party_id: value.passthrough_party_id,
+                compression_type: value.compression_type,
+                line_instance: value.line_instance,
+                call_reference: value.call_reference,
+                payload_type: value.payload_type,
+                conference_creator: value.conference_creator,
+                capability: value.capability,
+                encryption: value.encryption,
+                stream_passthrough_id: value.stream_passthrough_id,
+                associated_stream_id: value.associated_stream_id,
+            };
+            open_multimedia_from_common(
+                common,
+                MediaEndpointAddress {
+                    address: value.source_address.to_ip(message_id)?,
+                    port: decode_port(value.source_port, message_id, "multimedia source port")?,
+                },
+                IpAddressType::from(value.requested_address_type),
+                protocol,
+                message_id,
+            )
+        }
+        12..=16 => {
+            let value: WireOpenMultimediaV12 = decode(message_id, payload)?;
+            open_multimedia_from_common(
+                value.base,
+                MediaEndpointAddress {
+                    address: IpAddr::V4(Ipv4Addr::from(value.source_address)),
+                    port: decode_port(value.source_port, message_id, "multimedia source port")?,
+                },
+                IpAddressType::Ipv4,
+                protocol,
+                message_id,
+            )
+        }
+        _ => {
+            let value: WireOpenMultimediaV11 = decode(message_id, payload)?;
+            open_multimedia_from_common(
+                value,
+                MediaEndpointAddress {
+                    address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: 0,
+                },
+                IpAddressType::Ipv4,
+                protocol,
+                message_id,
+            )
+        }
+    }
+}
+
+fn encode_open_multimedia(
+    value: &OpenMultimediaChannel,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    validate_multimedia_payload(
+        &value.payload,
+        MultimediaPayloadDirection::Receive,
+        protocol,
+        id::OPEN_MULTIMEDIA_CHANNEL,
+    )?;
+    let common = WireOpenMultimediaV11 {
+        conference_id: value.conference_id.get(),
+        passthrough_party_id: value.passthrough_party_id.get(),
+        compression_type: value.payload.compression_codec().wire_value(),
+        line_instance: value.line_instance,
+        call_reference: value.call_reference.get(),
+        payload_type: value.payload.descriptor().into(),
+        conference_creator: u32::from(value.conference_creator),
+        capability: multimedia_capability_to_wire(&value.payload),
+        encryption: WireEncryptionInfo::from_public(value.encryption.as_ref()),
+        stream_passthrough_id: value.stream_passthrough_id,
+        associated_stream_id: value.associated_stream_id,
+    };
+    match protocol.wire() {
+        17.. => encode(
+            id::OPEN_MULTIMEDIA_CHANNEL,
+            &WireOpenMultimediaV17 {
+                conference_id: common.conference_id,
+                passthrough_party_id: common.passthrough_party_id,
+                compression_type: common.compression_type,
+                line_instance: common.line_instance,
+                call_reference: common.call_reference,
+                payload_type: common.payload_type,
+                conference_creator: common.conference_creator,
+                capability: common.capability,
+                encryption: common.encryption,
+                stream_passthrough_id: common.stream_passthrough_id,
+                associated_stream_id: common.associated_stream_id,
+                source_address: WireExtendedAddress::from_ip(value.source.address),
+                source_port: u32::from(value.source.port),
+                requested_address_type: value.requested_address_type.wire_value(),
+            },
+        ),
+        12..=16 => {
+            let IpAddr::V4(address) = value.source.address else {
+                return Err(CodecError::InvalidValue {
+                    message_id: id::OPEN_MULTIMEDIA_CHANNEL,
+                    field: "IP address family for this protocol version",
+                    value: 1,
+                });
+            };
+            encode(
+                id::OPEN_MULTIMEDIA_CHANNEL,
+                &WireOpenMultimediaV12 {
+                    base: common,
+                    source_address: address.octets(),
+                    source_port: u32::from(value.source.port),
+                },
+            )
+        }
+        _ => encode(id::OPEN_MULTIMEDIA_CHANNEL, &common),
+    }
+}
+
+fn decode_start_multimedia(
+    payload: &[u8],
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<StartMultimediaTransmission, CodecError> {
+    let (
+        conference_id,
+        party_id,
+        compression_type,
+        address,
+        port,
+        call_reference,
+        payload_type,
+        dscp,
+        capability,
+        encryption,
+        stream_passthrough_id,
+        associated_stream_id,
+    ) = if protocol.wire() >= 17 {
+        let value: WireStartMultimediaFrom17 = decode(message_id, payload)?;
+        (
+            value.conference_id,
+            value.passthrough_party_id,
+            value.compression_type,
+            value.remote_address.to_ip(message_id)?,
+            value.remote_port,
+            value.call_reference,
+            value.payload_type,
+            value.dscp,
+            value.capability,
+            value.encryption,
+            value.stream_passthrough_id,
+            value.associated_stream_id,
+        )
+    } else {
+        let value: WireStartMultimediaPre17 = decode(message_id, payload)?;
+        (
+            value.conference_id,
+            value.passthrough_party_id,
+            value.compression_type,
+            IpAddr::V4(Ipv4Addr::from(value.remote_address)),
+            value.remote_port,
+            value.call_reference,
+            value.payload_type,
+            value.dscp,
+            value.capability,
+            value.encryption,
+            value.stream_passthrough_id,
+            value.associated_stream_id,
+        )
+    };
+    Ok(StartMultimediaTransmission {
+        conference_id: conference_id.into(),
+        passthrough_party_id: party_id.into(),
+        endpoint: MediaEndpointAddress {
+            address,
+            port: decode_port(port, message_id, "multimedia port")?,
+        },
+        call_reference: call_reference.into(),
+        payload: decode_multimedia_payload(
+            payload_type,
+            capability,
+            Codec::from(compression_type),
+            MultimediaPayloadDirection::Transmit,
+            protocol,
+            message_id,
+        )?,
+        traffic_class: MediaTrafficClass::from_wire(u8::try_from(dscp).map_err(|_| {
+            CodecError::InvalidValue {
+                message_id,
+                field: "multimedia traffic class",
+                value: u64::from(dscp),
+            }
+        })?),
+        encryption: encryption.to_public(message_id)?,
+        stream_passthrough_id,
+        associated_stream_id,
+    })
+}
+
+fn encode_start_multimedia(
+    value: &StartMultimediaTransmission,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    validate_multimedia_payload(
+        &value.payload,
+        MultimediaPayloadDirection::Transmit,
+        protocol,
+        id::START_MULTIMEDIA_TRANSMISSION,
+    )?;
+    if protocol.wire() >= 17 {
+        encode(
+            id::START_MULTIMEDIA_TRANSMISSION,
+            &WireStartMultimediaFrom17 {
+                conference_id: value.conference_id.get(),
+                passthrough_party_id: value.passthrough_party_id.get(),
+                compression_type: value.payload.compression_codec().wire_value(),
+                remote_address: WireExtendedAddress::from_ip(value.endpoint.address),
+                remote_port: u32::from(value.endpoint.port),
+                call_reference: value.call_reference.get(),
+                payload_type: value.payload.descriptor().into(),
+                dscp: u32::from(value.traffic_class),
+                capability: multimedia_capability_to_wire(&value.payload),
+                encryption: WireEncryptionInfo::from_public(value.encryption.as_ref()),
+                stream_passthrough_id: value.stream_passthrough_id,
+                associated_stream_id: value.associated_stream_id,
+            },
+        )
+    } else {
+        let IpAddr::V4(address) = value.endpoint.address else {
+            return Err(CodecError::InvalidValue {
+                message_id: id::START_MULTIMEDIA_TRANSMISSION,
+                field: "IP address family for this protocol version",
+                value: 1,
+            });
+        };
+        encode(
+            id::START_MULTIMEDIA_TRANSMISSION,
+            &WireStartMultimediaPre17 {
+                conference_id: value.conference_id.get(),
+                passthrough_party_id: value.passthrough_party_id.get(),
+                compression_type: value.payload.compression_codec().wire_value(),
+                remote_address: address.octets(),
+                remote_port: u32::from(value.endpoint.port),
+                call_reference: value.call_reference.get(),
+                payload_type: value.payload.descriptor().into(),
+                dscp: u32::from(value.traffic_class),
+                capability: multimedia_capability_to_wire(&value.payload),
+                encryption: WireEncryptionInfo::from_public(value.encryption.as_ref()),
+                stream_passthrough_id: value.stream_passthrough_id,
+                associated_stream_id: value.associated_stream_id,
+            },
+        )
+    }
+}
+
+fn decode_miscellaneous_command(
+    payload: &[u8],
+    message_id: u32,
+) -> Result<MiscellaneousCommand, CodecError> {
+    let value: WireMiscellaneousCommand = decode(message_id, payload)?;
+    Ok(MiscellaneousCommand {
+        conference_id: value.conference_id.into(),
+        passthrough_party_id: value.passthrough_party_id.into(),
+        call_reference: value.call_reference.into(),
+        command: values::MiscCommandType::from(value.command),
+        data: bounded_from_fixed(value.data),
+    })
+}
+
+fn encode_miscellaneous_command(value: &MiscellaneousCommand) -> Result<Vec<u8>, CodecError> {
+    encode(
+        id::MISCELLANEOUS_COMMAND,
+        &WireMiscellaneousCommand {
+            conference_id: value.conference_id.get(),
+            passthrough_party_id: value.passthrough_party_id.get(),
+            call_reference: value.call_reference.get(),
+            command: value.command.wire_value(),
+            data: fixed_bounded_bytes(&value.data),
+        },
+    )
+}
+
+fn dtmf_payload_identity_from_wire(value: WireDtmfPayloadIdentity) -> DtmfPayloadIdentity {
+    DtmfPayloadIdentity {
+        payload_type: value.payload_type,
+        conference_id: value.conference_id,
+        passthrough_party_id: value.passthrough_party_id,
+    }
+}
+
+fn dtmf_payload_identity_to_wire(value: DtmfPayloadIdentity) -> WireDtmfPayloadIdentity {
+    WireDtmfPayloadIdentity {
+        payload_type: value.payload_type,
+        conference_id: value.conference_id,
+        passthrough_party_id: value.passthrough_party_id,
+    }
+}
+
+fn dtmf_payload_request_from_wire(value: WireDtmfPayloadRequest) -> DtmfPayloadRequest {
+    DtmfPayloadRequest {
+        payload_type: value.payload_type,
+        conference_id: value.conference_id,
+        passthrough_party_id: value.passthrough_party_id,
+        dtmf_type: value.dtmf_type,
+    }
+}
+
+fn dtmf_payload_request_to_wire(value: DtmfPayloadRequest) -> WireDtmfPayloadRequest {
+    WireDtmfPayloadRequest {
+        payload_type: value.payload_type,
+        conference_id: value.conference_id,
+        passthrough_party_id: value.passthrough_party_id,
+        dtmf_type: value.dtmf_type,
+    }
+}
+
+const MAX_CONFERENCE_PASSTHROUGH_DATA: usize = 2000;
+const MAX_AUDIT_CONFERENCE_ENTRIES: usize = 32;
+const MAX_AUDIT_PARTICIPANT_DATA: usize = 256;
+
+fn encode_participant_request(
+    message_id: u32,
+    conference_id: crate::types::ConferenceId,
+    participant: &ConferenceParticipant,
+) -> Result<WireParticipantRequest, CodecError> {
+    Ok(WireParticipantRequest {
+        conference_id: conference_id.get(),
+        call_reference: participant.call_reference.get(),
+        presentation_restrictions: participant.presentation_restrictions.bits(),
+        participant_name: WireFixedText::new(message_id, "participant name", &participant.name)?,
+        participant_number: WireFixedText::new(
+            message_id,
+            "participant number",
+            &participant.number,
+        )?,
+        conference_name: WireFixedText::new(
+            message_id,
+            "conference name",
+            &participant.conference_name,
+        )?,
+    })
+}
+
+fn decode_participant_request(
+    payload: &[u8],
+    message_id: u32,
+) -> Result<(crate::types::ConferenceId, ConferenceParticipant), CodecError> {
+    validate_exact_payload(payload, message_id, 108)?;
+    let value: WireParticipantRequest = decode(message_id, payload)?;
+    Ok((
+        value.conference_id.into(),
+        ConferenceParticipant {
+            call_reference: value.call_reference.into(),
+            presentation_restrictions: PartyInformationRestrictions::from_bits_retain(
+                value.presentation_restrictions,
+            ),
+            name: value.participant_name.text()?,
+            number: value.participant_number.text()?,
+            conference_name: value.conference_name.text()?,
+        },
+    ))
+}
+
+impl ConferenceParticipantChange {
+    /// Place the typed participant change inside the standard V1 application
+    /// envelope. The caller supplies application-specific routing metadata.
+    pub fn to_user_data_v1(
+        &self,
+        routing: ParticipantChangeRouting,
+    ) -> Result<UserDataV1Message, CodecError> {
+        let data = encode(
+            id::USER_TO_DEVICE_DATA_V1,
+            &encode_participant_request(
+                id::USER_TO_DEVICE_DATA_V1,
+                self.conference_id,
+                &self.participant,
+            )?,
+        )?;
+        Ok(UserDataV1Message {
+            application_id: routing.application_id.get(),
+            line_instance: routing.line_instance,
+            call_reference: self.participant.call_reference.get(),
+            transaction_id: routing.transaction_id.get(),
+            sequence_flag: routing.sequence_flag,
+            display_priority: routing.display_priority,
+            conference_id: self.conference_id.get(),
+            application_instance_id: routing.application_instance_id.get(),
+            routing: routing.routing,
+            data,
+        })
+    }
+
+    /// Decode a participant change from a V1 application envelope and reject
+    /// mismatched envelope/payload call or conference identities.
+    pub fn from_user_data_v1(message: &UserDataV1Message) -> Result<Self, CodecError> {
+        let (conference_id, participant) =
+            decode_participant_request(&message.data, id::USER_TO_DEVICE_DATA_V1)?;
+        if message.conference_id != conference_id.get() {
+            return Err(CodecError::InvalidValue {
+                message_id: id::USER_TO_DEVICE_DATA_V1,
+                field: "participant change conference ID",
+                value: u64::from(message.conference_id),
+            });
+        }
+        if message.call_reference != participant.call_reference.get() {
+            return Err(CodecError::InvalidValue {
+                message_id: id::USER_TO_DEVICE_DATA_V1,
+                field: "participant change call reference",
+                value: u64::from(message.call_reference),
+            });
+        }
+        Ok(Self {
+            conference_id,
+            participant,
+        })
+    }
+}
+
+fn validate_conference_data_length(
+    payload: &[u8],
+    message_id: u32,
+    header_size: usize,
+    length_offset: usize,
+) -> Result<(), CodecError> {
+    if payload.len() < header_size {
+        return Err(CodecError::Truncated {
+            message_id,
+            needed: header_size,
+            actual: payload.len(),
+        });
+    }
+    let data_length = usize_from_wire(
+        message_id,
+        "conference passthrough data",
+        u32::from_le_bytes(
+            payload[length_offset..length_offset + 4]
+                .try_into()
+                .expect("validated conference header contains length word"),
+        ),
+    )?;
+    if data_length > MAX_CONFERENCE_PASSTHROUGH_DATA {
+        return Err(CodecError::CountTooLarge {
+            message_id,
+            field: "conference passthrough data",
+            count: data_length,
+            maximum: MAX_CONFERENCE_PASSTHROUGH_DATA,
+        });
+    }
+    let needed = header_size + data_length;
+    if payload.len() < needed {
+        return Err(CodecError::Truncated {
+            message_id,
+            needed,
+            actual: payload.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_conference_data_for_encode(
+    message_id: u32,
+    passthrough_data: &[u8],
+) -> Result<u32, CodecError> {
+    if passthrough_data.len() > MAX_CONFERENCE_PASSTHROUGH_DATA {
+        return Err(CodecError::CountTooLarge {
+            message_id,
+            field: "conference passthrough data",
+            count: passthrough_data.len(),
+            maximum: MAX_CONFERENCE_PASSTHROUGH_DATA,
+        });
+    }
+    wire_count(
+        message_id,
+        "conference passthrough data",
+        passthrough_data.len(),
+    )
+}
+
+fn encode_user_data(message: &UserDataMessage, message_id: u32) -> Result<Vec<u8>, CodecError> {
+    if message.data.len() > 2000 {
+        return Err(CodecError::CountTooLarge {
+            message_id,
+            field: "user data",
+            count: message.data.len(),
+            maximum: 2000,
+        });
+    }
+    encode(
+        message_id,
+        &WireUserData {
+            application_id: message.application_id,
+            line_instance: message.line_instance,
+            call_reference: message.call_reference,
+            transaction_id: message.transaction_id,
+            data_length: wire_count(message_id, "user data", message.data.len())?,
+            data: message.data.clone(),
+        },
+    )
+}
+
+fn decode_user_data_v1(payload: &[u8], message_id: u32) -> Result<UserDataV1Message, CodecError> {
+    let value: WireUserDataV1 = decode_zero_padded(message_id, payload)?;
+    if value.data.len() > 2000 {
+        return Err(CodecError::CountTooLarge {
+            message_id,
+            field: "user data",
+            count: value.data.len(),
+            maximum: 2000,
+        });
+    }
+    Ok(UserDataV1Message {
+        application_id: value.application_id,
+        line_instance: value.line_instance,
+        call_reference: value.call_reference,
+        transaction_id: value.transaction_id,
+        sequence_flag: value.sequence_flag,
+        display_priority: value.display_priority,
+        conference_id: value.conference_id,
+        application_instance_id: value.application_instance_id,
+        routing: value.routing,
+        data: value.data,
+    })
+}
+
+fn encode_user_data_v1(
+    message: &UserDataV1Message,
+    message_id: u32,
+) -> Result<Vec<u8>, CodecError> {
+    if message.data.len() > 2000 {
+        return Err(CodecError::CountTooLarge {
+            message_id,
+            field: "user data",
+            count: message.data.len(),
+            maximum: 2000,
+        });
+    }
+    encode(
+        message_id,
+        &WireUserDataV1 {
+            application_id: message.application_id,
+            line_instance: message.line_instance,
+            call_reference: message.call_reference,
+            transaction_id: message.transaction_id,
+            data_length: wire_count(message_id, "user data", message.data.len())?,
+            sequence_flag: message.sequence_flag,
+            display_priority: message.display_priority,
+            conference_id: message.conference_id,
+            application_instance_id: message.application_instance_id,
+            routing: message.routing,
+            data: message.data.clone(),
+        },
+    )
+}
+
+fn decode_port_response(
+    payload: &[u8],
+    protocol: u32,
+    message_id: u32,
+) -> Result<PortEndpoint, CodecError> {
+    let (conference_id, call_reference, passthrough_party_id, address, rtp, rtcp, media_type) =
+        if protocol >= 20 {
+            let value: WirePortResponseV20 = decode(message_id, payload)?;
+            (
+                value.conference_id,
+                value.call_reference,
+                value.passthrough_party_id,
+                value.address.to_ip(message_id)?,
+                value.rtp_port,
+                value.rtcp_port,
+                Some(MediaType::from(value.media_type)),
+            )
+        } else {
+            let value: WirePortResponseV3 = decode(message_id, payload)?;
+            (
+                value.conference_id,
+                value.call_reference,
+                value.passthrough_party_id,
+                IpAddr::V4(Ipv4Addr::from(value.address)),
+                value.rtp_port,
+                value.rtcp_port,
+                None,
+            )
+        };
+    Ok(PortEndpoint {
+        conference_id,
+        call_reference,
+        passthrough_party_id,
+        address,
+        rtp_port: decode_port(rtp, message_id, "RTP port")?,
+        rtcp_port: decode_port(rtcp, message_id, "RTCP port")?,
+        media_type,
+    })
+}
+
+fn encode_port_response(
+    endpoint: &PortEndpoint,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    if protocol.wire() >= 20 {
+        encode(
+            id::PORT_RESPONSE,
+            &WirePortResponseV20 {
+                conference_id: endpoint.conference_id,
+                call_reference: endpoint.call_reference,
+                passthrough_party_id: endpoint.passthrough_party_id,
+                address: WireExtendedAddress::from_ip(endpoint.address),
+                rtp_port: u32::from(endpoint.rtp_port),
+                rtcp_port: u32::from(endpoint.rtcp_port),
+                media_type: endpoint
+                    .media_type
+                    .ok_or(CodecError::InvalidValue {
+                        message_id: id::PORT_RESPONSE,
+                        field: "media type required from protocol 20",
+                        value: 0,
+                    })?
+                    .wire_value(),
+            },
+        )
+    } else {
+        let IpAddr::V4(address) = endpoint.address else {
+            return Err(CodecError::InvalidValue {
+                message_id: id::PORT_RESPONSE,
+                field: "IP address family for this protocol version",
+                value: 1,
+            });
+        };
+        encode(
+            id::PORT_RESPONSE,
+            &WirePortResponseV3 {
+                conference_id: endpoint.conference_id,
+                call_reference: endpoint.call_reference,
+                passthrough_party_id: endpoint.passthrough_party_id,
+                address: address.octets(),
+                rtp_port: u32::from(endpoint.rtp_port),
+                rtcp_port: u32::from(endpoint.rtcp_port),
+            },
+        )
+    }
+}
+
+fn push_dynamic_text(
+    output: &mut Vec<u8>,
+    message_id: u32,
+    field: &'static str,
+    text: &str,
+    maximum: usize,
+) -> Result<(), CodecError> {
+    if text.as_bytes().contains(&0) {
+        return Err(CodecError::InvalidText);
+    }
+    if text.len() > maximum {
+        return Err(CodecError::TextTooLong {
+            message_id,
+            field,
+            actual: text.len(),
+            maximum,
+        });
+    }
+    output.extend_from_slice(text.as_bytes());
+    output.push(0);
+    Ok(())
+}
+
+fn push_dynamic_station_text(
+    output: &mut Vec<u8>,
+    message_id: u32,
+    field: &'static str,
+    text: &str,
+    maximum: usize,
+    code_page: Option<LegacyCodePage>,
+) -> Result<(), CodecError> {
+    let bytes = station_text_bytes(text, code_page)?;
+    if bytes.len() > maximum {
+        return Err(CodecError::TextTooLong {
+            message_id,
+            field,
+            actual: bytes.len(),
+            maximum,
+        });
+    }
+    output.extend_from_slice(&bytes);
+    output.push(0);
+    Ok(())
+}
+
+/// Station-variable payloads are zero-filled through the next 32-bit boundary.
+fn pad_dynamic_payload(output: &mut Vec<u8>) {
+    let padding = (4 - output.len() % 4) % 4;
+    output.resize(output.len() + padding, 0);
+}
+
+fn decode_dynamic_texts(
+    message_id: u32,
+    payload: &[u8],
+    offset: usize,
+    count: usize,
+) -> Result<Vec<String>, CodecError> {
+    if !payload.len().is_multiple_of(4) {
+        return Err(CodecError::InvalidAlignment {
+            message_id,
+            actual: payload.len(),
+        });
+    }
+    let Some(mut remaining) = payload.get(offset..) else {
+        return Err(CodecError::Truncated {
+            message_id,
+            needed: offset,
+            actual: payload.len(),
+        });
+    };
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let Some(end) = remaining.iter().position(|byte| *byte == 0) else {
+            return Err(CodecError::Truncated {
+                message_id,
+                needed: payload.len() + 1,
+                actual: payload.len(),
+            });
+        };
+        fields.push(
+            std::str::from_utf8(&remaining[..end])
+                .map_err(|_| CodecError::InvalidText)?
+                .to_owned(),
+        );
+        remaining = &remaining[end + 1..];
+    }
+    validate_dynamic_padding(message_id, remaining)?;
+    Ok(fields)
+}
+
+fn decode_dynamic_text(
+    message_id: u32,
+    payload: &[u8],
+    offset: usize,
+) -> Result<String, CodecError> {
+    Ok(decode_dynamic_texts(message_id, payload, offset, 1)?
+        .pop()
+        .expect("one requested dynamic field is returned"))
+}
+
+fn take_dynamic_text(
+    message_id: u32,
+    remaining: &mut &[u8],
+    field: &'static str,
+    maximum: usize,
+) -> Result<String, CodecError> {
+    let Some(end) = remaining.iter().position(|byte| *byte == 0) else {
+        return Err(CodecError::Truncated {
+            message_id,
+            needed: remaining.len() + 1,
+            actual: remaining.len(),
+        });
+    };
+    if end > maximum {
+        return Err(CodecError::TextTooLong {
+            message_id,
+            field,
+            actual: end,
+            maximum,
+        });
+    }
+    let value = std::str::from_utf8(&remaining[..end])
+        .map_err(|_| CodecError::InvalidText)?
+        .to_owned();
+    *remaining = &remaining[end + 1..];
+    Ok(value)
+}
+
+fn take_dynamic_word(message_id: u32, remaining: &mut &[u8]) -> Result<u32, CodecError> {
+    let Some((word, tail)) = remaining.split_first_chunk::<4>() else {
+        return Err(CodecError::Truncated {
+            message_id,
+            needed: 4,
+            actual: remaining.len(),
+        });
+    };
+    *remaining = tail;
+    Ok(u32::from_le_bytes(*word))
+}
+
+fn decode_dynamic_config_status(payload: &[u8]) -> Result<ServerMessage, CodecError> {
+    const MESSAGE_ID: u32 = id::CONFIG_STAT_DYNAMIC;
+    if !payload.len().is_multiple_of(4) {
+        return Err(CodecError::InvalidAlignment {
+            message_id: MESSAGE_ID,
+            actual: payload.len(),
+        });
+    }
+    let mut remaining = payload;
+    let device_name = take_dynamic_text(MESSAGE_ID, &mut remaining, "device name", 64)?;
+    let reserved = take_dynamic_word(MESSAGE_ID, &mut remaining)?;
+    let instance = take_dynamic_word(MESSAGE_ID, &mut remaining)?;
+    let line_count = take_dynamic_word(MESSAGE_ID, &mut remaining)?;
+    let speed_dial_count = take_dynamic_word(MESSAGE_ID, &mut remaining)?;
+    let user_name = take_dynamic_text(MESSAGE_ID, &mut remaining, "user name", 64)?;
+    let server_name = take_dynamic_text(MESSAGE_ID, &mut remaining, "server name", 256)?;
+    validate_dynamic_padding(MESSAGE_ID, remaining)?;
+    let status = ConfigurationStatus {
+        device_name,
+        station_user_id: reserved,
+        station_instance: instance,
+        line_count,
+        speed_dial_count,
+        user_name,
+        server_name,
+    };
+    Ok(ServerMessage::ConfigStatus(status))
+}
+
+fn encode_dynamic_config_status(value: &ConfigurationStatus) -> Result<Vec<u8>, CodecError> {
+    const MESSAGE_ID: u32 = id::CONFIG_STAT_DYNAMIC;
+    let mut payload = Vec::new();
+    push_dynamic_text(
+        &mut payload,
+        MESSAGE_ID,
+        "device name",
+        &value.device_name,
+        64,
+    )?;
+    payload.extend_from_slice(&value.station_user_id.to_le_bytes());
+    payload.extend_from_slice(&value.station_instance.to_le_bytes());
+    payload.extend_from_slice(&value.line_count.to_le_bytes());
+    payload.extend_from_slice(&value.speed_dial_count.to_le_bytes());
+    push_dynamic_text(&mut payload, MESSAGE_ID, "user name", &value.user_name, 64)?;
+    push_dynamic_text(
+        &mut payload,
+        MESSAGE_ID,
+        "server name",
+        &value.server_name,
+        256,
+    )?;
+    pad_dynamic_payload(&mut payload);
+    Ok(payload)
+}
+
+fn validate_dynamic_padding(message_id: u32, padding: &[u8]) -> Result<(), CodecError> {
+    if padding.len() > 3 || padding.iter().any(|byte| *byte != 0) {
+        return Err(CodecError::TrailingBytes {
+            message_id,
+            count: padding.len(),
+        });
+    }
+    Ok(())
+}
+
+fn encode_dynamic_line_status(
+    instance: u32,
+    number: &str,
+    display_name: &str,
+    code_page: Option<LegacyCodePage>,
+) -> Result<Vec<u8>, CodecError> {
+    let mut payload = encode(
+        id::LINE_STAT_DYNAMIC,
+        &WireLineStatusDynamicHeader {
+            line_instance: instance,
+            line_type: 15,
+        },
+    )?;
+    push_dynamic_text(
+        &mut payload,
+        id::LINE_STAT_DYNAMIC,
+        "line number",
+        number,
+        24,
+    )?;
+    push_dynamic_station_text(
+        &mut payload,
+        id::LINE_STAT_DYNAMIC,
+        "fully qualified display name",
+        display_name,
+        120,
+        code_page,
+    )?;
+    push_dynamic_station_text(
+        &mut payload,
+        id::LINE_STAT_DYNAMIC,
+        "line label",
+        display_name,
+        120,
+        code_page,
+    )?;
+    pad_dynamic_payload(&mut payload);
+    Ok(payload)
+}
+
+fn decode_dynamic_line_status(payload: &[u8]) -> Result<ServerMessage, CodecError> {
+    const HEADER_SIZE: usize = 8;
+    if payload.len() < HEADER_SIZE {
+        return Err(CodecError::Truncated {
+            message_id: id::LINE_STAT_DYNAMIC,
+            needed: HEADER_SIZE,
+            actual: payload.len(),
+        });
+    }
+    let header: WireLineStatusDynamicHeader =
+        decode(id::LINE_STAT_DYNAMIC, &payload[..HEADER_SIZE])?;
+    let fields = decode_dynamic_texts(id::LINE_STAT_DYNAMIC, payload, HEADER_SIZE, 3)?;
+    Ok(ServerMessage::LineStatus {
+        instance: header.line_instance,
+        number: fields[0].clone(),
+        display_name: fields[2].clone(),
+    })
+}
+
+fn encode_dynamic_service_url_status(
+    index: u32,
+    url: &str,
+    label: &str,
+    extension_text: &str,
+    protocol: ProtocolVersion,
+    code_page: Option<LegacyCodePage>,
+) -> Result<Vec<u8>, CodecError> {
+    let mut payload = encode(id::SERVICE_URL_STAT_DYNAMIC, &WireOneWord { value: index })?;
+    push_dynamic_text(
+        &mut payload,
+        id::SERVICE_URL_STAT_DYNAMIC,
+        "service URL",
+        url,
+        255,
+    )?;
+    push_dynamic_station_text(
+        &mut payload,
+        id::SERVICE_URL_STAT_DYNAMIC,
+        "service label",
+        label,
+        120,
+        code_page,
+    )?;
+    if protocol >= ProtocolVersion::V19 {
+        push_dynamic_station_text(
+            &mut payload,
+            id::SERVICE_URL_STAT_DYNAMIC,
+            "service extension text",
+            extension_text,
+            120,
+            code_page,
+        )?;
+    }
+    pad_dynamic_payload(&mut payload);
+    Ok(payload)
+}
+
+fn decode_dynamic_service_url_status(
+    payload: &[u8],
+    protocol: ProtocolVersion,
+) -> Result<ServerMessage, CodecError> {
+    const HEADER_SIZE: usize = 4;
+    if payload.len() < HEADER_SIZE {
+        return Err(CodecError::Truncated {
+            message_id: id::SERVICE_URL_STAT_DYNAMIC,
+            needed: HEADER_SIZE,
+            actual: payload.len(),
+        });
+    }
+    let header: WireOneWord = decode(id::SERVICE_URL_STAT_DYNAMIC, &payload[..HEADER_SIZE])?;
+    let fields = decode_dynamic_texts(
+        id::SERVICE_URL_STAT_DYNAMIC,
+        payload,
+        HEADER_SIZE,
+        if protocol >= ProtocolVersion::V19 {
+            3
+        } else {
+            2
+        },
+    )?;
+    Ok(ServerMessage::ServiceUrlStatus {
+        index: header.value,
+        url: fields[0].clone(),
+        label: fields[1].clone(),
+        extension_text: fields.get(2).cloned().unwrap_or_default(),
+    })
+}
+
+fn encode_dynamic_call_info(
+    info: &CallInfo,
+    line_instance: u32,
+    call_reference: u32,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    let mut payload = encode(
+        id::CALL_INFO_DYNAMIC,
+        &WireCallInfoDynamicHeader {
+            line_instance,
+            call_reference,
+            call_type: match info.direction {
+                crate::types::CallDirection::Inbound => 1,
+                crate::types::CallDirection::Outbound => 2,
+            },
+            original_redirect_reason: info.original_redirect_reason,
+            last_redirect_reason: info.last_redirect_reason,
+            call_instance: 1,
+            security_status: 0,
+            party_restrictions: info.party_restrictions,
+        },
+    )?;
+
+    let fields: &[(&'static str, &str, usize)] = match protocol.dynamic_call_info_layout() {
+        DynamicCallInfoLayout::Fields15 => &[
+            ("calling number", &info.calling_number, 24),
+            ("original calling number", "", 24),
+            ("called number", &info.called_number, 24),
+            ("original called number", &info.original_called_number, 24),
+            ("last redirecting number", &info.last_redirecting_number, 24),
+            ("calling voicemail", "", 24),
+            ("called voicemail", "", 24),
+            ("original called voicemail", "", 24),
+            ("last redirecting voicemail", "", 24),
+            ("calling name", &info.calling_name, 120),
+            ("called name", &info.called_name, 120),
+            ("original called name", &info.original_called_name, 120),
+            ("last redirecting name", &info.last_redirecting_name, 120),
+            ("hunt pilot number", "", 24),
+            ("hunt pilot name", "", 120),
+        ],
+        DynamicCallInfoLayout::Fields13 => &[
+            ("calling number", &info.calling_number, 24),
+            ("original calling number", "", 24),
+            ("called number", &info.called_number, 24),
+            ("original called number", &info.original_called_number, 24),
+            ("last redirecting number", &info.last_redirecting_number, 24),
+            ("calling voicemail", "", 24),
+            ("called voicemail", "", 24),
+            ("original called voicemail", "", 24),
+            ("last redirecting voicemail", "", 24),
+            ("calling name", &info.calling_name, 120),
+            ("called name", &info.called_name, 120),
+            ("original called name", &info.original_called_name, 120),
+            ("last redirecting name", &info.last_redirecting_name, 120),
+        ],
+        DynamicCallInfoLayout::Fields12 => &[
+            ("calling number", &info.calling_number, 24),
+            ("called number", &info.called_number, 24),
+            ("original called number", &info.original_called_number, 24),
+            ("last redirecting number", &info.last_redirecting_number, 24),
+            ("calling voicemail", "", 24),
+            ("called voicemail", "", 24),
+            ("original called voicemail", "", 24),
+            ("last redirecting voicemail", "", 24),
+            ("calling name", &info.calling_name, 120),
+            ("called name", &info.called_name, 120),
+            ("original called name", &info.original_called_name, 120),
+            ("last redirecting name", &info.last_redirecting_name, 120),
+        ],
+    };
+    for &(field, text, maximum) in fields {
+        push_dynamic_text(&mut payload, id::CALL_INFO_DYNAMIC, field, text, maximum)?;
+    }
+    pad_dynamic_payload(&mut payload);
+    Ok(payload)
+}
+
+fn decode_dynamic_call_info(
+    payload: &[u8],
+    protocol: ProtocolVersion,
+) -> Result<ServerMessage, CodecError> {
+    const HEADER_SIZE: usize = 32;
+    if payload.len() < HEADER_SIZE {
+        return Err(CodecError::Truncated {
+            message_id: id::CALL_INFO_DYNAMIC,
+            needed: HEADER_SIZE,
+            actual: payload.len(),
+        });
+    }
+    let header: WireCallInfoDynamicHeader = decode(id::CALL_INFO_DYNAMIC, &payload[..HEADER_SIZE])?;
+    let fields = decode_dynamic_texts(
+        id::CALL_INFO_DYNAMIC,
+        payload,
+        HEADER_SIZE,
+        protocol.dynamic_call_info_layout().string_count(),
+    )?;
+    let (
+        calling_number,
+        called_number,
+        original_called_number,
+        last_redirecting_number,
+        calling_name,
+        called_name,
+        original_called_name,
+        last_redirecting_name,
+    ) = if matches!(
+        protocol.dynamic_call_info_layout(),
+        DynamicCallInfoLayout::Fields13 | DynamicCallInfoLayout::Fields15
+    ) {
+        (
+            &fields[0],
+            &fields[2],
+            &fields[3],
+            &fields[4],
+            &fields[9],
+            &fields[10],
+            &fields[11],
+            &fields[12],
+        )
+    } else {
+        (
+            &fields[0],
+            &fields[1],
+            &fields[2],
+            &fields[3],
+            &fields[8],
+            &fields[9],
+            &fields[10],
+            &fields[11],
+        )
+    };
+    Ok(ServerMessage::CallInfo {
+        info: CallInfo {
+            direction: if header.call_type == 1 {
+                crate::types::CallDirection::Inbound
+            } else {
+                crate::types::CallDirection::Outbound
+            },
+            calling_name: calling_name.clone(),
+            calling_number: calling_number.clone(),
+            called_name: called_name.clone(),
+            called_number: called_number.clone(),
+            original_called_name: original_called_name.clone(),
+            original_called_number: original_called_number.clone(),
+            last_redirecting_name: last_redirecting_name.clone(),
+            last_redirecting_number: last_redirecting_number.clone(),
+            original_redirect_reason: header.original_redirect_reason,
+            last_redirect_reason: header.last_redirect_reason,
+            party_restrictions: header.party_restrictions,
+        },
+        line_instance: header.line_instance,
+        call_reference: header.call_reference,
+    })
+}
+
+fn decode_port(value: u32, message_id: u32, field: &'static str) -> Result<u16, CodecError> {
+    u16::try_from(value).map_err(|_| CodecError::InvalidValue {
+        message_id,
+        field,
+        value: u64::from(value),
+    })
+}
+
+fn decode_server_endpoints(
+    message_id: u32,
+    names: [WireFixedText<48>; MAX_SIGNALING_SERVERS],
+    ports: [u32; MAX_SIGNALING_SERVERS],
+    addresses: Vec<IpAddr>,
+) -> Result<Vec<SignalingServerEndpoint>, CodecError> {
+    let mut servers = Vec::with_capacity(MAX_SIGNALING_SERVERS);
+    for ((name, port), address) in names.into_iter().zip(ports).zip(addresses) {
+        let name = name.text()?;
+        let empty = name.is_empty() && port == 0 && address.is_unspecified();
+        if empty {
+            continue;
+        }
+        if port == 0 || address.is_unspecified() || address.is_multicast() {
+            return Err(CodecError::InvalidValue {
+                message_id,
+                field: "server endpoint",
+                value: u64::from(port),
+            });
+        }
+        servers.push(SignalingServerEndpoint {
+            name,
+            address,
+            port: NonZeroU16::new(decode_port(port, message_id, "server port")?).ok_or(
+                CodecError::InvalidValue {
+                    message_id,
+                    field: "server port",
+                    value: 0,
+                },
+            )?,
+        });
+    }
+    Ok(servers)
+}
+
+fn decode_bool_word(value: u32, message_id: u32, field: &'static str) -> Result<bool, CodecError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(CodecError::InvalidValue {
+            message_id,
+            field,
+            value: u64::from(value),
+        }),
+    }
+}
+
+fn encode_connection_statistics(
+    statistics: &ConnectionStatistics,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    let tail = WireConnectionStatisticsTail {
+        packets_sent: statistics.packets_sent,
+        octets_sent: statistics.octets_sent,
+        packets_received: statistics.packets_received,
+        octets_received: statistics.octets_received,
+        packets_lost: statistics.packets_lost,
+        jitter_millis: statistics.jitter_millis,
+        latency_millis: statistics.latency_millis,
+        quality_size: u32::try_from(statistics.quality.as_bytes().len()).map_err(|_| {
+            CodecError::CountTooLarge {
+                message_id: id::CONNECTION_STATISTICS_RES,
+                field: "quality statistics",
+                count: statistics.quality.as_bytes().len(),
+                maximum: CONNECTION_QUALITY_MAX_BYTES,
+            }
+        })?,
+    };
+    if protocol.wire() >= 19 {
+        encode(
+            id::CONNECTION_STATISTICS_RES,
+            &WireConnectionStatisticsV19 {
+                directory_number: WireFixedText::new(
+                    id::CONNECTION_STATISTICS_RES,
+                    "directory number",
+                    &statistics.directory_number,
+                )?,
+                alignment: [0; 3],
+                call_reference: statistics.call_reference,
+                processing: statistics.processing.wire_value(),
+                statistics: tail,
+                quality: statistics.quality.as_bytes().to_vec(),
+            },
+        )
+    } else {
+        encode(
+            id::CONNECTION_STATISTICS_RES,
+            &WireConnectionStatisticsV3 {
+                directory_number: WireFixedText::new(
+                    id::CONNECTION_STATISTICS_RES,
+                    "directory number",
+                    &statistics.directory_number,
+                )?,
+                call_reference: statistics.call_reference,
+                processing: statistics.processing.wire_value(),
+                statistics: tail,
+                quality: statistics.quality.as_bytes().to_vec(),
+            },
+        )
+    }
+}
+
+fn encode_start_media_ack(
+    ack: &MediaTransmissionAck,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    if protocol.wire() >= 17 {
+        let base = WireStartMediaAckV17 {
+            conference_id: ack.conference_id,
+            passthrough_party_id: ack.passthrough_party_id,
+            call_reference: ack.call_reference,
+            address: WireExtendedAddress::from_ip(ack.address),
+            port: u32::from(ack.port),
+            status: ack.status.wire_value(),
+        };
+        if let Some(extension) = ack.wire.as_ref().and_then(|wire| wire.extension) {
+            encode(
+                id::START_MEDIA_TRANSMISSION_ACK,
+                &WireStartMediaAckV20 { base, extension },
+            )
+        } else {
+            encode(id::START_MEDIA_TRANSMISSION_ACK, &base)
+        }
+    } else {
+        let IpAddr::V4(address) = ack.address else {
+            return Err(CodecError::InvalidValue {
+                message_id: id::START_MEDIA_TRANSMISSION_ACK,
+                field: "IP address family for this protocol version",
+                value: 1,
+            });
+        };
+        encode(
+            id::START_MEDIA_TRANSMISSION_ACK,
+            &WireStartMediaAckV3 {
+                conference_id: ack.conference_id,
+                passthrough_party_id: ack.passthrough_party_id,
+                call_reference: ack.call_reference,
+                address: address.octets(),
+                port: u32::from(ack.port),
+                status: ack.status.wire_value(),
+            },
+        )
+    }
+}
+
+impl ServerMessage {
+    /// Decode a server-to-phone message using the negotiated version for
+    /// layouts whose frame header is zero or otherwise ambiguous.
+    pub fn decode(frame: Frame, protocol: ProtocolVersion) -> Result<Self, CodecError> {
+        ensure_station_route(&frame, MessageRoute::ControlToStation, "control-to-station")?;
+        Self::decode_unchecked(frame, protocol)
+    }
+
+    fn decode_unchecked(frame: Frame, protocol: ProtocolVersion) -> Result<Self, CodecError> {
+        let p = &frame.payload;
+        match frame.message_id {
+            id::REGISTER_ACK => {
+                let value: WireRegisterAck = decode(frame.message_id, p)?;
+                validate_zero_payload(&value.alignment, frame.message_id, 2)?;
+                let protocol_features = u32::from_le_bytes(value.protocol_features);
+                Ok(Self::RegisterAck {
+                    keepalive_seconds: value.keepalive_seconds,
+                    secondary_keepalive_seconds: value.secondary_keepalive_seconds,
+                    protocol: ProtocolVersion::negotiate(u32::from(value.protocol_features[0]))?,
+                    features: PhoneFeatures::from_bits_retain(protocol_features & !0xff),
+                    date_template: DateTemplate::new(
+                        std::str::from_utf8(
+                            &value.date_template[..value
+                                .date_template
+                                .iter()
+                                .position(|byte| *byte == 0)
+                                .unwrap_or(6)],
+                        )
+                        .map_err(|_| CodecError::InvalidText)?,
+                    )?,
+                })
+            }
+            id::REGISTER_REJECT => {
+                let value: WireFixedText<33> = decode_zero_padded(frame.message_id, p)?;
+                Ok(Self::RegisterReject {
+                    reason: value.text()?,
+                })
+            }
+            id::KEEP_ALIVE_ACK => Ok(Self::KeepAliveAck),
+            id::UNREGISTER_ACK => {
+                let _: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::UnregisterAck)
+            }
+            id::CAPABILITIES_REQ => Ok(Self::CapabilitiesRequest),
+            id::CONFIG_STAT => {
+                let value: WireConfigStatus = decode(frame.message_id, p)?;
+                Ok(Self::ConfigStatus(ConfigurationStatus {
+                    device_name: value.device_id.text()?,
+                    station_user_id: value.station_user_id,
+                    station_instance: value.station_instance,
+                    user_name: value.user_name.text()?,
+                    server_name: value.server_name.text()?,
+                    line_count: value.line_count,
+                    speed_dial_count: value.speed_dial_count,
+                }))
+            }
+            id::CONFIG_STAT_DYNAMIC => decode_dynamic_config_status(p),
+            id::LINE_STAT => {
+                let value: WireLineStatus = decode(frame.message_id, p)?;
+                Ok(Self::LineStatus {
+                    instance: value.line_instance,
+                    number: value.directory_number.text()?,
+                    display_name: value.display_name.text()?,
+                })
+            }
+            id::LINE_STAT_DYNAMIC => decode_dynamic_line_status(p),
+            id::BUTTON_TEMPLATE => {
+                let value: WireButtonTemplate = decode(frame.message_id, p)?;
+                if value.count > 42 {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: frame.message_id,
+                        field: "button definitions in message",
+                        count: usize_from_wire(
+                            frame.message_id,
+                            "button definitions in message",
+                            value.count,
+                        )?,
+                        maximum: 42,
+                    });
+                }
+                let total = usize_from_wire(frame.message_id, "button definitions", value.total)?;
+                if total > 42 {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: frame.message_id,
+                        field: "button definitions",
+                        count: total,
+                        maximum: 42,
+                    });
+                }
+                let offset = usize_from_wire(frame.message_id, "button offset", value.offset)?;
+                let count = usize_from_wire(frame.message_id, "button definitions", value.count)?;
+                if offset.checked_add(count).is_none_or(|end| end > total) {
+                    return Err(CodecError::InvalidValue {
+                        message_id: frame.message_id,
+                        field: "button template range",
+                        value: u64::from(value.offset) + u64::from(value.count),
+                    });
+                }
+                let mut buttons = value.definitions[..count]
+                    .iter()
+                    .map(|definition| ButtonTemplateEntry {
+                        instance: u32::from(definition.instance),
+                        button_type: ButtonType::from(u32::from(definition.button_type)),
+                    })
+                    .collect::<Vec<_>>();
+                while buttons.last().is_some_and(|button| {
+                    button.instance == 0 && button.button_type == ButtonType::Unused
+                }) {
+                    buttons.pop();
+                }
+                Ok(Self::ButtonTemplate { buttons })
+            }
+            id::VERSION => {
+                let value: WireFixedText<16> = decode(frame.message_id, p)?;
+                Ok(Self::Version {
+                    firmware: value.text()?,
+                })
+            }
+            id::SERVER_RES => {
+                let servers = if protocol.wire() >= 17 {
+                    let value: WireServerResponseV17 = decode(frame.message_id, p)?;
+                    decode_server_endpoints(
+                        frame.message_id,
+                        value.names,
+                        value.ports,
+                        value
+                            .addresses
+                            .map(|address| address.to_ip(frame.message_id))
+                            .into_iter()
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )?
+                } else {
+                    let value: WireServerResponseV3 = decode(frame.message_id, p)?;
+                    decode_server_endpoints(
+                        frame.message_id,
+                        value.names,
+                        value.ports,
+                        value
+                            .addresses
+                            .map(|address| IpAddr::V4(Ipv4Addr::from(address)))
+                            .to_vec(),
+                    )?
+                };
+                Ok(Self::ServerResponse { servers })
+            }
+            id::DEFINE_TIME_DATE => {
+                let value: WireTimeDate = decode(frame.message_id, p)?;
+                Ok(Self::TimeDate {
+                    year: value.year,
+                    month: value.month,
+                    weekday: value.weekday,
+                    day: value.day,
+                    hour: value.hour,
+                    minute: value.minute,
+                    second: value.second,
+                    milliseconds: value.milliseconds,
+                    unix_seconds: value.unix_seconds,
+                })
+            }
+            id::SOFT_KEY_TEMPLATE_RES => {
+                let value: WireSoftKeyTemplate = decode(frame.message_id, p)?;
+                let actions = value
+                    .definitions
+                    .iter()
+                    .filter(|definition| definition.event != 0)
+                    .map(|definition| SoftKey::from(definition.event))
+                    .collect();
+                Ok(Self::SoftKeyTemplate { actions })
+            }
+            id::SOFT_KEY_SET_RES => {
+                let value: WireSoftKeySet = decode(frame.message_id, p)?;
+                let profile =
+                    SoftKeyProfile::new(KeyMode::ALL_KNOWN.iter().copied().map(|mode| {
+                        let actions = value
+                            .sets
+                            .get(mode.wire_value() as usize)
+                            .map(|set| {
+                                set.template_indexes
+                                    .iter()
+                                    .copied()
+                                    .take_while(|index| *index != 0)
+                                    .map(|index| SoftKey::from(u32::from(index)))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (mode, actions)
+                    }))?;
+                Ok(Self::SoftKeySet { profile })
+            }
+            id::SELECT_SOFT_KEYS => {
+                let value: WireSelectSoftKeys = decode(frame.message_id, p)?;
+                Ok(Self::SelectSoftKeys {
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                    set: KeyMode::from(value.set),
+                    valid_mask: value.valid_mask,
+                })
+            }
+            id::CALL_STATE => {
+                let value: WireCallState = decode(frame.message_id, p)?;
+                Ok(Self::CallState {
+                    state: CallState::from(value.state),
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::CALL_INFO => {
+                let value: WireCallInfo = decode(frame.message_id, p)?;
+                let call_type = super::values::CallType::from(value.call_type);
+                Ok(Self::CallInfo {
+                    info: CallInfo {
+                        direction: match call_type {
+                            super::values::CallType::Inbound => {
+                                crate::types::CallDirection::Inbound
+                            }
+                            _ => crate::types::CallDirection::Outbound,
+                        },
+                        calling_name: value.calling_name.text()?,
+                        calling_number: value.calling_number.text()?,
+                        called_name: value.called_name.text()?,
+                        called_number: value.called_number.text()?,
+                        original_called_name: value.original_called_name.text()?,
+                        original_called_number: value.original_called_number.text()?,
+                        last_redirecting_name: value.last_redirecting_name.text()?,
+                        last_redirecting_number: value.last_redirecting_number.text()?,
+                        original_redirect_reason: value.original_redirect_reason,
+                        last_redirect_reason: value.last_redirect_reason,
+                        party_restrictions: value.party_restrictions,
+                    },
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::CALL_INFO_DYNAMIC => decode_dynamic_call_info(p, protocol),
+            id::DISPLAY_PROMPT_STATUS => {
+                let value: WirePromptStatus = decode(frame.message_id, p)?;
+                Ok(Self::DisplayPrompt {
+                    timeout_seconds: value.timeout_seconds,
+                    text: value.text.text()?,
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::DISPLAY_DYNAMIC_PROMPT_STATUS => {
+                const HEADER_SIZE: usize = 12;
+                if p.len() < HEADER_SIZE {
+                    return Err(CodecError::Truncated {
+                        message_id: frame.message_id,
+                        needed: HEADER_SIZE,
+                        actual: p.len(),
+                    });
+                }
+                let value: WireDynamicPromptHeader = decode(frame.message_id, &p[..HEADER_SIZE])?;
+                Ok(Self::DisplayPrompt {
+                    timeout_seconds: value.timeout_seconds,
+                    text: decode_dynamic_text(frame.message_id, p, HEADER_SIZE)?,
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::CLEAR_PROMPT_STATUS => {
+                let value: WireLineCall = decode(frame.message_id, p)?;
+                Ok(Self::ClearPrompt {
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::DISPLAY_NOTIFY => {
+                let value: WireNotify = decode(frame.message_id, p)?;
+                Ok(Self::DisplayNotify {
+                    timeout_seconds: value.timeout_seconds,
+                    text: value.text.text()?,
+                })
+            }
+            id::DISPLAY_DYNAMIC_NOTIFY => {
+                const HEADER_SIZE: usize = 4;
+                if p.len() < HEADER_SIZE {
+                    return Err(CodecError::Truncated {
+                        message_id: frame.message_id,
+                        needed: HEADER_SIZE,
+                        actual: p.len(),
+                    });
+                }
+                let value: WireDynamicNotifyHeader = decode(frame.message_id, &p[..HEADER_SIZE])?;
+                Ok(Self::DisplayNotify {
+                    timeout_seconds: value.timeout_seconds,
+                    text: decode_dynamic_text(frame.message_id, p, HEADER_SIZE)?,
+                })
+            }
+            id::CLEAR_NOTIFY => Ok(Self::ClearNotify),
+            id::DISPLAY_PRIORITY_NOTIFY => {
+                let value: WirePriorityNotify = decode(frame.message_id, p)?;
+                Ok(Self::DisplayPriorityNotify {
+                    timeout_seconds: value.timeout_seconds,
+                    priority: NotificationPriority::from(value.priority),
+                    text: value.text.text()?,
+                })
+            }
+            id::DISPLAY_DYNAMIC_PRIORITY_NOTIFY => {
+                const HEADER_SIZE: usize = 8;
+                if p.len() < HEADER_SIZE {
+                    return Err(CodecError::Truncated {
+                        message_id: frame.message_id,
+                        needed: HEADER_SIZE,
+                        actual: p.len(),
+                    });
+                }
+                let value: WireDynamicPriorityNotifyHeader =
+                    decode(frame.message_id, &p[..HEADER_SIZE])?;
+                Ok(Self::DisplayPriorityNotify {
+                    timeout_seconds: value.timeout_seconds,
+                    priority: NotificationPriority::from(value.priority),
+                    text: decode_dynamic_text(frame.message_id, p, HEADER_SIZE)?,
+                })
+            }
+            id::CLEAR_PRIORITY_NOTIFY => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::ClearPriorityNotify {
+                    priority: NotificationPriority::from(value.value),
+                })
+            }
+            id::NOTIFY_DTMF_TONE | id::SEND_DTMF_TONE => {
+                let value: WireDtmfToneControl = decode(frame.message_id, p)?;
+                let message = DtmfToneControl {
+                    tone: Tone::from(value.tone),
+                    conference_id: value.conference_id.into(),
+                    passthrough_party_id: value.passthrough_party_id,
+                };
+                if frame.message_id == id::NOTIFY_DTMF_TONE {
+                    Ok(Self::NotifyDtmfTone(message))
+                } else {
+                    Ok(Self::SendDtmfTone(message))
+                }
+            }
+            id::START_ANNOUNCEMENT => {
+                const PAYLOAD_SIZE: usize = 464;
+                validate_exact_payload(p, frame.message_id, PAYLOAD_SIZE)?;
+                let value: WireStartAnnouncement = decode(frame.message_id, p)?;
+                let mut announcements = value
+                    .announcements
+                    .into_iter()
+                    .map(|entry| AnnouncementEntry {
+                        locale: entry.locale,
+                        country: entry.country,
+                        tone: Tone::from(entry.tone),
+                    })
+                    .collect::<Vec<_>>();
+                while announcements.last().is_some_and(|entry| {
+                    entry.locale == 0 && entry.country == 0 && entry.tone.wire_value() == 0
+                }) {
+                    announcements.pop();
+                }
+                let mut matrix_conference_party_ids = value.matrix_conference_party_ids.to_vec();
+                while matrix_conference_party_ids.last() == Some(&0) {
+                    matrix_conference_party_ids.pop();
+                }
+                Ok(Self::StartAnnouncement {
+                    announcements,
+                    end_of_ack: value.end_of_ack,
+                    conference_id: value.conference_id,
+                    matrix_conference_party_ids,
+                    hearing_conference_party_mask: value.hearing_conference_party_mask,
+                    play_mode: value.play_mode,
+                })
+            }
+            id::STOP_ANNOUNCEMENT => {
+                validate_exact_payload(p, frame.message_id, 4)?;
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::StopAnnouncement {
+                    conference_id: value.value,
+                })
+            }
+            id::ANNOUNCEMENT_FINISH => {
+                validate_exact_payload(p, frame.message_id, 8)?;
+                let value: WireAnnouncementFinish = decode(frame.message_id, p)?;
+                Ok(Self::AnnouncementFinish {
+                    conference_id: value.conference_id,
+                    play_status: value.play_status,
+                })
+            }
+            id::CLEAR_CONFERENCE => {
+                validate_exact_payload(p, frame.message_id, 8)?;
+                let value: WireCallParty = decode(frame.message_id, p)?;
+                Ok(Self::ClearConference {
+                    conference_id: value.call_reference.into(),
+                    service_number: value.passthrough_party_id,
+                })
+            }
+            id::CREATE_CONFERENCE_REQ => {
+                validate_conference_data_length(p, frame.message_id, 76, 72)?;
+                let value: WireCreateConferenceRequest = decode_zero_padded(frame.message_id, p)?;
+                Ok(Self::CreateConferenceRequest(CreateConferenceRequest {
+                    conference_id: value.conference_id.into(),
+                    reserved_participants: value.reserved_participants,
+                    resource_type: ConferenceResourceType::from(value.resource_type),
+                    application_id: value.application_id.into(),
+                    application_conference_id: value.application_conference_id.text()?,
+                    application_data: value.application_data.text()?,
+                    passthrough_data: value.passthrough_data,
+                }))
+            }
+            id::DELETE_CONFERENCE_REQ => {
+                validate_exact_payload(p, frame.message_id, 4)?;
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::DeleteConferenceRequest {
+                    conference_id: value.value.into(),
+                })
+            }
+            id::MODIFY_CONFERENCE_REQ => {
+                validate_conference_data_length(p, frame.message_id, 72, 68)?;
+                let value: WireModifyConferenceRequest = decode_zero_padded(frame.message_id, p)?;
+                Ok(Self::ModifyConferenceRequest(ModifyConferenceRequest {
+                    conference_id: value.conference_id.into(),
+                    reserved_participants: value.reserved_participants,
+                    application_id: value.application_id.into(),
+                    application_conference_id: value.application_conference_id.text()?,
+                    application_data: value.application_data.text()?,
+                    passthrough_data: value.passthrough_data,
+                }))
+            }
+            id::AUDIT_CONFERENCE_REQ => {
+                validate_exact_payload(p, frame.message_id, 0)?;
+                Ok(Self::AuditConferenceRequest)
+            }
+            id::ADD_PARTICIPANT_REQ => {
+                let (conference_id, participant) = decode_participant_request(p, frame.message_id)?;
+                Ok(Self::AddParticipantRequest(AddParticipantRequest {
+                    conference_id,
+                    participant,
+                }))
+            }
+            id::DROP_PARTICIPANT_REQ => {
+                validate_exact_payload(p, frame.message_id, 8)?;
+                let value: WireCallParty = decode(frame.message_id, p)?;
+                Ok(Self::DropParticipantRequest {
+                    conference_id: value.call_reference.into(),
+                    call_reference: value.passthrough_party_id.into(),
+                })
+            }
+            id::AUDIT_PARTICIPANT_REQ => {
+                validate_exact_payload(p, frame.message_id, 4)?;
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::AuditParticipantRequest {
+                    conference_id: value.value.into(),
+                })
+            }
+            id::CHANGE_PARTICIPANT_REQ => {
+                let (conference_id, participant) = decode_participant_request(p, frame.message_id)?;
+                Ok(Self::ChangeParticipantRequest(ChangeParticipantRequest {
+                    conference_id,
+                    participant,
+                }))
+            }
+            id::STOP_MULTIMEDIA_TRANSMISSION | id::CLOSE_MULTIMEDIA_RECEIVE_CHANNEL => {
+                let value: WireMultimediaStreamControl = decode(frame.message_id, p)?;
+                let message = MultimediaStreamControl {
+                    conference_id: value.conference_id.into(),
+                    passthrough_party_id: value.passthrough_party_id.into(),
+                    call_reference: value.call_reference.into(),
+                    port_handling_flag: value.port_handling_flag,
+                };
+                if frame.message_id == id::STOP_MULTIMEDIA_TRANSMISSION {
+                    Ok(Self::StopMultimediaTransmission(message))
+                } else {
+                    Ok(Self::CloseMultimediaReceiveChannel(message))
+                }
+            }
+            id::FLOW_CONTROL_COMMAND | id::FLOW_CONTROL_NOTIFY => {
+                let value: WireVideoFlowControl = decode(frame.message_id, p)?;
+                let message = VideoFlowControl {
+                    conference_id: value.conference_id.into(),
+                    passthrough_party_id: value.passthrough_party_id.into(),
+                    call_reference: value.call_reference.into(),
+                    maximum_bit_rate: value.maximum_bit_rate,
+                };
+                if frame.message_id == id::FLOW_CONTROL_COMMAND {
+                    Ok(Self::FlowControlCommand(message))
+                } else {
+                    Ok(Self::FlowControlNotify(message))
+                }
+            }
+            id::VIDEO_DISPLAY_COMMAND => {
+                let value: WireVideoDisplayCommand = decode(frame.message_id, p)?;
+                Ok(Self::VideoDisplayCommand {
+                    conference_id: value.conference_id.into(),
+                    call_reference: value.call_reference.into(),
+                    layout_id: value.layout_id,
+                })
+            }
+            id::ACTIVATE_CALL_PLANE => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::ActivateCallPlane {
+                    line_instance: value.value,
+                })
+            }
+            id::DEACTIVATE_CALL_PLANE => Ok(Self::DeactivateCallPlane),
+            id::BACKSPACE_RESPONSE => {
+                let value: WireLineCall = decode(frame.message_id, p)?;
+                Ok(Self::BackspaceResponse {
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::REGISTER_TOKEN_ACK => Ok(Self::RegisterTokenAck),
+            id::REGISTER_TOKEN_REJECT => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::RegisterTokenReject {
+                    backoff_seconds: value.value,
+                })
+            }
+            id::SET_RINGER => {
+                let value: WireModeLineCall = decode(frame.message_id, p)?;
+                Ok(Self::SetRinger {
+                    mode: RingerMode::from(value.mode),
+                    duration: RingDuration::from(value.duration),
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::SET_LAMP => {
+                let value: WireLampState = decode(frame.message_id, p)?;
+                Ok(Self::SetLamp {
+                    stimulus: ButtonType::from(value.stimulus),
+                    instance: value.instance,
+                    mode: LampMode::from(value.mode),
+                })
+            }
+            id::START_TONE => {
+                let value: WireToneLineCall = decode(frame.message_id, p)?;
+                Ok(Self::StartTone {
+                    tone: Tone::from(value.tone),
+                    direction: ToneDirection::from(value.direction),
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::STOP_TONE => {
+                let (line_instance, call_reference) = if protocol.wire() >= 12 {
+                    let value: WireStopToneV12 = decode(frame.message_id, p)?;
+                    (value.line_instance, value.call_reference)
+                } else {
+                    let value: WireLineCall = decode(frame.message_id, p)?;
+                    (value.line_instance, value.call_reference)
+                };
+                Ok(Self::StopTone {
+                    line_instance,
+                    call_reference,
+                })
+            }
+            id::START_MULTICAST_MEDIA_RECEPTION => {
+                decode_start_multicast_reception(p, protocol, frame.message_id)
+            }
+            id::START_MULTICAST_MEDIA_TRANSMISSION => {
+                decode_start_multicast_transmission(p, protocol, frame.message_id)
+            }
+            id::STOP_MULTICAST_MEDIA_RECEPTION | id::STOP_MULTICAST_MEDIA_TRANSMISSION => {
+                validate_exact_payload(p, frame.message_id, 12)?;
+                let value: WireStopMulticast = decode(frame.message_id, p)?;
+                if frame.message_id == id::STOP_MULTICAST_MEDIA_RECEPTION {
+                    Ok(Self::StopMulticastMediaReception {
+                        conference_id: value.conference_id.into(),
+                        passthrough_party_id: value.passthrough_party_id.into(),
+                        call_reference: value.call_reference.into(),
+                    })
+                } else {
+                    Ok(Self::StopMulticastMediaTransmission {
+                        conference_id: value.conference_id.into(),
+                        passthrough_party_id: value.passthrough_party_id.into(),
+                        call_reference: value.call_reference.into(),
+                    })
+                }
+            }
+            id::OPEN_RECEIVE_CHANNEL => decode_open_receive(p, protocol, frame.message_id),
+            id::CLOSE_RECEIVE_CHANNEL => {
+                validate_exact_payload(p, frame.message_id, 16)?;
+                let value: WireAudioStreamControl = decode(frame.message_id, p)?;
+                Ok(Self::CloseReceiveChannel(AudioStreamControl {
+                    conference_id: value.conference_id.into(),
+                    passthrough_party_id: value.passthrough_party_id.into(),
+                    call_reference: value.call_reference.into(),
+                    port_handling_flag: value.port_handling_flag,
+                }))
+            }
+            id::CONNECTION_STATISTICS_REQ => {
+                if protocol.wire() >= 19 {
+                    let value: WireConnectionStatisticsRequestV19 = decode(frame.message_id, p)?;
+                    Ok(Self::ConnectionStatisticsRequest {
+                        directory_number: value.directory_number.text()?,
+                        call_reference: value.call_reference,
+                        processing: StatisticsProcessing::from(value.processing),
+                    })
+                } else {
+                    let value: WireConnectionStatisticsRequestV3 = decode(frame.message_id, p)?;
+                    Ok(Self::ConnectionStatisticsRequest {
+                        directory_number: value.directory_number.text()?,
+                        call_reference: value.call_reference,
+                        processing: StatisticsProcessing::from(value.processing),
+                    })
+                }
+            }
+            id::START_MEDIA_TRANSMISSION => decode_start_media(p, protocol, frame.message_id),
+            id::STOP_MEDIA_TRANSMISSION => {
+                validate_exact_payload(p, frame.message_id, 16)?;
+                let value: WireAudioStreamControl = decode(frame.message_id, p)?;
+                Ok(Self::StopMediaTransmission(AudioStreamControl {
+                    conference_id: value.conference_id.into(),
+                    passthrough_party_id: value.passthrough_party_id.into(),
+                    call_reference: value.call_reference.into(),
+                    port_handling_flag: value.port_handling_flag,
+                }))
+            }
+            id::SET_SPEAKER_MODE => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::SetSpeakerMode(SpeakerMode::from(value.value)))
+            }
+            id::SET_MICROPHONE_MODE => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::SetMicrophoneMode(MicrophoneMode::from(value.value)))
+            }
+            id::RESET => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::Reset(ResetType::from(value.value)))
+            }
+            id::DISPLAY_TEXT => {
+                let value: WireFixedText<32> = decode(frame.message_id, p)?;
+                Ok(Self::DisplayText {
+                    text: value.text()?,
+                })
+            }
+            id::CLEAR_DISPLAY => Ok(Self::ClearDisplay),
+            id::FORWARD_STAT => {
+                if protocol.wire() >= 19 {
+                    let value: WireForwardStatusV19 = decode(frame.message_id, p)?;
+                    validate_zero_payload(&value.all_alignment, frame.message_id, 3)?;
+                    validate_zero_payload(&value.busy_alignment, frame.message_id, 3)?;
+                    validate_zero_payload(&value.no_answer_alignment, frame.message_id, 3)?;
+                    Ok(Self::ForwardStatus {
+                        forward_all: (value.all_active != 0)
+                            .then(|| value.all_number.text())
+                            .transpose()?,
+                        forward_busy: (value.busy_active != 0)
+                            .then(|| value.busy_number.text())
+                            .transpose()?,
+                        forward_no_answer: (value.no_answer_active != 0)
+                            .then(|| value.no_answer_number.text())
+                            .transpose()?,
+                        line_instance: value.line_instance,
+                    })
+                } else {
+                    let value: WireForwardStatusV3 = decode_zero_padded(frame.message_id, p)?;
+                    Ok(Self::ForwardStatus {
+                        forward_all: (value.all_active != 0)
+                            .then(|| value.all_number.text())
+                            .transpose()?,
+                        forward_busy: (value.busy_active != 0)
+                            .then(|| value.busy_number.text())
+                            .transpose()?,
+                        forward_no_answer: (value.no_answer_active != 0)
+                            .then(|| value.no_answer_number.text())
+                            .transpose()?,
+                        line_instance: value.line_instance,
+                    })
+                }
+            }
+            id::SPEED_DIAL_STAT => {
+                let value: WireSpeedDialStatus = decode(frame.message_id, p)?;
+                Ok(Self::SpeedDialStatus {
+                    instance: value.instance,
+                    number: value.number.text()?,
+                    display_name: value.display_name.text()?,
+                })
+            }
+            id::SPEED_DIAL_STAT_DYNAMIC => {
+                let value: WireSpeedDialStatus = decode(frame.message_id, p)?;
+                Ok(Self::SpeedDialStatus {
+                    instance: value.instance,
+                    number: value.number.text()?,
+                    display_name: value.display_name.text()?,
+                })
+            }
+            id::START_MEDIA_FAILURE_DETECTION => {
+                let value: WireMediaFailureDetection = decode(frame.message_id, p)?;
+                Ok(Self::StartMediaFailureDetection(MediaFailureDetection {
+                    conference_id: value.conference_id.into(),
+                    passthrough_party_id: value.passthrough_party_id,
+                    packet_millis: value.packet_millis,
+                    codec: Codec::from(value.codec),
+                    echo_cancellation: EchoCancellation::from(value.echo_cancellation),
+                    codec_qualifier: value.codec_qualifier,
+                    call_reference: value.call_reference.into(),
+                }))
+            }
+            id::OPEN_MULTIMEDIA_CHANNEL => decode_open_multimedia(p, protocol, frame.message_id)
+                .map(Self::OpenMultimediaChannel),
+            id::START_MULTIMEDIA_TRANSMISSION => {
+                decode_start_multimedia(p, protocol, frame.message_id)
+                    .map(Self::StartMultimediaTransmission)
+            }
+            id::MISCELLANEOUS_COMMAND => {
+                decode_miscellaneous_command(p, frame.message_id).map(Self::MiscellaneousCommand)
+            }
+            id::DIALED_NUMBER => {
+                if protocol.wire() >= 19 {
+                    let value: WireDialedNumberV19 = decode(frame.message_id, p)?;
+                    validate_zero_payload(&value.alignment, frame.message_id, 3)?;
+                    Ok(Self::DialedNumber {
+                        number: value.number.text()?,
+                        line_instance: value.line_instance,
+                        call_reference: value.call_reference,
+                    })
+                } else {
+                    let value: WireDialedNumberV3 = decode_zero_padded(frame.message_id, p)?;
+                    Ok(Self::DialedNumber {
+                        number: value.number.text()?,
+                        line_instance: value.line_instance,
+                        call_reference: value.call_reference,
+                    })
+                }
+            }
+            id::SUBSCRIBE_DTMF_PAYLOAD_REQ => {
+                let value: WireDtmfPayloadRequest = decode(frame.message_id, p)?;
+                Ok(Self::SubscribeDtmfPayloadRequest(
+                    dtmf_payload_request_from_wire(value),
+                ))
+            }
+            id::SUBSCRIBE_DTMF_PAYLOAD_ERR => {
+                let value: WireDtmfPayloadIdentity = decode(frame.message_id, p)?;
+                Ok(Self::SubscribeDtmfPayloadError(
+                    dtmf_payload_identity_from_wire(value),
+                ))
+            }
+            id::UNSUBSCRIBE_DTMF_PAYLOAD_REQ => {
+                let value: WireDtmfPayloadRequest = decode(frame.message_id, p)?;
+                Ok(Self::UnsubscribeDtmfPayloadRequest(
+                    dtmf_payload_request_from_wire(value),
+                ))
+            }
+            id::UNSUBSCRIBE_DTMF_PAYLOAD_ERR => {
+                let value: WireDtmfPayloadIdentity = decode(frame.message_id, p)?;
+                Ok(Self::UnsubscribeDtmfPayloadError(
+                    dtmf_payload_identity_from_wire(value),
+                ))
+            }
+            id::USER_TO_DEVICE_DATA => {
+                decode_user_data(p, frame.message_id).map(Self::UserToDeviceData)
+            }
+            id::USER_TO_DEVICE_DATA_V1 => {
+                decode_user_data_v1(p, frame.message_id).map(Self::UserToDeviceDataV1)
+            }
+            id::FEATURE_STAT => {
+                let value: WireFeatureStatus = decode(frame.message_id, p)?;
+                Ok(Self::FeatureStatus {
+                    instance: value.instance,
+                    button_type: ButtonType::from(value.button_type),
+                    label: value.label.text()?,
+                    state: value.state,
+                })
+            }
+            id::FEATURE_STAT_DYNAMIC => {
+                let value: WireFeatureStatusDynamic = decode(frame.message_id, p)?;
+                Ok(Self::FeatureStatus {
+                    instance: value.instance,
+                    button_type: ButtonType::from(value.button_type),
+                    label: value.label.text()?,
+                    state: value.state,
+                })
+            }
+            id::SERVICE_URL_STAT => {
+                let value: WireServiceUrlStatus = decode(frame.message_id, p)?;
+                Ok(Self::ServiceUrlStatus {
+                    index: value.index,
+                    url: value.url.text()?,
+                    label: value.label.text()?,
+                    extension_text: String::new(),
+                })
+            }
+            id::SERVICE_URL_STAT_DYNAMIC => decode_dynamic_service_url_status(p, protocol),
+            id::CALL_SELECT_STAT => {
+                let value: WireCallSelectStatus = decode(frame.message_id, p)?;
+                Ok(Self::CallSelectStatus {
+                    status: value.status,
+                    call_reference: value.call_reference,
+                    line_instance: value.line_instance,
+                })
+            }
+            id::PORT_REQUEST => {
+                let request = if protocol.wire() >= 20 {
+                    let value: WirePortRequestFrom20 = decode(frame.message_id, p)?;
+                    PortRequest {
+                        conference_id: value.conference_id.into(),
+                        call_reference: value.call_reference.into(),
+                        passthrough_party_id: value.passthrough_party_id.into(),
+                        transport: MediaTransport::from(value.transport),
+                        address_type: Some(IpAddressType::from(value.address_type)),
+                        media_type: Some(MediaType::from(value.media_type)),
+                    }
+                } else {
+                    let value: WirePortRequestPre20 = decode(frame.message_id, p)?;
+                    PortRequest {
+                        conference_id: value.conference_id.into(),
+                        call_reference: value.call_reference.into(),
+                        passthrough_party_id: value.passthrough_party_id.into(),
+                        transport: MediaTransport::from(value.transport),
+                        address_type: None,
+                        media_type: None,
+                    }
+                };
+                Ok(Self::PortRequest(request))
+            }
+            id::PORT_CLOSE => {
+                let close = if protocol.wire() >= 20 {
+                    let value: WirePortCloseFrom20 = decode(frame.message_id, p)?;
+                    PortClose {
+                        conference_id: value.conference_id.into(),
+                        call_reference: value.call_reference.into(),
+                        passthrough_party_id: value.passthrough_party_id.into(),
+                        media_type: Some(MediaType::from(value.media_type)),
+                    }
+                } else {
+                    let value: WirePortClosePre20 = decode(frame.message_id, p)?;
+                    PortClose {
+                        conference_id: value.conference_id.into(),
+                        call_reference: value.call_reference.into(),
+                        passthrough_party_id: value.passthrough_party_id.into(),
+                        media_type: None,
+                    }
+                };
+                Ok(Self::PortClose(close))
+            }
+            id::SUBSCRIPTION_STAT => {
+                let value: WireSubscriptionStatus = decode(frame.message_id, p)?;
+                Ok(Self::SubscriptionStatus {
+                    transaction_id: value.transaction_id,
+                    feature_id: value.feature_id,
+                    timer_seconds: value.timer_seconds,
+                    cause: SubscriptionCause::from(value.cause),
+                })
+            }
+            id::NOTIFICATION => {
+                let value: WireNotification = decode(frame.message_id, p)?;
+                Ok(Self::Notification {
+                    transaction_id: value.transaction_id,
+                    feature_id: value.feature_id,
+                    status: BusyLampFieldState::from(value.status),
+                    text: value.text.text()?,
+                })
+            }
+            id::CALL_HISTORY_DISPOSITION => {
+                let value: WireCallHistoryDisposition = decode(frame.message_id, p)?;
+                Ok(Self::CallHistoryDisposition {
+                    disposition: CallHistoryDisposition::from(value.disposition),
+                    line_instance: value.line_instance,
+                    call_reference: value.call_reference,
+                })
+            }
+            id::CALL_COUNT_RES => Ok(Self::CallCountResponse),
+            id::RECORDING_STATUS => {
+                let value: WireRecordingStatus = decode(frame.message_id, p)?;
+                Ok(Self::RecordingStatus {
+                    call_reference: value.call_reference,
+                    active: decode_bool_word(value.active, frame.message_id, "recording active")?,
+                })
+            }
+            _ => {
+                let message_type = frame.message_type();
+                if message_type.is_known() {
+                    preserve_known_message(frame, message_type).map(Self::KnownOpaque)
+                } else {
+                    Ok(Self::Unknown(RawMessage {
+                        message_id: frame.message_id,
+                        protocol_version: frame.protocol_version,
+                        payload: frame.payload,
+                    }))
+                }
+            }
+        }
+    }
+
+    /// Encodes a control-to-station message using version-only layout selection.
+    ///
+    /// When negotiated feature flags also select layouts, use
+    /// [`Self::encode_for_session`].
+    pub fn encode(&self, protocol: ProtocolVersion) -> Result<Vec<u8>, CodecError> {
+        self.encode_for_session(protocol.into())
+    }
+
+    /// Encodes a control-to-station message with complete session layout inputs.
+    pub fn encode_for_session(
+        &self,
+        session: StationSessionContext,
+    ) -> Result<Vec<u8>, CodecError> {
+        let (message_id, payload, header_protocol) = self.payload(session, None)?;
+        reject_non_station_route(
+            message_id,
+            MessageRoute::ControlToStation,
+            "control-to-station",
+        )?;
+        Frame::new(header_protocol, message_id, payload).encode()
+    }
+
+    fn encode_unchecked(&self, protocol: ProtocolVersion) -> Result<Vec<u8>, CodecError> {
+        let (message_id, payload, header_protocol) = self.payload(protocol.into(), None)?;
+        Frame::new(header_protocol, message_id, payload).encode()
+    }
+
+    /// Encode station-facing labels in a legacy single-byte code page.
+    ///
+    /// Version-only layout selection is used. See
+    /// [`Self::encode_for_legacy_session`] when feature flags also matter.
+    pub fn encode_for_legacy_station(
+        &self,
+        protocol: ProtocolVersion,
+        code_page: LegacyCodePage,
+    ) -> Result<Vec<u8>, CodecError> {
+        self.encode_for_legacy_session(protocol.into(), code_page)
+    }
+
+    /// Encodes a station message with session-aware layout selection and a
+    /// legacy single-byte code page for user-visible labels.
+    pub fn encode_for_legacy_session(
+        &self,
+        session: StationSessionContext,
+        code_page: LegacyCodePage,
+    ) -> Result<Vec<u8>, CodecError> {
+        let (message_id, payload, header_protocol) = self.payload(session, Some(code_page))?;
+        reject_non_station_route(
+            message_id,
+            MessageRoute::ControlToStation,
+            "control-to-station",
+        )?;
+        Frame::new(header_protocol, message_id, payload).encode()
+    }
+
+    fn payload(
+        &self,
+        session: StationSessionContext,
+        legacy_code_page: Option<LegacyCodePage>,
+    ) -> Result<(u32, Vec<u8>, u32), CodecError> {
+        let protocol = session.protocol;
+        let mut p = Vec::new();
+        let id = match self {
+            Self::RegisterAck {
+                keepalive_seconds,
+                secondary_keepalive_seconds,
+                protocol,
+                features,
+                date_template,
+            } => {
+                if date_template.as_str().len() > 6 {
+                    return Err(CodecError::TextTooLong {
+                        message_id: id::REGISTER_ACK,
+                        field: "date template",
+                        actual: date_template.as_str().len(),
+                        maximum: 6,
+                    });
+                }
+                let mut wire_date_template = [0_u8; 6];
+                wire_date_template[..date_template.as_str().len()]
+                    .copy_from_slice(date_template.as_str().as_bytes());
+                p = encode(
+                    id::REGISTER_ACK,
+                    &WireRegisterAck {
+                        keepalive_seconds: *keepalive_seconds,
+                        date_template: wire_date_template,
+                        alignment: [0; 2],
+                        secondary_keepalive_seconds: *secondary_keepalive_seconds,
+                        protocol_features: {
+                            let mut bytes = features.bits().to_le_bytes();
+                            bytes[0] = protocol.wire() as u8;
+                            bytes
+                        },
+                    },
+                )?;
+                return Ok((id::REGISTER_ACK, p, 0));
+            }
+            Self::RegisterReject { reason } => {
+                p = encode(
+                    id::REGISTER_REJECT,
+                    &WireFixedText::<33>::new(id::REGISTER_REJECT, "reject reason", reason)?,
+                )?;
+                pad_dynamic_payload(&mut p);
+                id::REGISTER_REJECT
+            }
+            Self::KeepAliveAck => return Ok((id::KEEP_ALIVE_ACK, p, 0)),
+            Self::UnregisterAck => {
+                p = encode(id::UNREGISTER_ACK, &WireOneWord { value: 0 })?;
+                return Ok((id::UNREGISTER_ACK, p, 0));
+            }
+            Self::CapabilitiesRequest => id::CAPABILITIES_REQ,
+            Self::ConfigStatus(status) => {
+                if session.uses_dynamic_general_ui() {
+                    p = encode_dynamic_config_status(status)?;
+                    id::CONFIG_STAT_DYNAMIC
+                } else {
+                    p = encode(
+                        id::CONFIG_STAT,
+                        &WireConfigStatus {
+                            device_id: WireFixedText::new(
+                                id::CONFIG_STAT,
+                                "device ID",
+                                &status.device_name,
+                            )?,
+                            station_user_id: status.station_user_id,
+                            station_instance: status.station_instance,
+                            user_name: WireFixedText::new_station(
+                                id::CONFIG_STAT,
+                                "user name",
+                                &status.user_name,
+                                legacy_code_page,
+                            )?,
+                            server_name: WireFixedText::new_station(
+                                id::CONFIG_STAT,
+                                "server name",
+                                &status.server_name,
+                                legacy_code_page,
+                            )?,
+                            line_count: status.line_count,
+                            speed_dial_count: status.speed_dial_count,
+                        },
+                    )?;
+                    id::CONFIG_STAT
+                }
+            }
+            Self::LineStatus {
+                instance,
+                number,
+                display_name,
+            } => {
+                if session.uses_dynamic_general_ui() {
+                    p = encode_dynamic_line_status(
+                        *instance,
+                        number,
+                        display_name,
+                        legacy_code_page,
+                    )?;
+                    id::LINE_STAT_DYNAMIC
+                } else {
+                    p = encode(
+                        id::LINE_STAT,
+                        &WireLineStatus {
+                            line_instance: *instance,
+                            directory_number: WireFixedText::new(
+                                id::LINE_STAT,
+                                "line number",
+                                number,
+                            )?,
+                            display_name: WireFixedText::new_station(
+                                id::LINE_STAT,
+                                "display name",
+                                display_name,
+                                legacy_code_page,
+                            )?,
+                            display_label: WireFixedText::new_station(
+                                id::LINE_STAT,
+                                "line label",
+                                display_name,
+                                legacy_code_page,
+                            )?,
+                            reserved: 0,
+                        },
+                    )?;
+                    id::LINE_STAT
+                }
+            }
+            Self::ButtonTemplate { buttons } => {
+                if buttons.len() > 42 {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: id::BUTTON_TEMPLATE,
+                        field: "button definitions",
+                        count: buttons.len(),
+                        maximum: 42,
+                    });
+                }
+                let mut definitions = [WireButtonDefinition::default(); 42];
+                for (index, button) in buttons.iter().enumerate() {
+                    definitions[index] = WireButtonDefinition {
+                        instance: u8::try_from(button.instance).map_err(|_| {
+                            CodecError::InvalidValue {
+                                message_id: id::BUTTON_TEMPLATE,
+                                field: "button instance",
+                                value: u64::from(button.instance),
+                            }
+                        })?,
+                        button_type: u8::try_from(button.button_type.wire_value()).map_err(
+                            |_| CodecError::InvalidValue {
+                                message_id: id::BUTTON_TEMPLATE,
+                                field: "button type",
+                                value: u64::from(button.button_type.wire_value()),
+                            },
+                        )?,
+                    };
+                }
+                p = encode(
+                    id::BUTTON_TEMPLATE,
+                    &WireButtonTemplate {
+                        offset: 0,
+                        count: 42,
+                        total: 42,
+                        definitions,
+                    },
+                )?;
+                id::BUTTON_TEMPLATE
+            }
+            Self::Version { firmware } => {
+                p = encode(
+                    id::VERSION,
+                    &WireFixedText::<16>::new(id::VERSION, "firmware", firmware)?,
+                )?;
+                id::VERSION
+            }
+            Self::ServerResponse { servers } => {
+                if servers.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        message_id: id::SERVER_RES,
+                        field: "server endpoints",
+                        value: 0,
+                    });
+                }
+                if servers.len() > MAX_SIGNALING_SERVERS {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: id::SERVER_RES,
+                        field: "server endpoints",
+                        count: servers.len(),
+                        maximum: MAX_SIGNALING_SERVERS,
+                    });
+                }
+                if servers
+                    .iter()
+                    .any(|server| server.address.is_unspecified() || server.address.is_multicast())
+                {
+                    return Err(CodecError::InvalidValue {
+                        message_id: id::SERVER_RES,
+                        field: "server address",
+                        value: 0,
+                    });
+                }
+                let names: [WireFixedText<48>; MAX_SIGNALING_SERVERS] = (0..MAX_SIGNALING_SERVERS)
+                    .map(|index| {
+                        WireFixedText::new(
+                            id::SERVER_RES,
+                            "server name",
+                            servers.get(index).map_or("", |server| server.name.as_str()),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .try_into()
+                    .map_err(|_| CodecError::InvalidValue {
+                        message_id: id::SERVER_RES,
+                        field: "server endpoint array",
+                        value: servers.len() as u64,
+                    })?;
+                let ports = std::array::from_fn(|index| {
+                    servers
+                        .get(index)
+                        .map_or(0, |server| u32::from(server.port.get()))
+                });
+                if protocol.wire() >= 17 {
+                    p = encode(
+                        id::SERVER_RES,
+                        &WireServerResponseV17 {
+                            names,
+                            ports,
+                            addresses: std::array::from_fn(|index| {
+                                WireExtendedAddress::from_ip(
+                                    servers
+                                        .get(index)
+                                        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |server| {
+                                            server.address
+                                        }),
+                                )
+                            }),
+                        },
+                    )?;
+                } else {
+                    let addresses: [[u8; 4]; MAX_SIGNALING_SERVERS] = (0..MAX_SIGNALING_SERVERS)
+                        .map(|index| match servers.get(index) {
+                            Some(server) => match server.address {
+                                IpAddr::V4(address) => Ok(address.octets()),
+                                IpAddr::V6(_) => Err(CodecError::InvalidValue {
+                                    message_id: id::SERVER_RES,
+                                    field: "IP address family for pre-v17 protocol",
+                                    value: 1,
+                                }),
+                            },
+                            None => Ok([0; 4]),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .try_into()
+                        .map_err(|_| CodecError::InvalidValue {
+                            message_id: id::SERVER_RES,
+                            field: "server address array",
+                            value: servers.len() as u64,
+                        })?;
+                    p = encode(
+                        id::SERVER_RES,
+                        &WireServerResponseV3 {
+                            names,
+                            ports,
+                            addresses,
+                        },
+                    )?;
+                }
+                id::SERVER_RES
+            }
+            Self::TimeDate {
+                year,
+                month,
+                weekday,
+                day,
+                hour,
+                minute,
+                second,
+                milliseconds,
+                unix_seconds,
+            } => {
+                p = encode(
+                    id::DEFINE_TIME_DATE,
+                    &WireTimeDate {
+                        year: *year,
+                        month: *month,
+                        weekday: *weekday,
+                        day: *day,
+                        hour: *hour,
+                        minute: *minute,
+                        second: *second,
+                        milliseconds: *milliseconds,
+                        unix_seconds: *unix_seconds,
+                    },
+                )?;
+                id::DEFINE_TIME_DATE
+            }
+            Self::SoftKeyTemplate { actions } => {
+                // SoftKeyEvent returns the template position, so the canonical
+                // 32-entry protocol order must remain stable
+                // even when the active set exposes only a subset.
+                const LABELS: [u16; 32] = [
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 202, 65, 67, 63,
+                    79, 78, 54, 62, 77, 80, 88, 60, 0, 201,
+                ];
+                let mut available = [false; 32];
+                for action in actions {
+                    let value = action.wire_value();
+                    if !action.is_known() || value == 0 || value > available.len() as u32 {
+                        return Err(CodecError::InvalidDefinition(format!(
+                            "soft-key template contains unknown action {value}"
+                        )));
+                    }
+                    let slot = value as usize - 1;
+                    if std::mem::replace(&mut available[slot], true) {
+                        return Err(CodecError::InvalidDefinition(format!(
+                            "soft-key template repeats action {value}"
+                        )));
+                    }
+                }
+                p = encode(
+                    id::SOFT_KEY_TEMPLATE_RES,
+                    &WireSoftKeyTemplate {
+                        offset: 0,
+                        count: 32,
+                        total: 32,
+                        definitions: std::array::from_fn(|index| {
+                            if !available[index] {
+                                return WireSoftKeyDefinition {
+                                    label: [0; 16],
+                                    event: 0,
+                                };
+                            }
+                            let label = LABELS[index];
+                            let mut encoded = [0; 16];
+                            if label == 201 {
+                                encoded[..4].copy_from_slice(b"Dial");
+                            } else if label != 0 {
+                                encoded[0] = 0x80;
+                                encoded[1] = label as u8;
+                            }
+                            WireSoftKeyDefinition {
+                                label: encoded,
+                                event: index as u32 + 1,
+                            }
+                        }),
+                    },
+                )?;
+                id::SOFT_KEY_TEMPLATE_RES
+            }
+            Self::SoftKeySet { profile } => {
+                let definitions = (0_u32..16)
+                    .map(KeyMode::from)
+                    .map(|mode| profile.actions(mode))
+                    .map(|actions| {
+                        let mut indexes = [0_u8; 16];
+                        let mut info = [0_u16; 16];
+                        for (slot, action) in actions.iter().copied().enumerate() {
+                            let template = action.wire_value() as u8;
+                            indexes[slot] = template;
+                            info[slot] = u16::from(template) + 300;
+                        }
+                        WireSoftKeySetDefinition {
+                            template_indexes: indexes,
+                            info,
+                        }
+                    })
+                    .collect();
+                p = encode(
+                    id::SOFT_KEY_SET_RES,
+                    &WireSoftKeySet {
+                        offset: 0,
+                        count: 16,
+                        total: 16,
+                        sets: definitions,
+                    },
+                )?;
+                id::SOFT_KEY_SET_RES
+            }
+            Self::SelectSoftKeys {
+                line_instance,
+                call_reference,
+                set,
+                valid_mask,
+            } => {
+                p = encode(
+                    id::SELECT_SOFT_KEYS,
+                    &WireSelectSoftKeys {
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                        set: set.wire_value(),
+                        valid_mask: *valid_mask,
+                    },
+                )?;
+                id::SELECT_SOFT_KEYS
+            }
+            Self::CallState {
+                state,
+                line_instance,
+                call_reference,
+            } => {
+                p = encode(
+                    id::CALL_STATE,
+                    &WireCallState {
+                        state: state.wire_value(),
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                        visibility: 0,
+                        precedence: call_state_precedence(*state),
+                        domain: 0,
+                    },
+                )?;
+                id::CALL_STATE
+            }
+            Self::CallInfo {
+                info,
+                line_instance,
+                call_reference,
+            } => {
+                if session.uses_dynamic_general_ui() {
+                    p = encode_dynamic_call_info(info, *line_instance, *call_reference, protocol)?;
+                    id::CALL_INFO_DYNAMIC
+                } else {
+                    p = encode(
+                        id::CALL_INFO,
+                        &WireCallInfo {
+                            calling_name: WireFixedText::new(
+                                id::CALL_INFO,
+                                "calling name",
+                                &info.calling_name,
+                            )?,
+                            calling_number: WireFixedText::new(
+                                id::CALL_INFO,
+                                "calling number",
+                                &info.calling_number,
+                            )?,
+                            called_name: WireFixedText::new(
+                                id::CALL_INFO,
+                                "called name",
+                                &info.called_name,
+                            )?,
+                            called_number: WireFixedText::new(
+                                id::CALL_INFO,
+                                "called number",
+                                &info.called_number,
+                            )?,
+                            line_instance: *line_instance,
+                            call_reference: *call_reference,
+                            call_type: match info.direction {
+                                crate::types::CallDirection::Inbound => 1,
+                                crate::types::CallDirection::Outbound => 2,
+                            },
+                            original_called_name: WireFixedText::new(
+                                id::CALL_INFO,
+                                "original called name",
+                                &info.original_called_name,
+                            )?,
+                            original_called_number: WireFixedText::new(
+                                id::CALL_INFO,
+                                "original called number",
+                                &info.original_called_number,
+                            )?,
+                            last_redirecting_name: WireFixedText::new(
+                                id::CALL_INFO,
+                                "last redirecting name",
+                                &info.last_redirecting_name,
+                            )?,
+                            last_redirecting_number: WireFixedText::new(
+                                id::CALL_INFO,
+                                "last redirecting number",
+                                &info.last_redirecting_number,
+                            )?,
+                            original_redirect_reason: info.original_redirect_reason,
+                            last_redirect_reason: info.last_redirect_reason,
+                            voice_mailboxes: std::array::from_fn(|_| {
+                                WireFixedText::new(id::CALL_INFO, "voice mailbox", "").unwrap()
+                            }),
+                            call_instance: 1,
+                            security_status: 0,
+                            party_restrictions: info.party_restrictions,
+                        },
+                    )?;
+                    id::CALL_INFO
+                }
+            }
+            Self::DisplayPrompt {
+                timeout_seconds,
+                text,
+                line_instance,
+                call_reference,
+            } => {
+                if session.uses_dynamic_general_ui() {
+                    p = encode(
+                        id::DISPLAY_DYNAMIC_PROMPT_STATUS,
+                        &WireDynamicPromptHeader {
+                            timeout_seconds: *timeout_seconds,
+                            line_instance: *line_instance,
+                            call_reference: *call_reference,
+                        },
+                    )?;
+                    push_dynamic_text(
+                        &mut p,
+                        id::DISPLAY_DYNAMIC_PROMPT_STATUS,
+                        "prompt",
+                        text,
+                        96,
+                    )?;
+                    pad_dynamic_payload(&mut p);
+                    id::DISPLAY_DYNAMIC_PROMPT_STATUS
+                } else {
+                    p = encode(
+                        id::DISPLAY_PROMPT_STATUS,
+                        &WirePromptStatus {
+                            timeout_seconds: *timeout_seconds,
+                            text: WireFixedText::new(id::DISPLAY_PROMPT_STATUS, "prompt", text)?,
+                            line_instance: *line_instance,
+                            call_reference: *call_reference,
+                        },
+                    )?;
+                    id::DISPLAY_PROMPT_STATUS
+                }
+            }
+            Self::ClearPrompt {
+                line_instance,
+                call_reference,
+            } => {
+                p = encode(
+                    id::CLEAR_PROMPT_STATUS,
+                    &WireLineCall {
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                    },
+                )?;
+                id::CLEAR_PROMPT_STATUS
+            }
+            Self::DisplayNotify {
+                timeout_seconds,
+                text,
+            } => {
+                if session.uses_dynamic_general_ui() {
+                    p = encode(
+                        id::DISPLAY_DYNAMIC_NOTIFY,
+                        &WireDynamicNotifyHeader {
+                            timeout_seconds: *timeout_seconds,
+                        },
+                    )?;
+                    push_dynamic_text(
+                        &mut p,
+                        id::DISPLAY_DYNAMIC_NOTIFY,
+                        "notification",
+                        text,
+                        96,
+                    )?;
+                    pad_dynamic_payload(&mut p);
+                    id::DISPLAY_DYNAMIC_NOTIFY
+                } else {
+                    p = encode(
+                        id::DISPLAY_NOTIFY,
+                        &WireNotify {
+                            timeout_seconds: *timeout_seconds,
+                            text: WireFixedText::new(id::DISPLAY_NOTIFY, "notification", text)?,
+                        },
+                    )?;
+                    id::DISPLAY_NOTIFY
+                }
+            }
+            Self::ClearNotify => id::CLEAR_NOTIFY,
+            Self::DisplayPriorityNotify {
+                timeout_seconds,
+                priority,
+                text,
+            } => {
+                if session.uses_dynamic_general_ui() {
+                    p = encode(
+                        id::DISPLAY_DYNAMIC_PRIORITY_NOTIFY,
+                        &WireDynamicPriorityNotifyHeader {
+                            timeout_seconds: *timeout_seconds,
+                            priority: priority.wire_value(),
+                        },
+                    )?;
+                    push_dynamic_text(
+                        &mut p,
+                        id::DISPLAY_DYNAMIC_PRIORITY_NOTIFY,
+                        "notification",
+                        text,
+                        96,
+                    )?;
+                    pad_dynamic_payload(&mut p);
+                    id::DISPLAY_DYNAMIC_PRIORITY_NOTIFY
+                } else {
+                    p = encode(
+                        id::DISPLAY_PRIORITY_NOTIFY,
+                        &WirePriorityNotify {
+                            timeout_seconds: *timeout_seconds,
+                            priority: priority.wire_value(),
+                            text: WireFixedText::new(
+                                id::DISPLAY_PRIORITY_NOTIFY,
+                                "notification",
+                                text,
+                            )?,
+                        },
+                    )?;
+                    id::DISPLAY_PRIORITY_NOTIFY
+                }
+            }
+            Self::ClearPriorityNotify { priority } => {
+                p = encode(
+                    id::CLEAR_PRIORITY_NOTIFY,
+                    &WireOneWord {
+                        value: priority.wire_value(),
+                    },
+                )?;
+                id::CLEAR_PRIORITY_NOTIFY
+            }
+            Self::NotifyDtmfTone(message) | Self::SendDtmfTone(message) => {
+                let message_id = if matches!(self, Self::NotifyDtmfTone(_)) {
+                    id::NOTIFY_DTMF_TONE
+                } else {
+                    id::SEND_DTMF_TONE
+                };
+                p = encode(
+                    message_id,
+                    &WireDtmfToneControl {
+                        tone: message.tone.wire_value(),
+                        conference_id: message.conference_id.get(),
+                        passthrough_party_id: message.passthrough_party_id,
+                    },
+                )?;
+                message_id
+            }
+            Self::StartAnnouncement {
+                announcements,
+                end_of_ack,
+                conference_id,
+                matrix_conference_party_ids,
+                hearing_conference_party_mask,
+                play_mode,
+            } => {
+                if announcements.len() > 32 {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: id::START_ANNOUNCEMENT,
+                        field: "announcements",
+                        count: announcements.len(),
+                        maximum: 32,
+                    });
+                }
+                if matrix_conference_party_ids.len() > 16 {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: id::START_ANNOUNCEMENT,
+                        field: "matrix conference party identifiers",
+                        count: matrix_conference_party_ids.len(),
+                        maximum: 16,
+                    });
+                }
+                let mut wire_announcements = [WireAnnouncementEntry::default(); 32];
+                for (wire, entry) in wire_announcements.iter_mut().zip(announcements) {
+                    *wire = WireAnnouncementEntry {
+                        locale: entry.locale,
+                        country: entry.country,
+                        tone: entry.tone.wire_value(),
+                    };
+                }
+                let mut wire_party_ids = [0; 16];
+                wire_party_ids[..matrix_conference_party_ids.len()]
+                    .copy_from_slice(matrix_conference_party_ids);
+                p = encode(
+                    id::START_ANNOUNCEMENT,
+                    &WireStartAnnouncement {
+                        announcements: wire_announcements,
+                        end_of_ack: *end_of_ack,
+                        conference_id: *conference_id,
+                        matrix_conference_party_ids: wire_party_ids,
+                        hearing_conference_party_mask: *hearing_conference_party_mask,
+                        play_mode: *play_mode,
+                    },
+                )?;
+                id::START_ANNOUNCEMENT
+            }
+            Self::StopAnnouncement { conference_id } => {
+                p = encode(
+                    id::STOP_ANNOUNCEMENT,
+                    &WireOneWord {
+                        value: *conference_id,
+                    },
+                )?;
+                id::STOP_ANNOUNCEMENT
+            }
+            Self::AnnouncementFinish {
+                conference_id,
+                play_status,
+            } => {
+                p = encode(
+                    id::ANNOUNCEMENT_FINISH,
+                    &WireAnnouncementFinish {
+                        conference_id: *conference_id,
+                        play_status: *play_status,
+                    },
+                )?;
+                id::ANNOUNCEMENT_FINISH
+            }
+            Self::ClearConference {
+                conference_id,
+                service_number,
+            } => {
+                p = encode(
+                    id::CLEAR_CONFERENCE,
+                    &WireCallParty {
+                        call_reference: conference_id.get(),
+                        passthrough_party_id: *service_number,
+                    },
+                )?;
+                id::CLEAR_CONFERENCE
+            }
+            Self::CreateConferenceRequest(request) => {
+                p = encode(
+                    id::CREATE_CONFERENCE_REQ,
+                    &WireCreateConferenceRequest {
+                        conference_id: request.conference_id.get(),
+                        reserved_participants: request.reserved_participants,
+                        resource_type: request.resource_type.wire_value(),
+                        application_id: request.application_id.get(),
+                        application_conference_id: WireFixedText::new(
+                            id::CREATE_CONFERENCE_REQ,
+                            "application conference ID",
+                            &request.application_conference_id,
+                        )?,
+                        application_data: WireFixedText::new(
+                            id::CREATE_CONFERENCE_REQ,
+                            "application data",
+                            &request.application_data,
+                        )?,
+                        data_length: validate_conference_data_for_encode(
+                            id::CREATE_CONFERENCE_REQ,
+                            &request.passthrough_data,
+                        )?,
+                        passthrough_data: request.passthrough_data.clone(),
+                    },
+                )?;
+                id::CREATE_CONFERENCE_REQ
+            }
+            Self::DeleteConferenceRequest { conference_id } => {
+                p = encode(
+                    id::DELETE_CONFERENCE_REQ,
+                    &WireOneWord {
+                        value: conference_id.get(),
+                    },
+                )?;
+                id::DELETE_CONFERENCE_REQ
+            }
+            Self::ModifyConferenceRequest(request) => {
+                p = encode(
+                    id::MODIFY_CONFERENCE_REQ,
+                    &WireModifyConferenceRequest {
+                        conference_id: request.conference_id.get(),
+                        reserved_participants: request.reserved_participants,
+                        application_id: request.application_id.get(),
+                        application_conference_id: WireFixedText::new(
+                            id::MODIFY_CONFERENCE_REQ,
+                            "application conference ID",
+                            &request.application_conference_id,
+                        )?,
+                        application_data: WireFixedText::new(
+                            id::MODIFY_CONFERENCE_REQ,
+                            "application data",
+                            &request.application_data,
+                        )?,
+                        data_length: validate_conference_data_for_encode(
+                            id::MODIFY_CONFERENCE_REQ,
+                            &request.passthrough_data,
+                        )?,
+                        passthrough_data: request.passthrough_data.clone(),
+                    },
+                )?;
+                id::MODIFY_CONFERENCE_REQ
+            }
+            Self::AuditConferenceRequest => id::AUDIT_CONFERENCE_REQ,
+            Self::AddParticipantRequest(request) => {
+                p = encode(
+                    id::ADD_PARTICIPANT_REQ,
+                    &encode_participant_request(
+                        id::ADD_PARTICIPANT_REQ,
+                        request.conference_id,
+                        &request.participant,
+                    )?,
+                )?;
+                id::ADD_PARTICIPANT_REQ
+            }
+            Self::DropParticipantRequest {
+                conference_id,
+                call_reference,
+            } => {
+                p = encode(
+                    id::DROP_PARTICIPANT_REQ,
+                    &WireCallParty {
+                        call_reference: conference_id.get(),
+                        passthrough_party_id: call_reference.get(),
+                    },
+                )?;
+                id::DROP_PARTICIPANT_REQ
+            }
+            Self::AuditParticipantRequest { conference_id } => {
+                p = encode(
+                    id::AUDIT_PARTICIPANT_REQ,
+                    &WireOneWord {
+                        value: conference_id.get(),
+                    },
+                )?;
+                id::AUDIT_PARTICIPANT_REQ
+            }
+            Self::ChangeParticipantRequest(request) => {
+                p = encode(
+                    id::CHANGE_PARTICIPANT_REQ,
+                    &encode_participant_request(
+                        id::CHANGE_PARTICIPANT_REQ,
+                        request.conference_id,
+                        &request.participant,
+                    )?,
+                )?;
+                id::CHANGE_PARTICIPANT_REQ
+            }
+            Self::StopMultimediaTransmission(message)
+            | Self::CloseMultimediaReceiveChannel(message) => {
+                let message_id = if matches!(self, Self::StopMultimediaTransmission(_)) {
+                    id::STOP_MULTIMEDIA_TRANSMISSION
+                } else {
+                    id::CLOSE_MULTIMEDIA_RECEIVE_CHANNEL
+                };
+                p = encode(
+                    message_id,
+                    &WireMultimediaStreamControl {
+                        conference_id: message.conference_id.get(),
+                        passthrough_party_id: message.passthrough_party_id.get(),
+                        call_reference: message.call_reference.get(),
+                        port_handling_flag: message.port_handling_flag,
+                    },
+                )?;
+                message_id
+            }
+            Self::FlowControlCommand(message) | Self::FlowControlNotify(message) => {
+                let message_id = if matches!(self, Self::FlowControlCommand(_)) {
+                    id::FLOW_CONTROL_COMMAND
+                } else {
+                    id::FLOW_CONTROL_NOTIFY
+                };
+                p = encode(
+                    message_id,
+                    &WireVideoFlowControl {
+                        conference_id: message.conference_id.get(),
+                        passthrough_party_id: message.passthrough_party_id.get(),
+                        call_reference: message.call_reference.get(),
+                        maximum_bit_rate: message.maximum_bit_rate,
+                    },
+                )?;
+                message_id
+            }
+            Self::VideoDisplayCommand {
+                conference_id,
+                call_reference,
+                layout_id,
+            } => {
+                p = encode(
+                    id::VIDEO_DISPLAY_COMMAND,
+                    &WireVideoDisplayCommand {
+                        conference_id: conference_id.get(),
+                        call_reference: call_reference.get(),
+                        layout_id: *layout_id,
+                    },
+                )?;
+                id::VIDEO_DISPLAY_COMMAND
+            }
+            Self::ActivateCallPlane { line_instance } => {
+                p = encode(
+                    id::ACTIVATE_CALL_PLANE,
+                    &WireOneWord {
+                        value: *line_instance,
+                    },
+                )?;
+                id::ACTIVATE_CALL_PLANE
+            }
+            Self::DeactivateCallPlane => id::DEACTIVATE_CALL_PLANE,
+            Self::BackspaceResponse {
+                line_instance,
+                call_reference,
+            } => {
+                p = encode(
+                    id::BACKSPACE_RESPONSE,
+                    &WireLineCall {
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                    },
+                )?;
+                id::BACKSPACE_RESPONSE
+            }
+            Self::RegisterTokenAck => id::REGISTER_TOKEN_ACK,
+            Self::RegisterTokenReject { backoff_seconds } => {
+                p = encode(
+                    id::REGISTER_TOKEN_REJECT,
+                    &WireOneWord {
+                        value: *backoff_seconds,
+                    },
+                )?;
+                id::REGISTER_TOKEN_REJECT
+            }
+            Self::SetRinger {
+                mode,
+                duration,
+                line_instance,
+                call_reference,
+            } => {
+                p = encode(
+                    id::SET_RINGER,
+                    &WireModeLineCall {
+                        mode: mode.wire_value(),
+                        duration: duration.wire_value(),
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                    },
+                )?;
+                id::SET_RINGER
+            }
+            Self::SetLamp {
+                stimulus,
+                instance,
+                mode,
+            } => {
+                p = encode(
+                    id::SET_LAMP,
+                    &WireLampState {
+                        stimulus: stimulus.wire_value(),
+                        instance: *instance,
+                        mode: mode.wire_value(),
+                    },
+                )?;
+                id::SET_LAMP
+            }
+            Self::StartTone {
+                tone,
+                direction,
+                line_instance,
+                call_reference,
+            } => {
+                p = encode(
+                    id::START_TONE,
+                    &WireToneLineCall {
+                        tone: tone.wire_value(),
+                        direction: direction.wire_value(),
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                    },
+                )?;
+                id::START_TONE
+            }
+            Self::StopTone {
+                line_instance,
+                call_reference,
+            } => {
+                p = if protocol.wire() > 11 {
+                    encode(
+                        id::STOP_TONE,
+                        &WireStopToneV12 {
+                            line_instance: *line_instance,
+                            call_reference: *call_reference,
+                            tone: 0,
+                        },
+                    )?
+                } else {
+                    encode(
+                        id::STOP_TONE,
+                        &WireLineCall {
+                            line_instance: *line_instance,
+                            call_reference: *call_reference,
+                        },
+                    )?
+                };
+                id::STOP_TONE
+            }
+            Self::StartMulticastMediaReception(message) => {
+                p = encode_start_multicast_reception(message, protocol)?;
+                id::START_MULTICAST_MEDIA_RECEPTION
+            }
+            Self::StartMulticastMediaTransmission(message) => {
+                p = encode_start_multicast_transmission(message, protocol)?;
+                id::START_MULTICAST_MEDIA_TRANSMISSION
+            }
+            Self::StopMulticastMediaReception {
+                conference_id,
+                passthrough_party_id,
+                call_reference,
+            }
+            | Self::StopMulticastMediaTransmission {
+                conference_id,
+                passthrough_party_id,
+                call_reference,
+            } => {
+                let message_id = if matches!(self, Self::StopMulticastMediaReception { .. }) {
+                    id::STOP_MULTICAST_MEDIA_RECEPTION
+                } else {
+                    id::STOP_MULTICAST_MEDIA_TRANSMISSION
+                };
+                p = encode(
+                    message_id,
+                    &WireStopMulticast {
+                        conference_id: conference_id.get(),
+                        passthrough_party_id: passthrough_party_id.get(),
+                        call_reference: call_reference.get(),
+                    },
+                )?;
+                message_id
+            }
+            Self::OpenReceiveChannel {
+                call_reference,
+                passthrough_party_id,
+                packet_ms,
+                codec,
+                echo_cancellation,
+                telephone_event_payload,
+                source_address,
+                source_port,
+                encryption,
+                wire,
+            } => {
+                p = encode_open_receive(
+                    *call_reference,
+                    *passthrough_party_id,
+                    OpenReceiveParameters {
+                        packet_ms: *packet_ms,
+                        codec: *codec,
+                        echo_cancellation: *echo_cancellation,
+                        telephone_event_payload: *telephone_event_payload,
+                        source_address: *source_address,
+                        source_port: *source_port,
+                    },
+                    encryption.as_ref(),
+                    wire.as_ref(),
+                    protocol,
+                )?;
+                id::OPEN_RECEIVE_CHANNEL
+            }
+            Self::CloseReceiveChannel(control) => {
+                p = encode(
+                    id::CLOSE_RECEIVE_CHANNEL,
+                    &WireAudioStreamControl {
+                        conference_id: control.conference_id.get(),
+                        passthrough_party_id: control.passthrough_party_id.get(),
+                        call_reference: control.call_reference.get(),
+                        port_handling_flag: control.port_handling_flag,
+                    },
+                )?;
+                id::CLOSE_RECEIVE_CHANNEL
+            }
+            Self::ConnectionStatisticsRequest {
+                directory_number,
+                call_reference,
+                processing,
+            } => {
+                if protocol.wire() >= 19 {
+                    p = encode(
+                        id::CONNECTION_STATISTICS_REQ,
+                        &WireConnectionStatisticsRequestV19 {
+                            directory_number: WireFixedText::new(
+                                id::CONNECTION_STATISTICS_REQ,
+                                "directory number",
+                                directory_number,
+                            )?,
+                            alignment: [0; 3],
+                            call_reference: *call_reference,
+                            processing: processing.wire_value(),
+                        },
+                    )?;
+                } else {
+                    p = encode(
+                        id::CONNECTION_STATISTICS_REQ,
+                        &WireConnectionStatisticsRequestV3 {
+                            directory_number: WireFixedText::new(
+                                id::CONNECTION_STATISTICS_REQ,
+                                "directory number",
+                                directory_number,
+                            )?,
+                            call_reference: *call_reference,
+                            processing: processing.wire_value(),
+                        },
+                    )?;
+                }
+                id::CONNECTION_STATISTICS_REQ
+            }
+            Self::StartMediaTransmission {
+                call_reference,
+                passthrough_party_id,
+                endpoint,
+                silence_suppression,
+                traffic_class,
+                encryption,
+                wire,
+            } => {
+                p = encode_start_media(
+                    *call_reference,
+                    *passthrough_party_id,
+                    StartMediaParameters {
+                        endpoint: *endpoint,
+                        silence_suppression: *silence_suppression,
+                        traffic_class: *traffic_class,
+                    },
+                    encryption.as_ref(),
+                    wire.as_ref(),
+                    protocol,
+                )?;
+                id::START_MEDIA_TRANSMISSION
+            }
+            Self::StopMediaTransmission(control) => {
+                p = encode(
+                    id::STOP_MEDIA_TRANSMISSION,
+                    &WireAudioStreamControl {
+                        conference_id: control.conference_id.get(),
+                        passthrough_party_id: control.passthrough_party_id.get(),
+                        call_reference: control.call_reference.get(),
+                        port_handling_flag: control.port_handling_flag,
+                    },
+                )?;
+                id::STOP_MEDIA_TRANSMISSION
+            }
+            Self::SetSpeakerMode(mode) => {
+                p = encode(
+                    id::SET_SPEAKER_MODE,
+                    &WireOneWord {
+                        value: mode.wire_value(),
+                    },
+                )?;
+                id::SET_SPEAKER_MODE
+            }
+            Self::SetMicrophoneMode(mode) => {
+                p = encode(
+                    id::SET_MICROPHONE_MODE,
+                    &WireOneWord {
+                        value: mode.wire_value(),
+                    },
+                )?;
+                id::SET_MICROPHONE_MODE
+            }
+            Self::Reset(reset) => {
+                p = encode(
+                    id::RESET,
+                    &WireOneWord {
+                        value: reset.wire_value(),
+                    },
+                )?;
+                id::RESET
+            }
+            Self::DisplayText { text } => {
+                p = encode(
+                    id::DISPLAY_TEXT,
+                    &WireFixedText::<32>::new(id::DISPLAY_TEXT, "display text", text)?,
+                )?;
+                id::DISPLAY_TEXT
+            }
+            Self::ClearDisplay => id::CLEAR_DISPLAY,
+            Self::ForwardStatus {
+                line_instance,
+                forward_all,
+                forward_busy,
+                forward_no_answer,
+            } => {
+                let active = u32::from(
+                    forward_all.is_some() || forward_busy.is_some() || forward_no_answer.is_some(),
+                );
+                if protocol.wire() >= 19 {
+                    p = encode(
+                        id::FORWARD_STAT,
+                        &WireForwardStatusV19 {
+                            active,
+                            line_instance: *line_instance,
+                            all_active: u32::from(forward_all.is_some()),
+                            all_number: WireFixedText::new(
+                                id::FORWARD_STAT,
+                                "forward number",
+                                forward_all.as_deref().unwrap_or(""),
+                            )?,
+                            all_alignment: [0; 3],
+                            busy_active: u32::from(forward_busy.is_some()),
+                            busy_number: WireFixedText::new(
+                                id::FORWARD_STAT,
+                                "forward number",
+                                forward_busy.as_deref().unwrap_or(""),
+                            )?,
+                            busy_alignment: [0; 3],
+                            no_answer_active: u32::from(forward_no_answer.is_some()),
+                            no_answer_number: WireFixedText::new(
+                                id::FORWARD_STAT,
+                                "forward number",
+                                forward_no_answer.as_deref().unwrap_or(""),
+                            )?,
+                            no_answer_alignment: [0; 3],
+                        },
+                    )?;
+                } else {
+                    p = encode(
+                        id::FORWARD_STAT,
+                        &WireForwardStatusV3 {
+                            active,
+                            line_instance: *line_instance,
+                            all_active: u32::from(forward_all.is_some()),
+                            all_number: WireFixedText::new(
+                                id::FORWARD_STAT,
+                                "forward number",
+                                forward_all.as_deref().unwrap_or(""),
+                            )?,
+                            busy_active: u32::from(forward_busy.is_some()),
+                            busy_number: WireFixedText::new(
+                                id::FORWARD_STAT,
+                                "forward number",
+                                forward_busy.as_deref().unwrap_or(""),
+                            )?,
+                            no_answer_active: u32::from(forward_no_answer.is_some()),
+                            no_answer_number: WireFixedText::new(
+                                id::FORWARD_STAT,
+                                "forward number",
+                                forward_no_answer.as_deref().unwrap_or(""),
+                            )?,
+                        },
+                    )?;
+                }
+                id::FORWARD_STAT
+            }
+            Self::SpeedDialStatus {
+                instance,
+                number,
+                display_name,
+            } => {
+                let message_id = if protocol.uses_dynamic_speed_dial_status() {
+                    id::SPEED_DIAL_STAT_DYNAMIC
+                } else {
+                    id::SPEED_DIAL_STAT
+                };
+                p = encode(
+                    message_id,
+                    &WireSpeedDialStatus {
+                        instance: *instance,
+                        number: WireFixedText::new(message_id, "number", number)?,
+                        display_name: WireFixedText::new_station(
+                            message_id,
+                            "display name",
+                            display_name,
+                            legacy_code_page,
+                        )?,
+                    },
+                )?;
+                message_id
+            }
+            Self::DialedNumber {
+                number,
+                line_instance,
+                call_reference,
+            } => {
+                p = if protocol.wire() >= 19 {
+                    encode(
+                        id::DIALED_NUMBER,
+                        &WireDialedNumberV19 {
+                            number: WireFixedText::new(id::DIALED_NUMBER, "dialed number", number)?,
+                            alignment: [0; 3],
+                            line_instance: *line_instance,
+                            call_reference: *call_reference,
+                        },
+                    )?
+                } else {
+                    encode(
+                        id::DIALED_NUMBER,
+                        &WireDialedNumberV3 {
+                            number: WireFixedText::new(id::DIALED_NUMBER, "dialed number", number)?,
+                            line_instance: *line_instance,
+                            call_reference: *call_reference,
+                        },
+                    )?
+                };
+                id::DIALED_NUMBER
+            }
+            Self::StartMediaFailureDetection(detection) => {
+                p = encode(
+                    id::START_MEDIA_FAILURE_DETECTION,
+                    &WireMediaFailureDetection {
+                        conference_id: detection.conference_id.get(),
+                        passthrough_party_id: detection.passthrough_party_id,
+                        packet_millis: detection.packet_millis,
+                        codec: detection.codec.wire_value(),
+                        echo_cancellation: detection.echo_cancellation.wire_value(),
+                        codec_qualifier: detection.codec_qualifier,
+                        call_reference: detection.call_reference.get(),
+                    },
+                )?;
+                id::START_MEDIA_FAILURE_DETECTION
+            }
+            Self::OpenMultimediaChannel(message) => {
+                p = encode_open_multimedia(message, protocol)?;
+                id::OPEN_MULTIMEDIA_CHANNEL
+            }
+            Self::StartMultimediaTransmission(message) => {
+                p = encode_start_multimedia(message, protocol)?;
+                id::START_MULTIMEDIA_TRANSMISSION
+            }
+            Self::MiscellaneousCommand(message) => {
+                p = encode_miscellaneous_command(message)?;
+                id::MISCELLANEOUS_COMMAND
+            }
+            Self::UserToDeviceData(data) => {
+                p = encode_user_data(data, id::USER_TO_DEVICE_DATA)?;
+                id::USER_TO_DEVICE_DATA
+            }
+            Self::UserToDeviceDataV1(data) => {
+                p = encode_user_data_v1(data, id::USER_TO_DEVICE_DATA_V1)?;
+                id::USER_TO_DEVICE_DATA_V1
+            }
+            Self::SubscribeDtmfPayloadRequest(request) => {
+                p = encode(
+                    id::SUBSCRIBE_DTMF_PAYLOAD_REQ,
+                    &dtmf_payload_request_to_wire(*request),
+                )?;
+                id::SUBSCRIBE_DTMF_PAYLOAD_REQ
+            }
+            Self::SubscribeDtmfPayloadError(identity) => {
+                p = encode(
+                    id::SUBSCRIBE_DTMF_PAYLOAD_ERR,
+                    &dtmf_payload_identity_to_wire(*identity),
+                )?;
+                id::SUBSCRIBE_DTMF_PAYLOAD_ERR
+            }
+            Self::UnsubscribeDtmfPayloadRequest(request) => {
+                p = encode(
+                    id::UNSUBSCRIBE_DTMF_PAYLOAD_REQ,
+                    &dtmf_payload_request_to_wire(*request),
+                )?;
+                id::UNSUBSCRIBE_DTMF_PAYLOAD_REQ
+            }
+            Self::UnsubscribeDtmfPayloadError(identity) => {
+                p = encode(
+                    id::UNSUBSCRIBE_DTMF_PAYLOAD_ERR,
+                    &dtmf_payload_identity_to_wire(*identity),
+                )?;
+                id::UNSUBSCRIBE_DTMF_PAYLOAD_ERR
+            }
+            Self::FeatureStatus {
+                instance,
+                button_type,
+                label,
+                state,
+            } => {
+                if session.uses_dynamic_feature_status() {
+                    p = encode(
+                        id::FEATURE_STAT_DYNAMIC,
+                        &WireFeatureStatusDynamic {
+                            instance: *instance,
+                            button_type: button_type.wire_value(),
+                            state: *state,
+                            label: WireFixedText::new_station(
+                                id::FEATURE_STAT_DYNAMIC,
+                                "feature label",
+                                label,
+                                legacy_code_page,
+                            )?,
+                            padding: [0; 3],
+                        },
+                    )?;
+                    id::FEATURE_STAT_DYNAMIC
+                } else {
+                    p = encode(
+                        id::FEATURE_STAT,
+                        &WireFeatureStatus {
+                            instance: *instance,
+                            button_type: button_type.wire_value(),
+                            label: WireFixedText::new_station(
+                                id::FEATURE_STAT,
+                                "feature label",
+                                label,
+                                legacy_code_page,
+                            )?,
+                            state: *state,
+                        },
+                    )?;
+                    id::FEATURE_STAT
+                }
+            }
+            Self::ServiceUrlStatus {
+                index,
+                url,
+                label,
+                extension_text,
+            } => {
+                if protocol < ProtocolVersion::V19 && !extension_text.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        message_id: id::SERVICE_URL_STAT_DYNAMIC,
+                        field: "service URL extension for this protocol version",
+                        value: extension_text.len() as u64,
+                    });
+                }
+                if session.uses_dynamic_general_ui() {
+                    p = encode_dynamic_service_url_status(
+                        *index,
+                        url,
+                        label,
+                        extension_text,
+                        protocol,
+                        legacy_code_page,
+                    )?;
+                    id::SERVICE_URL_STAT_DYNAMIC
+                } else {
+                    p = encode(
+                        id::SERVICE_URL_STAT,
+                        &WireServiceUrlStatus {
+                            index: *index,
+                            url: WireFixedText::new(id::SERVICE_URL_STAT, "service URL", url)?,
+                            label: WireFixedText::new_station(
+                                id::SERVICE_URL_STAT,
+                                "service label",
+                                label,
+                                legacy_code_page,
+                            )?,
+                        },
+                    )?;
+                    id::SERVICE_URL_STAT
+                }
+            }
+            Self::CallSelectStatus {
+                status,
+                call_reference,
+                line_instance,
+            } => {
+                p = encode(
+                    id::CALL_SELECT_STAT,
+                    &WireCallSelectStatus {
+                        status: *status,
+                        call_reference: *call_reference,
+                        line_instance: *line_instance,
+                    },
+                )?;
+                id::CALL_SELECT_STAT
+            }
+            Self::PortRequest(request) => {
+                p = if protocol.wire() >= 20 {
+                    encode(
+                        id::PORT_REQUEST,
+                        &WirePortRequestFrom20 {
+                            conference_id: request.conference_id.get(),
+                            call_reference: request.call_reference.get(),
+                            passthrough_party_id: request.passthrough_party_id.get(),
+                            transport: request.transport.wire_value(),
+                            address_type: request
+                                .address_type
+                                .ok_or(CodecError::InvalidValue {
+                                    message_id: id::PORT_REQUEST,
+                                    field: "address type required from protocol 20",
+                                    value: 0,
+                                })?
+                                .wire_value(),
+                            media_type: request
+                                .media_type
+                                .ok_or(CodecError::InvalidValue {
+                                    message_id: id::PORT_REQUEST,
+                                    field: "media type required from protocol 20",
+                                    value: 0,
+                                })?
+                                .wire_value(),
+                        },
+                    )?
+                } else {
+                    encode(
+                        id::PORT_REQUEST,
+                        &WirePortRequestPre20 {
+                            conference_id: request.conference_id.get(),
+                            call_reference: request.call_reference.get(),
+                            passthrough_party_id: request.passthrough_party_id.get(),
+                            transport: request.transport.wire_value(),
+                        },
+                    )?
+                };
+                id::PORT_REQUEST
+            }
+            Self::PortClose(close) => {
+                p = if protocol.wire() >= 20 {
+                    encode(
+                        id::PORT_CLOSE,
+                        &WirePortCloseFrom20 {
+                            conference_id: close.conference_id.get(),
+                            call_reference: close.call_reference.get(),
+                            passthrough_party_id: close.passthrough_party_id.get(),
+                            media_type: close
+                                .media_type
+                                .ok_or(CodecError::InvalidValue {
+                                    message_id: id::PORT_CLOSE,
+                                    field: "media type required from protocol 20",
+                                    value: 0,
+                                })?
+                                .wire_value(),
+                        },
+                    )?
+                } else {
+                    encode(
+                        id::PORT_CLOSE,
+                        &WirePortClosePre20 {
+                            conference_id: close.conference_id.get(),
+                            call_reference: close.call_reference.get(),
+                            passthrough_party_id: close.passthrough_party_id.get(),
+                        },
+                    )?
+                };
+                id::PORT_CLOSE
+            }
+            Self::SubscriptionStatus {
+                transaction_id,
+                feature_id,
+                timer_seconds,
+                cause,
+            } => {
+                p = encode(
+                    id::SUBSCRIPTION_STAT,
+                    &WireSubscriptionStatus {
+                        transaction_id: *transaction_id,
+                        feature_id: *feature_id,
+                        timer_seconds: *timer_seconds,
+                        cause: cause.wire_value(),
+                    },
+                )?;
+                id::SUBSCRIPTION_STAT
+            }
+            Self::Notification {
+                transaction_id,
+                feature_id,
+                status,
+                text,
+            } => {
+                p = encode(
+                    id::NOTIFICATION,
+                    &WireNotification {
+                        transaction_id: *transaction_id,
+                        feature_id: *feature_id,
+                        status: status.wire_value(),
+                        text: WireFixedText::new(id::NOTIFICATION, "notification", text)?,
+                    },
+                )?;
+                id::NOTIFICATION
+            }
+            Self::CallHistoryDisposition {
+                disposition,
+                line_instance,
+                call_reference,
+            } => {
+                p = encode(
+                    id::CALL_HISTORY_DISPOSITION,
+                    &WireCallHistoryDisposition {
+                        disposition: disposition.wire_value(),
+                        line_instance: *line_instance,
+                        call_reference: *call_reference,
+                    },
+                )?;
+                id::CALL_HISTORY_DISPOSITION
+            }
+            Self::CallCountResponse => id::CALL_COUNT_RES,
+            Self::RecordingStatus {
+                call_reference,
+                active,
+            } => {
+                p = encode(
+                    id::RECORDING_STATUS,
+                    &WireRecordingStatus {
+                        call_reference: *call_reference,
+                        active: u32::from(*active),
+                    },
+                )?;
+                id::RECORDING_STATUS
+            }
+            Self::KnownOpaque(message) => {
+                ensure_preserve_only(message.id)?;
+                return Ok((
+                    message.id.wire_value(),
+                    message.payload.as_bytes().to_vec(),
+                    message.protocol_version,
+                ));
+            }
+            Self::Unknown(message) => {
+                return Ok((
+                    message.message_id,
+                    message.payload.clone(),
+                    message.protocol_version,
+                ));
+            }
+        };
+        pad_typed_payload(id, &mut p);
+        Ok((id, p, protocol.wire()))
+    }
+}
+
+fn qos_flow_from_wire(flow: WireQosFlow, message_id: u32) -> Result<QosFlow, CodecError> {
+    Ok(QosFlow {
+        conference_id: flow.conference_id.into(),
+        call_reference: flow.call_reference.into(),
+        passthrough_party_id: flow.passthrough_party_id.into(),
+        address: Ipv4Addr::from(flow.address),
+        port: decode_port(flow.port, message_id, "QoS media port")?,
+    })
+}
+
+fn qos_flow_to_wire(flow: QosFlow) -> WireQosFlow {
+    WireQosFlow {
+        conference_id: flow.conference_id.get(),
+        call_reference: flow.call_reference.get(),
+        passthrough_party_id: flow.passthrough_party_id.get(),
+        address: flow.address.octets(),
+        port: u32::from(flow.port),
+    }
+}
+
+fn qos_application_from_wire(
+    value: WireQosApplicationIdentifier,
+) -> Result<QosApplicationIdentifier, CodecError> {
+    Ok(QosApplicationIdentifier {
+        vendor_id: value.vendor_id.text()?,
+        version: value.version.text()?,
+        application_name: value.application_name.text()?,
+        sub_application_id: value.sub_application_id.text()?,
+    })
+}
+
+fn qos_application_to_wire(
+    message_id: u32,
+    value: &QosApplicationIdentifier,
+) -> Result<WireQosApplicationIdentifier, CodecError> {
+    Ok(WireQosApplicationIdentifier {
+        vendor_id: WireFixedText::new(message_id, "QoS vendor ID", &value.vendor_id)?,
+        version: WireFixedText::new(message_id, "QoS application version", &value.version)?,
+        application_name: WireFixedText::new(
+            message_id,
+            "QoS application name",
+            &value.application_name,
+        )?,
+        sub_application_id: WireFixedText::new(
+            message_id,
+            "QoS sub-application ID",
+            &value.sub_application_id,
+        )?,
+    })
+}
+
+fn qos_traffic(
+    compression_type: u32,
+    average_bit_rate: u32,
+    burst_size: u32,
+    peak_rate: u32,
+) -> QosTrafficSpecification {
+    QosTrafficSpecification {
+        codec: Codec::from(compression_type),
+        average_bit_rate,
+        burst_size,
+        peak_rate,
+    }
+}
+
+fn reject_non_station_route(
+    message_id: u32,
+    expected_route: MessageRoute,
+    expected: &'static str,
+) -> Result<(), CodecError> {
+    if let Some(actual) = MessageId::from(message_id).route()
+        && actual != expected_route
+    {
+        return Err(CodecError::UnexpectedRoute {
+            message_id,
+            actual,
+            expected,
+        });
+    }
+    Ok(())
+}
+
+impl ControlMessage {
+    /// Decode a frame whose catalog route is between call-control or service
+    /// roles. Station messages fail closed instead of being interpreted by a
+    /// structurally similar conference or QoS layout.
+    pub fn decode(frame: Frame, protocol: ProtocolVersion) -> Result<Self, CodecError> {
+        let message_id = MessageId::from(frame.message_id);
+        let route = message_id.route().ok_or(CodecError::InvalidValue {
+            message_id: frame.message_id,
+            field: "known control message identifier",
+            value: u64::from(frame.message_id),
+        })?;
+        if matches!(
+            route,
+            MessageRoute::StationToControl | MessageRoute::ControlToStation
+        ) {
+            return Err(CodecError::UnexpectedRoute {
+                message_id: frame.message_id,
+                actual: route,
+                expected: "control/service-node or intra-control route",
+            });
+        }
+
+        let p = &frame.payload;
+        match frame.message_id {
+            id::START_SESSION_TRANSMISSION | id::STOP_SESSION_TRANSMISSION => {
+                let message = decode_session_transmission(p, protocol, frame.message_id)?;
+                if frame.message_id == id::START_SESSION_TRANSMISSION {
+                    Ok(Self::StartSessionTransmission(message))
+                } else {
+                    Ok(Self::StopSessionTransmission(message))
+                }
+            }
+            id::QOS_RESERVATION_NOTIFY => {
+                let value: WireQosReservationNotify = decode(frame.message_id, p)?;
+                Ok(Self::QosReservationNotify {
+                    flow: qos_flow_from_wire(value.flow, frame.message_id)?,
+                    direction: QosDirection::from(value.direction),
+                })
+            }
+            id::QOS_ERROR_NOTIFY => {
+                let value: WireQosErrorNotify = decode(frame.message_id, p)?;
+                Ok(Self::QosErrorNotify {
+                    flow: qos_flow_from_wire(value.flow, frame.message_id)?,
+                    direction: QosDirection::from(value.direction),
+                    error_code: QosErrorCode::from(value.error_code),
+                    failure_node: Ipv4Addr::from(value.failure_node),
+                    rsvp_error_code: RsvpErrorCode::from(value.rsvp_error_code),
+                    rsvp_error_subcode: value.rsvp_error_subcode,
+                    rsvp_error_flags: value.rsvp_error_flags,
+                })
+            }
+            id::QOS_LISTEN => {
+                let value: WireQosListen = decode(frame.message_id, p)?;
+                Ok(Self::QosListen {
+                    flow: qos_flow_from_wire(value.flow, frame.message_id)?,
+                    reservation_style: QosReservationStyle::from(value.reservation_style),
+                    maximum_retries: value.maximum_retries,
+                    retry_timer: value.retry_timer,
+                    confirmation_required: decode_bool_word(
+                        value.confirmation_required,
+                        frame.message_id,
+                        "QoS confirmation required",
+                    )?,
+                    preemption_priority: value.preemption_priority,
+                    defending_priority: value.defending_priority,
+                    traffic: qos_traffic(
+                        value.compression_type,
+                        value.average_bit_rate,
+                        value.burst_size,
+                        value.peak_rate,
+                    ),
+                    application: qos_application_from_wire(value.application)?,
+                })
+            }
+            id::QOS_PATH => {
+                let value: WireQosPath = decode(frame.message_id, p)?;
+                Ok(Self::QosPath {
+                    flow: qos_flow_from_wire(value.flow, frame.message_id)?,
+                    reservation_style: QosReservationStyle::from(value.reservation_style),
+                    maximum_retries: value.maximum_retries,
+                    retry_timer: value.retry_timer,
+                    preemption_priority: value.preemption_priority,
+                    defending_priority: value.defending_priority,
+                    traffic: qos_traffic(
+                        value.compression_type,
+                        value.average_bit_rate,
+                        value.burst_size,
+                        value.peak_rate,
+                    ),
+                    application: qos_application_from_wire(value.application)?,
+                })
+            }
+            id::QOS_TEARDOWN => {
+                let value: WireQosReservationNotify = decode(frame.message_id, p)?;
+                Ok(Self::QosTeardown {
+                    flow: qos_flow_from_wire(value.flow, frame.message_id)?,
+                    direction: QosDirection::from(value.direction),
+                })
+            }
+            id::UPDATE_DSCP => {
+                let value: WireUpdateDscp = decode(frame.message_id, p)?;
+                let dscp = u8::try_from(value.dscp).map_err(|_| CodecError::InvalidValue {
+                    message_id: frame.message_id,
+                    field: "DSCP",
+                    value: u64::from(value.dscp),
+                })?;
+                if dscp > 63 {
+                    return Err(CodecError::InvalidValue {
+                        message_id: frame.message_id,
+                        field: "DSCP",
+                        value: u64::from(dscp),
+                    });
+                }
+                Ok(Self::UpdateDscp {
+                    flow: qos_flow_from_wire(value.flow, frame.message_id)?,
+                    dscp,
+                })
+            }
+            id::QOS_MODIFY => {
+                let value: WireQosModify = decode(frame.message_id, p)?;
+                Ok(Self::QosModify {
+                    flow: qos_flow_from_wire(value.flow, frame.message_id)?,
+                    direction: QosDirection::from(value.direction),
+                    traffic: qos_traffic(
+                        value.compression_type,
+                        value.average_bit_rate,
+                        value.burst_size,
+                        value.peak_rate,
+                    ),
+                    application: qos_application_from_wire(value.application)?,
+                })
+            }
+            id::MWI_NOTIFICATION => {
+                let value: WireMessageWaitingNotification = decode(frame.message_id, p)?;
+                validate_zero_payload(&value.alignment, frame.message_id, 2)?;
+                Ok(Self::MessageWaitingNotification(
+                    MessageWaitingNotification {
+                        target_number: value.target_number.text()?,
+                        control_number: value.control_number.text()?,
+                        messages_waiting: decode_bool_word(
+                            value.messages_waiting,
+                            frame.message_id,
+                            "messages waiting",
+                        )?,
+                        total_voicemail: MessageWaitingCounts {
+                            new: value.total_voicemail_new,
+                            old: value.total_voicemail_old,
+                        },
+                        priority_voicemail: MessageWaitingCounts {
+                            new: value.priority_voicemail_new,
+                            old: value.priority_voicemail_old,
+                        },
+                        total_fax: MessageWaitingCounts {
+                            new: value.total_fax_new,
+                            old: value.total_fax_old,
+                        },
+                        priority_fax: MessageWaitingCounts {
+                            new: value.priority_fax_new,
+                            old: value.priority_fax_old,
+                        },
+                    },
+                ))
+            }
+            id::MWI_RESPONSE => {
+                let value: WireMessageWaitingResponse = decode(frame.message_id, p)?;
+                validate_zero_payload(&value.alignment, frame.message_id, 3)?;
+                Ok(Self::MessageWaitingResponse {
+                    target_number: value.target_number.text()?,
+                    result: MessageWaitingResult::from(value.result),
+                })
+            }
+            id::MEDIA_RESOURCE_NOTIFICATION
+            | id::PORT_RESPONSE
+            | id::CREATE_CONFERENCE_RES
+            | id::DELETE_CONFERENCE_RES
+            | id::MODIFY_CONFERENCE_RES
+            | id::ADD_PARTICIPANT_RES
+            | id::AUDIT_CONFERENCE_RES
+            | id::AUDIT_PARTICIPANT_RES => Self::from_client_message(
+                ClientMessage::decode_using_protocol(frame, protocol.wire())?,
+            ),
+            id::CLEAR_CONFERENCE
+            | id::START_ANNOUNCEMENT
+            | id::STOP_ANNOUNCEMENT
+            | id::ANNOUNCEMENT_FINISH
+            | id::CREATE_CONFERENCE_REQ
+            | id::DELETE_CONFERENCE_REQ
+            | id::MODIFY_CONFERENCE_REQ
+            | id::ADD_PARTICIPANT_REQ
+            | id::DROP_PARTICIPANT_REQ
+            | id::AUDIT_CONFERENCE_REQ
+            | id::AUDIT_PARTICIPANT_REQ
+            | id::CHANGE_PARTICIPANT_REQ => {
+                Self::from_server_message(ServerMessage::decode_unchecked(frame, protocol)?)
+            }
+            _ => preserve_known_message(frame, message_id).map(Self::KnownOpaque),
+        }
+    }
+
+    fn from_client_message(message: ClientMessage) -> Result<Self, CodecError> {
+        Ok(match message {
+            ClientMessage::MediaResourceNotification(value) => {
+                Self::MediaResourceNotification(value)
+            }
+            ClientMessage::PortResponse(value) => Self::PortResponse(value),
+            ClientMessage::CreateConferenceResponse(value) => Self::CreateConferenceResponse(value),
+            ClientMessage::DeleteConferenceResponse {
+                conference_id,
+                result,
+            } => Self::DeleteConferenceResponse {
+                conference_id,
+                result,
+            },
+            ClientMessage::ModifyConferenceResponse(value) => Self::ModifyConferenceResponse(value),
+            ClientMessage::AddParticipantResponse(value) => Self::AddParticipantResponse(value),
+            ClientMessage::AuditConferenceResponse(value) => Self::AuditConferenceResponse(value),
+            ClientMessage::AuditParticipantResponse(value) => Self::AuditParticipantResponse(value),
+            _ => {
+                return Err(CodecError::InvalidValue {
+                    message_id: 0,
+                    field: "control message decoded through station codec",
+                    value: 0,
+                });
+            }
+        })
+    }
+
+    fn from_server_message(message: ServerMessage) -> Result<Self, CodecError> {
+        Ok(match message {
+            ServerMessage::ClearConference {
+                conference_id,
+                service_number,
+            } => Self::ClearConference {
+                conference_id,
+                service_number,
+            },
+            ServerMessage::CreateConferenceRequest(value) => Self::CreateConferenceRequest(value),
+            ServerMessage::DeleteConferenceRequest { conference_id } => {
+                Self::DeleteConferenceRequest { conference_id }
+            }
+            ServerMessage::ModifyConferenceRequest(value) => Self::ModifyConferenceRequest(value),
+            ServerMessage::AddParticipantRequest(value) => Self::AddParticipantRequest(value),
+            ServerMessage::DropParticipantRequest {
+                conference_id,
+                call_reference,
+            } => Self::DropParticipantRequest {
+                conference_id,
+                call_reference,
+            },
+            ServerMessage::AuditConferenceRequest => Self::AuditConferenceRequest,
+            ServerMessage::AuditParticipantRequest { conference_id } => {
+                Self::AuditParticipantRequest { conference_id }
+            }
+            ServerMessage::ChangeParticipantRequest(value) => Self::ChangeParticipantRequest(value),
+            ServerMessage::StartAnnouncement {
+                announcements,
+                end_of_ack,
+                conference_id,
+                matrix_conference_party_ids,
+                hearing_conference_party_mask,
+                play_mode,
+            } => Self::StartAnnouncement {
+                announcements,
+                end_of_ack: EndOfAnnouncementAck::from(end_of_ack),
+                conference_id,
+                matrix_conference_party_ids,
+                hearing_conference_party_mask,
+                play_mode: AnnouncementPlayMode::from(play_mode),
+            },
+            ServerMessage::StopAnnouncement { conference_id } => {
+                Self::StopAnnouncement { conference_id }
+            }
+            ServerMessage::AnnouncementFinish {
+                conference_id,
+                play_status,
+            } => Self::AnnouncementFinish {
+                conference_id,
+                play_status: AnnouncementPlayStatus::from(play_status),
+            },
+            _ => {
+                return Err(CodecError::InvalidValue {
+                    message_id: 0,
+                    field: "control message decoded through station codec",
+                    value: 0,
+                });
+            }
+        })
+    }
+
+    /// Encodes a message routed between control and service roles.
+    ///
+    /// Station-routed variants are rejected rather than emitted through the
+    /// control-message API.
+    pub fn encode(&self, protocol: ProtocolVersion) -> Result<Vec<u8>, CodecError> {
+        let (message_id, payload, protocol_version) = match self {
+            Self::StartSessionTransmission(message) | Self::StopSessionTransmission(message) => {
+                let message_id = if matches!(self, Self::StartSessionTransmission(_)) {
+                    id::START_SESSION_TRANSMISSION
+                } else {
+                    id::STOP_SESSION_TRANSMISSION
+                };
+                (
+                    message_id,
+                    encode_session_transmission(*message, protocol, message_id)?,
+                    protocol.wire(),
+                )
+            }
+            Self::QosReservationNotify { flow, direction } => (
+                id::QOS_RESERVATION_NOTIFY,
+                encode(
+                    id::QOS_RESERVATION_NOTIFY,
+                    &WireQosReservationNotify {
+                        flow: qos_flow_to_wire(*flow),
+                        direction: direction.wire_value(),
+                    },
+                )?,
+                protocol.wire(),
+            ),
+            Self::QosErrorNotify {
+                flow,
+                direction,
+                error_code,
+                failure_node,
+                rsvp_error_code,
+                rsvp_error_subcode,
+                rsvp_error_flags,
+            } => (
+                id::QOS_ERROR_NOTIFY,
+                encode(
+                    id::QOS_ERROR_NOTIFY,
+                    &WireQosErrorNotify {
+                        flow: qos_flow_to_wire(*flow),
+                        direction: direction.wire_value(),
+                        error_code: error_code.wire_value(),
+                        failure_node: u32::from(*failure_node),
+                        rsvp_error_code: rsvp_error_code.wire_value(),
+                        rsvp_error_subcode: *rsvp_error_subcode,
+                        rsvp_error_flags: *rsvp_error_flags,
+                    },
+                )?,
+                protocol.wire(),
+            ),
+            Self::QosListen {
+                flow,
+                reservation_style,
+                maximum_retries,
+                retry_timer,
+                confirmation_required,
+                preemption_priority,
+                defending_priority,
+                traffic,
+                application,
+            } => (
+                id::QOS_LISTEN,
+                encode(
+                    id::QOS_LISTEN,
+                    &WireQosListen {
+                        flow: qos_flow_to_wire(*flow),
+                        reservation_style: reservation_style.wire_value(),
+                        maximum_retries: *maximum_retries,
+                        retry_timer: *retry_timer,
+                        confirmation_required: u32::from(*confirmation_required),
+                        preemption_priority: *preemption_priority,
+                        defending_priority: *defending_priority,
+                        compression_type: traffic.codec.wire_value(),
+                        average_bit_rate: traffic.average_bit_rate,
+                        burst_size: traffic.burst_size,
+                        peak_rate: traffic.peak_rate,
+                        application: qos_application_to_wire(id::QOS_LISTEN, application)?,
+                    },
+                )?,
+                protocol.wire(),
+            ),
+            Self::QosPath {
+                flow,
+                reservation_style,
+                maximum_retries,
+                retry_timer,
+                preemption_priority,
+                defending_priority,
+                traffic,
+                application,
+            } => (
+                id::QOS_PATH,
+                encode(
+                    id::QOS_PATH,
+                    &WireQosPath {
+                        flow: qos_flow_to_wire(*flow),
+                        reservation_style: reservation_style.wire_value(),
+                        maximum_retries: *maximum_retries,
+                        retry_timer: *retry_timer,
+                        preemption_priority: *preemption_priority,
+                        defending_priority: *defending_priority,
+                        compression_type: traffic.codec.wire_value(),
+                        average_bit_rate: traffic.average_bit_rate,
+                        burst_size: traffic.burst_size,
+                        peak_rate: traffic.peak_rate,
+                        application: qos_application_to_wire(id::QOS_PATH, application)?,
+                    },
+                )?,
+                protocol.wire(),
+            ),
+            Self::QosTeardown { flow, direction } => (
+                id::QOS_TEARDOWN,
+                encode(
+                    id::QOS_TEARDOWN,
+                    &WireQosReservationNotify {
+                        flow: qos_flow_to_wire(*flow),
+                        direction: direction.wire_value(),
+                    },
+                )?,
+                protocol.wire(),
+            ),
+            Self::UpdateDscp { flow, dscp } => {
+                if *dscp > 63 {
+                    return Err(CodecError::InvalidValue {
+                        message_id: id::UPDATE_DSCP,
+                        field: "DSCP",
+                        value: u64::from(*dscp),
+                    });
+                }
+                (
+                    id::UPDATE_DSCP,
+                    encode(
+                        id::UPDATE_DSCP,
+                        &WireUpdateDscp {
+                            flow: qos_flow_to_wire(*flow),
+                            dscp: u32::from(*dscp),
+                        },
+                    )?,
+                    protocol.wire(),
+                )
+            }
+            Self::QosModify {
+                flow,
+                direction,
+                traffic,
+                application,
+            } => (
+                id::QOS_MODIFY,
+                encode(
+                    id::QOS_MODIFY,
+                    &WireQosModify {
+                        flow: qos_flow_to_wire(*flow),
+                        direction: direction.wire_value(),
+                        compression_type: traffic.codec.wire_value(),
+                        average_bit_rate: traffic.average_bit_rate,
+                        burst_size: traffic.burst_size,
+                        peak_rate: traffic.peak_rate,
+                        application: qos_application_to_wire(id::QOS_MODIFY, application)?,
+                    },
+                )?,
+                protocol.wire(),
+            ),
+            Self::MessageWaitingNotification(value) => (
+                id::MWI_NOTIFICATION,
+                encode(
+                    id::MWI_NOTIFICATION,
+                    &WireMessageWaitingNotification {
+                        target_number: WireFixedText::new(
+                            id::MWI_NOTIFICATION,
+                            "MWI target number",
+                            &value.target_number,
+                        )?,
+                        control_number: WireFixedText::new(
+                            id::MWI_NOTIFICATION,
+                            "MWI control number",
+                            &value.control_number,
+                        )?,
+                        alignment: [0; 2],
+                        messages_waiting: u32::from(value.messages_waiting),
+                        total_voicemail_new: value.total_voicemail.new,
+                        total_voicemail_old: value.total_voicemail.old,
+                        priority_voicemail_new: value.priority_voicemail.new,
+                        priority_voicemail_old: value.priority_voicemail.old,
+                        total_fax_new: value.total_fax.new,
+                        total_fax_old: value.total_fax.old,
+                        priority_fax_new: value.priority_fax.new,
+                        priority_fax_old: value.priority_fax.old,
+                    },
+                )?,
+                protocol.wire(),
+            ),
+            Self::MessageWaitingResponse {
+                target_number,
+                result,
+            } => (
+                id::MWI_RESPONSE,
+                encode(
+                    id::MWI_RESPONSE,
+                    &WireMessageWaitingResponse {
+                        target_number: WireFixedText::new(
+                            id::MWI_RESPONSE,
+                            "MWI target number",
+                            target_number,
+                        )?,
+                        alignment: [0; 3],
+                        result: result.wire_value(),
+                    },
+                )?,
+                protocol.wire(),
+            ),
+            Self::KnownOpaque(message) => {
+                ensure_preserve_only(message.id)?;
+                return Frame::new(
+                    message.protocol_version,
+                    message.id.wire_value(),
+                    message.payload.as_bytes().to_vec(),
+                )
+                .encode();
+            }
+            other => return other.encode_via_existing(protocol),
+        };
+        Frame::new(protocol_version, message_id, payload).encode()
+    }
+
+    fn encode_via_existing(&self, protocol: ProtocolVersion) -> Result<Vec<u8>, CodecError> {
+        match self {
+            Self::MediaResourceNotification(value) => {
+                ClientMessage::MediaResourceNotification(value.clone()).encode_unchecked(protocol)
+            }
+            Self::PortResponse(value) => {
+                ClientMessage::PortResponse(value.clone()).encode_unchecked(protocol)
+            }
+            Self::CreateConferenceResponse(value) => {
+                ClientMessage::CreateConferenceResponse(value.clone()).encode_unchecked(protocol)
+            }
+            Self::DeleteConferenceResponse {
+                conference_id,
+                result,
+            } => ClientMessage::DeleteConferenceResponse {
+                conference_id: *conference_id,
+                result: *result,
+            }
+            .encode_unchecked(protocol),
+            Self::ModifyConferenceResponse(value) => {
+                ClientMessage::ModifyConferenceResponse(value.clone()).encode_unchecked(protocol)
+            }
+            Self::AddParticipantResponse(value) => {
+                ClientMessage::AddParticipantResponse(value.clone()).encode_unchecked(protocol)
+            }
+            Self::AuditConferenceResponse(value) => {
+                ClientMessage::AuditConferenceResponse(value.clone()).encode_unchecked(protocol)
+            }
+            Self::AuditParticipantResponse(value) => {
+                ClientMessage::AuditParticipantResponse(value.clone()).encode_unchecked(protocol)
+            }
+            Self::ClearConference {
+                conference_id,
+                service_number,
+            } => ServerMessage::ClearConference {
+                conference_id: *conference_id,
+                service_number: *service_number,
+            }
+            .encode_unchecked(protocol),
+            Self::CreateConferenceRequest(value) => {
+                ServerMessage::CreateConferenceRequest(value.clone()).encode_unchecked(protocol)
+            }
+            Self::DeleteConferenceRequest { conference_id } => {
+                ServerMessage::DeleteConferenceRequest {
+                    conference_id: *conference_id,
+                }
+                .encode_unchecked(protocol)
+            }
+            Self::ModifyConferenceRequest(value) => {
+                ServerMessage::ModifyConferenceRequest(value.clone()).encode_unchecked(protocol)
+            }
+            Self::AddParticipantRequest(value) => {
+                ServerMessage::AddParticipantRequest(value.clone()).encode_unchecked(protocol)
+            }
+            Self::DropParticipantRequest {
+                conference_id,
+                call_reference,
+            } => ServerMessage::DropParticipantRequest {
+                conference_id: *conference_id,
+                call_reference: *call_reference,
+            }
+            .encode_unchecked(protocol),
+            Self::AuditConferenceRequest => {
+                ServerMessage::AuditConferenceRequest.encode_unchecked(protocol)
+            }
+            Self::AuditParticipantRequest { conference_id } => {
+                ServerMessage::AuditParticipantRequest {
+                    conference_id: *conference_id,
+                }
+                .encode_unchecked(protocol)
+            }
+            Self::ChangeParticipantRequest(value) => {
+                ServerMessage::ChangeParticipantRequest(value.clone()).encode_unchecked(protocol)
+            }
+            Self::StartAnnouncement {
+                announcements,
+                end_of_ack,
+                conference_id,
+                matrix_conference_party_ids,
+                hearing_conference_party_mask,
+                play_mode,
+            } => ServerMessage::StartAnnouncement {
+                announcements: announcements.clone(),
+                end_of_ack: end_of_ack.wire_value(),
+                conference_id: *conference_id,
+                matrix_conference_party_ids: matrix_conference_party_ids.clone(),
+                hearing_conference_party_mask: *hearing_conference_party_mask,
+                play_mode: play_mode.wire_value(),
+            }
+            .encode_unchecked(protocol),
+            Self::StopAnnouncement { conference_id } => ServerMessage::StopAnnouncement {
+                conference_id: *conference_id,
+            }
+            .encode_unchecked(protocol),
+            Self::AnnouncementFinish {
+                conference_id,
+                play_status,
+            } => ServerMessage::AnnouncementFinish {
+                conference_id: *conference_id,
+                play_status: play_status.wire_value(),
+            }
+            .encode_unchecked(protocol),
+            _ => unreachable!("directly encoded control message"),
+        }
+    }
+}
+
+const fn call_state_precedence(state: CallState) -> u32 {
+    match state {
+        CallState::OffHook | CallState::Proceed | CallState::Connected | CallState::Transfer => 3,
+        CallState::RingOut => 4,
+        _ => 2,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OpenReceiveParameters {
+    packet_ms: u32,
+    codec: Codec,
+    echo_cancellation: EchoCancellation,
+    telephone_event_payload: u8,
+    source_address: IpAddr,
+    source_port: u16,
+}
+
+fn encode_open_receive(
+    call: u32,
+    party: u32,
+    parameters: OpenReceiveParameters,
+    encryption: Option<&MediaEncryption>,
+    wire: Option<&OpenReceiveChannelWire>,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    let OpenReceiveParameters {
+        packet_ms,
+        codec,
+        echo_cancellation,
+        telephone_event_payload,
+        source_address,
+        source_port,
+    } = parameters;
+    let conference_id = wire.map_or(call, |value| value.conference_id);
+    let g723_bitrate = wire.map_or(0, |value| value.g723_bitrate);
+    let stream_passthrough_id = wire.map_or(0, |value| value.stream_passthrough_id);
+    let associated_stream_id = wire.map_or(0, |value| value.associated_stream_id);
+    let dtmf_type = wire.map_or(10, |value| value.dtmf_type);
+    let mixing_mode = wire.map_or(0, |value| value.mixing_mode);
+    let direction = wire.map_or(1, |value| value.direction);
+    let requested_address_type = wire.map_or_else(
+        || u32::from(matches!(source_address, IpAddr::V6(_))),
+        |value| value.requested_address_type,
+    );
+    let encryption = WireEncryptionInfo::from_public(encryption);
+    let base_v17 = WireOpenReceiveV17 {
+        conference_id,
+        passthrough_party_id: party,
+        packet_millis: packet_ms,
+        codec: codec.skinny(),
+        vad: echo_cancellation.wire_value(),
+        g723_bitrate,
+        call_reference: call,
+        encryption,
+        stream_passthrough_id,
+        associated_stream_id,
+        rfc2833_payload: u32::from(telephone_event_payload),
+        dtmf_type,
+        mixing_mode,
+        direction,
+        remote: WireExtendedAddress::from_ip(source_address),
+        remote_port: u32::from(source_port),
+        requested_address_type,
+    };
+    match protocol.wire() {
+        21.. => encode(
+            id::OPEN_RECEIVE_CHANNEL,
+            &WireOpenReceiveV21 {
+                base: WireOpenReceiveV18 {
+                    base: base_v17,
+                    audio_level_adjustment: wire.map_or(0, |value| value.audio_level_adjustment),
+                },
+                latent_capabilities: WireLatentCapabilities {
+                    bytes: wire.map_or([0; 36], |value| value.latent_capabilities),
+                },
+            },
+        ),
+        18..=20 => encode(
+            id::OPEN_RECEIVE_CHANNEL,
+            &WireOpenReceiveV18 {
+                base: base_v17,
+                audio_level_adjustment: wire.map_or(0, |value| value.audio_level_adjustment),
+            },
+        ),
+        17 => encode(id::OPEN_RECEIVE_CHANNEL, &base_v17),
+        version => {
+            let IpAddr::V4(source_address) = source_address else {
+                return Err(CodecError::InvalidValue {
+                    message_id: id::OPEN_RECEIVE_CHANNEL,
+                    field: "IP address family for pre-v17 protocol",
+                    value: 1,
+                });
+            };
+            let base = WireOpenReceiveV11 {
+                conference_id,
+                passthrough_party_id: party,
+                packet_millis: packet_ms,
+                codec: codec.skinny(),
+                vad: echo_cancellation.wire_value(),
+                g723_bitrate,
+                call_reference: call,
+                encryption,
+                stream_passthrough_id,
+                associated_stream_id,
+                rfc2833_payload: u32::from(telephone_event_payload),
+                dtmf_type,
+            };
+            if version >= 12 {
+                encode(
+                    id::OPEN_RECEIVE_CHANNEL,
+                    &WireOpenReceiveV12 {
+                        conference_id: base.conference_id,
+                        passthrough_party_id: base.passthrough_party_id,
+                        packet_millis: base.packet_millis,
+                        codec: base.codec,
+                        vad: base.vad,
+                        g723_bitrate: base.g723_bitrate,
+                        call_reference: base.call_reference,
+                        encryption: base.encryption,
+                        stream_passthrough_id: base.stream_passthrough_id,
+                        associated_stream_id: base.associated_stream_id,
+                        rfc2833_payload: base.rfc2833_payload,
+                        dtmf_type: base.dtmf_type,
+                        mixing_mode,
+                        direction,
+                        remote_ipv4: source_address.octets(),
+                        remote_port: u32::from(source_port),
+                    },
+                )
+            } else {
+                encode(id::OPEN_RECEIVE_CHANNEL, &base)
+            }
+        }
+    }
+}
+
+struct StartMediaParameters {
+    endpoint: MediaEndpoint,
+    silence_suppression: SilenceSuppression,
+    traffic_class: MediaTrafficClass,
+}
+
+fn encode_start_media(
+    call: u32,
+    party: u32,
+    parameters: StartMediaParameters,
+    encryption: Option<&MediaEncryption>,
+    wire: Option<&StartMediaTransmissionWire>,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    let StartMediaParameters {
+        endpoint,
+        silence_suppression,
+        traffic_class,
+    } = parameters;
+    let conference_id = wire.map_or(call, |value| value.conference_id);
+    let precedence = u32::from(traffic_class);
+    let g723_bitrate = wire.map_or(0, |value| value.g723_bitrate);
+    let stream_passthrough_id = wire.map_or(0, |value| value.stream_passthrough_id);
+    let associated_stream_id = wire.map_or(0, |value| value.associated_stream_id);
+    let dtmf_type = wire.map_or(10, |value| value.dtmf_type);
+    let mixing_mode = wire.map_or(0, |value| value.mixing_mode);
+    let direction = wire.map_or(1, |value| value.direction);
+    let encryption = WireEncryptionInfo::from_public(encryption);
+    if protocol.wire() >= 17 {
+        let base = WireStartMediaV17 {
+            conference_id,
+            passthrough_party_id: party,
+            remote: WireExtendedAddress::from_ip(endpoint.address),
+            remote_port: u32::from(endpoint.rtp_port),
+            packet_millis: endpoint.packet_ms,
+            codec: endpoint.codec.skinny(),
+            precedence,
+            silence_suppression: silence_suppression.wire_value(),
+            max_frames_per_packet: endpoint.max_frames_per_packet,
+            g723_bitrate,
+            call_reference: call,
+            encryption,
+            stream_passthrough_id,
+            associated_stream_id,
+            rfc2833_payload: u32::from(endpoint.telephone_event_payload),
+            dtmf_type,
+            mixing_mode,
+            direction,
+        };
+        if protocol.wire() >= 21 {
+            encode(
+                id::START_MEDIA_TRANSMISSION,
+                &WireStartMediaV21 {
+                    base,
+                    latent_capabilities: WireLatentCapabilities {
+                        bytes: wire.map_or([0; 36], |value| value.latent_capabilities),
+                    },
+                },
+            )
+        } else {
+            encode(id::START_MEDIA_TRANSMISSION, &base)
+        }
+    } else {
+        let IpAddr::V4(address) = endpoint.address else {
+            return Err(CodecError::InvalidValue {
+                message_id: id::START_MEDIA_TRANSMISSION,
+                field: "IP address family for pre-v17 protocol",
+                value: 1,
+            });
+        };
+        let base = WireStartMediaV11 {
+            conference_id,
+            passthrough_party_id: party,
+            remote_ipv4: address.octets(),
+            remote_port: u32::from(endpoint.rtp_port),
+            packet_millis: endpoint.packet_ms,
+            codec: endpoint.codec.skinny(),
+            precedence,
+            silence_suppression: silence_suppression.wire_value(),
+            max_frames_per_packet: endpoint.max_frames_per_packet,
+            g723_bitrate,
+            call_reference: call,
+            encryption,
+            stream_passthrough_id,
+            associated_stream_id,
+            rfc2833_payload: u32::from(endpoint.telephone_event_payload),
+            dtmf_type,
+        };
+        if protocol.wire() >= 12 {
+            encode(
+                id::START_MEDIA_TRANSMISSION,
+                &WireStartMediaV12 {
+                    conference_id: base.conference_id,
+                    passthrough_party_id: base.passthrough_party_id,
+                    remote_ipv4: base.remote_ipv4,
+                    remote_port: base.remote_port,
+                    packet_millis: base.packet_millis,
+                    codec: base.codec,
+                    precedence: base.precedence,
+                    silence_suppression: base.silence_suppression,
+                    max_frames_per_packet: base.max_frames_per_packet,
+                    g723_bitrate: base.g723_bitrate,
+                    call_reference: base.call_reference,
+                    encryption: base.encryption,
+                    stream_passthrough_id: base.stream_passthrough_id,
+                    associated_stream_id: base.associated_stream_id,
+                    rfc2833_payload: base.rfc2833_payload,
+                    dtmf_type: base.dtmf_type,
+                    mixing_mode,
+                    direction,
+                },
+            )
+        } else {
+            encode(id::START_MEDIA_TRANSMISSION, &base)
+        }
+    }
+}
+
+fn encode_start_multicast_reception(
+    message: &MulticastMediaReception,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    if protocol.wire() >= 17 {
+        encode(
+            id::START_MULTICAST_MEDIA_RECEPTION,
+            &WireStartMulticastReceptionV17 {
+                conference_id: message.conference_id.get(),
+                passthrough_party_id: message.passthrough_party_id.get(),
+                address: WireExtendedAddress::from_ip(message.address),
+                port: u32::from(message.port),
+                packet_millis: message.packet_millis,
+                codec: message.codec.wire_value(),
+                echo_cancellation: message.echo_cancellation.wire_value(),
+                g723_bitrate: message.g723_bitrate.wire_value(),
+                call_reference: message.call_reference.get(),
+            },
+        )
+    } else {
+        let IpAddr::V4(address) = message.address else {
+            return Err(CodecError::InvalidValue {
+                message_id: id::START_MULTICAST_MEDIA_RECEPTION,
+                field: "IP address family for pre-v17 protocol",
+                value: 1,
+            });
+        };
+        encode(
+            id::START_MULTICAST_MEDIA_RECEPTION,
+            &WireStartMulticastReceptionV3 {
+                conference_id: message.conference_id.get(),
+                passthrough_party_id: message.passthrough_party_id.get(),
+                address: address.octets(),
+                port: u32::from(message.port),
+                packet_millis: message.packet_millis,
+                codec: message.codec.wire_value(),
+                echo_cancellation: message.echo_cancellation.wire_value(),
+                g723_bitrate: message.g723_bitrate.wire_value(),
+                call_reference: message.call_reference.get(),
+            },
+        )
+    }
+}
+
+fn decode_start_multicast_reception(
+    payload: &[u8],
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<ServerMessage, CodecError> {
+    let (conference_id, party_id, address, port, packet_millis, codec, echo, g723, call_reference) =
+        if protocol.wire() >= 17 {
+            validate_exact_payload(payload, message_id, 52)?;
+            let value: WireStartMulticastReceptionV17 = decode(message_id, payload)?;
+            (
+                value.conference_id,
+                value.passthrough_party_id,
+                value.address.to_ip(message_id)?,
+                value.port,
+                value.packet_millis,
+                value.codec,
+                value.echo_cancellation,
+                value.g723_bitrate,
+                value.call_reference,
+            )
+        } else {
+            validate_exact_payload(payload, message_id, 36)?;
+            let value: WireStartMulticastReceptionV3 = decode(message_id, payload)?;
+            (
+                value.conference_id,
+                value.passthrough_party_id,
+                IpAddr::V4(Ipv4Addr::from(value.address)),
+                value.port,
+                value.packet_millis,
+                value.codec,
+                value.echo_cancellation,
+                value.g723_bitrate,
+                value.call_reference,
+            )
+        };
+    Ok(ServerMessage::StartMulticastMediaReception(
+        MulticastMediaReception {
+            conference_id: conference_id.into(),
+            passthrough_party_id: party_id.into(),
+            call_reference: call_reference.into(),
+            address,
+            port: decode_port(port, message_id, "multicast port")?,
+            packet_millis,
+            codec: Codec::from(codec),
+            echo_cancellation: EchoCancellation::from(echo),
+            g723_bitrate: G723BitRate::from(g723),
+        },
+    ))
+}
+
+fn encode_start_multicast_transmission(
+    message: &MulticastMediaTransmission,
+    protocol: ProtocolVersion,
+) -> Result<Vec<u8>, CodecError> {
+    if protocol.wire() >= 17 {
+        encode(
+            id::START_MULTICAST_MEDIA_TRANSMISSION,
+            &WireStartMulticastTransmissionV17 {
+                conference_id: message.conference_id.get(),
+                passthrough_party_id: message.passthrough_party_id.get(),
+                address: WireExtendedAddress::from_ip(message.address),
+                port: u32::from(message.port),
+                packet_millis: message.packet_millis,
+                codec: message.codec.wire_value(),
+                precedence: message.precedence,
+                silence_suppression: message.silence_suppression,
+                max_frames_per_packet: message.max_frames_per_packet,
+                g723_bitrate: message.g723_bitrate.wire_value(),
+                call_reference: message.call_reference.get(),
+            },
+        )
+    } else {
+        let IpAddr::V4(address) = message.address else {
+            return Err(CodecError::InvalidValue {
+                message_id: id::START_MULTICAST_MEDIA_TRANSMISSION,
+                field: "IP address family for pre-v17 protocol",
+                value: 1,
+            });
+        };
+        encode(
+            id::START_MULTICAST_MEDIA_TRANSMISSION,
+            &WireStartMulticastTransmissionV3 {
+                conference_id: message.conference_id.get(),
+                passthrough_party_id: message.passthrough_party_id.get(),
+                address: address.octets(),
+                port: u32::from(message.port),
+                packet_millis: message.packet_millis,
+                codec: message.codec.wire_value(),
+                precedence: message.precedence,
+                silence_suppression: message.silence_suppression,
+                max_frames_per_packet: message.max_frames_per_packet,
+                g723_bitrate: message.g723_bitrate.wire_value(),
+                call_reference: message.call_reference.get(),
+            },
+        )
+    }
+}
+
+fn decode_start_multicast_transmission(
+    payload: &[u8],
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<ServerMessage, CodecError> {
+    let (
+        conference_id,
+        party_id,
+        address,
+        port,
+        packet_millis,
+        codec,
+        precedence,
+        silence,
+        max_frames,
+        g723,
+        call_reference,
+    ) = if protocol.wire() >= 17 {
+        validate_exact_payload(payload, message_id, 60)?;
+        let value: WireStartMulticastTransmissionV17 = decode(message_id, payload)?;
+        (
+            value.conference_id,
+            value.passthrough_party_id,
+            value.address.to_ip(message_id)?,
+            value.port,
+            value.packet_millis,
+            value.codec,
+            value.precedence,
+            value.silence_suppression,
+            value.max_frames_per_packet,
+            value.g723_bitrate,
+            value.call_reference,
+        )
+    } else {
+        validate_exact_payload(payload, message_id, 44)?;
+        let value: WireStartMulticastTransmissionV3 = decode(message_id, payload)?;
+        (
+            value.conference_id,
+            value.passthrough_party_id,
+            IpAddr::V4(Ipv4Addr::from(value.address)),
+            value.port,
+            value.packet_millis,
+            value.codec,
+            value.precedence,
+            value.silence_suppression,
+            value.max_frames_per_packet,
+            value.g723_bitrate,
+            value.call_reference,
+        )
+    };
+    Ok(ServerMessage::StartMulticastMediaTransmission(
+        MulticastMediaTransmission {
+            conference_id: conference_id.into(),
+            passthrough_party_id: party_id.into(),
+            call_reference: call_reference.into(),
+            address,
+            port: decode_port(port, message_id, "multicast port")?,
+            packet_millis,
+            codec: Codec::from(codec),
+            precedence,
+            silence_suppression: silence,
+            max_frames_per_packet: max_frames,
+            g723_bitrate: G723BitRate::from(g723),
+        },
+    ))
+}
+
+fn decode_open_receive(
+    payload: &[u8],
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<ServerMessage, CodecError> {
+    let (
+        call_reference,
+        passthrough_party_id,
+        packet_ms,
+        codec,
+        echo,
+        rfc2833,
+        source_address,
+        source_port,
+        encryption,
+        wire,
+    ) = match protocol.wire() {
+        21.. => {
+            let value: WireOpenReceiveV21 = decode(message_id, payload)?;
+            (
+                value.base.base.call_reference,
+                value.base.base.passthrough_party_id,
+                value.base.base.packet_millis,
+                value.base.base.codec,
+                value.base.base.vad,
+                value.base.base.rfc2833_payload,
+                value.base.base.remote.to_ip(message_id)?,
+                decode_port(value.base.base.remote_port, message_id, "source RTP port")?,
+                value.base.base.encryption,
+                OpenReceiveChannelWire {
+                    conference_id: value.base.base.conference_id,
+                    g723_bitrate: value.base.base.g723_bitrate,
+                    stream_passthrough_id: value.base.base.stream_passthrough_id,
+                    associated_stream_id: value.base.base.associated_stream_id,
+                    dtmf_type: value.base.base.dtmf_type,
+                    mixing_mode: value.base.base.mixing_mode,
+                    direction: value.base.base.direction,
+                    requested_address_type: value.base.base.requested_address_type,
+                    audio_level_adjustment: value.base.audio_level_adjustment,
+                    latent_capabilities: value.latent_capabilities.bytes,
+                },
+            )
+        }
+        18..=20 => {
+            let value: WireOpenReceiveV18 = decode(message_id, payload)?;
+            (
+                value.base.call_reference,
+                value.base.passthrough_party_id,
+                value.base.packet_millis,
+                value.base.codec,
+                value.base.vad,
+                value.base.rfc2833_payload,
+                value.base.remote.to_ip(message_id)?,
+                decode_port(value.base.remote_port, message_id, "source RTP port")?,
+                value.base.encryption,
+                OpenReceiveChannelWire {
+                    conference_id: value.base.conference_id,
+                    g723_bitrate: value.base.g723_bitrate,
+                    stream_passthrough_id: value.base.stream_passthrough_id,
+                    associated_stream_id: value.base.associated_stream_id,
+                    dtmf_type: value.base.dtmf_type,
+                    mixing_mode: value.base.mixing_mode,
+                    direction: value.base.direction,
+                    requested_address_type: value.base.requested_address_type,
+                    audio_level_adjustment: value.audio_level_adjustment,
+                    latent_capabilities: [0; 36],
+                },
+            )
+        }
+        17 => {
+            let value: WireOpenReceiveV17 = decode(message_id, payload)?;
+            (
+                value.call_reference,
+                value.passthrough_party_id,
+                value.packet_millis,
+                value.codec,
+                value.vad,
+                value.rfc2833_payload,
+                value.remote.to_ip(message_id)?,
+                decode_port(value.remote_port, message_id, "source RTP port")?,
+                value.encryption,
+                OpenReceiveChannelWire {
+                    conference_id: value.conference_id,
+                    g723_bitrate: value.g723_bitrate,
+                    stream_passthrough_id: value.stream_passthrough_id,
+                    associated_stream_id: value.associated_stream_id,
+                    dtmf_type: value.dtmf_type,
+                    mixing_mode: value.mixing_mode,
+                    direction: value.direction,
+                    requested_address_type: value.requested_address_type,
+                    audio_level_adjustment: 0,
+                    latent_capabilities: [0; 36],
+                },
+            )
+        }
+        12..=16 => {
+            let value: WireOpenReceiveV12 = decode(message_id, payload)?;
+            (
+                value.call_reference,
+                value.passthrough_party_id,
+                value.packet_millis,
+                value.codec,
+                value.vad,
+                value.rfc2833_payload,
+                IpAddr::V4(Ipv4Addr::from(value.remote_ipv4)),
+                decode_port(value.remote_port, message_id, "source RTP port")?,
+                value.encryption,
+                OpenReceiveChannelWire {
+                    conference_id: value.conference_id,
+                    g723_bitrate: value.g723_bitrate,
+                    stream_passthrough_id: value.stream_passthrough_id,
+                    associated_stream_id: value.associated_stream_id,
+                    dtmf_type: value.dtmf_type,
+                    mixing_mode: value.mixing_mode,
+                    direction: value.direction,
+                    requested_address_type: 0,
+                    audio_level_adjustment: 0,
+                    latent_capabilities: [0; 36],
+                },
+            )
+        }
+        _ => {
+            let value: WireOpenReceiveV11 = decode(message_id, payload)?;
+            (
+                value.call_reference,
+                value.passthrough_party_id,
+                value.packet_millis,
+                value.codec,
+                value.vad,
+                value.rfc2833_payload,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                0,
+                value.encryption,
+                OpenReceiveChannelWire {
+                    conference_id: value.conference_id,
+                    g723_bitrate: value.g723_bitrate,
+                    stream_passthrough_id: value.stream_passthrough_id,
+                    associated_stream_id: value.associated_stream_id,
+                    dtmf_type: value.dtmf_type,
+                    mixing_mode: 0,
+                    direction: 0,
+                    requested_address_type: 0,
+                    audio_level_adjustment: 0,
+                    latent_capabilities: [0; 36],
+                },
+            )
+        }
+    };
+    let telephone_event_payload = u8::try_from(rfc2833).map_err(|_| CodecError::InvalidValue {
+        message_id,
+        field: "RFC2833 payload",
+        value: u64::from(rfc2833),
+    })?;
+    Ok(ServerMessage::OpenReceiveChannel {
+        call_reference,
+        passthrough_party_id,
+        packet_ms,
+        codec: Codec::from(codec),
+        echo_cancellation: EchoCancellation::from(echo),
+        telephone_event_payload,
+        source_address,
+        source_port,
+        encryption: encryption.to_public(message_id)?,
+        wire: (wire != canonical_open_receive_wire(call_reference, source_address, protocol))
+            .then_some(wire),
+    })
+}
+
+fn decode_start_media(
+    payload: &[u8],
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<ServerMessage, CodecError> {
+    let (
+        call_reference,
+        passthrough_party_id,
+        address,
+        port,
+        packet_ms,
+        codec,
+        precedence,
+        silence_suppression,
+        max_frames_per_packet,
+        rfc2833,
+        encryption,
+        wire,
+    ) = match protocol.wire() {
+        21.. => {
+            let value: WireStartMediaV21 = decode(message_id, payload)?;
+            (
+                value.base.call_reference,
+                value.base.passthrough_party_id,
+                value.base.remote.to_ip(message_id)?,
+                value.base.remote_port,
+                value.base.packet_millis,
+                value.base.codec,
+                value.base.precedence,
+                value.base.silence_suppression,
+                value.base.max_frames_per_packet,
+                value.base.rfc2833_payload,
+                value.base.encryption,
+                StartMediaTransmissionWire {
+                    conference_id: value.base.conference_id,
+                    g723_bitrate: value.base.g723_bitrate,
+                    stream_passthrough_id: value.base.stream_passthrough_id,
+                    associated_stream_id: value.base.associated_stream_id,
+                    dtmf_type: value.base.dtmf_type,
+                    mixing_mode: value.base.mixing_mode,
+                    direction: value.base.direction,
+                    latent_capabilities: value.latent_capabilities.bytes,
+                },
+            )
+        }
+        17..=20 => {
+            let value: WireStartMediaV17 = decode(message_id, payload)?;
+            (
+                value.call_reference,
+                value.passthrough_party_id,
+                value.remote.to_ip(message_id)?,
+                value.remote_port,
+                value.packet_millis,
+                value.codec,
+                value.precedence,
+                value.silence_suppression,
+                value.max_frames_per_packet,
+                value.rfc2833_payload,
+                value.encryption,
+                StartMediaTransmissionWire {
+                    conference_id: value.conference_id,
+                    g723_bitrate: value.g723_bitrate,
+                    stream_passthrough_id: value.stream_passthrough_id,
+                    associated_stream_id: value.associated_stream_id,
+                    dtmf_type: value.dtmf_type,
+                    mixing_mode: value.mixing_mode,
+                    direction: value.direction,
+                    latent_capabilities: [0; 36],
+                },
+            )
+        }
+        12..=16 => {
+            let value: WireStartMediaV12 = decode(message_id, payload)?;
+            (
+                value.call_reference,
+                value.passthrough_party_id,
+                IpAddr::V4(Ipv4Addr::from(value.remote_ipv4)),
+                value.remote_port,
+                value.packet_millis,
+                value.codec,
+                value.precedence,
+                value.silence_suppression,
+                value.max_frames_per_packet,
+                value.rfc2833_payload,
+                value.encryption,
+                StartMediaTransmissionWire {
+                    conference_id: value.conference_id,
+                    g723_bitrate: value.g723_bitrate,
+                    stream_passthrough_id: value.stream_passthrough_id,
+                    associated_stream_id: value.associated_stream_id,
+                    dtmf_type: value.dtmf_type,
+                    mixing_mode: value.mixing_mode,
+                    direction: value.direction,
+                    latent_capabilities: [0; 36],
+                },
+            )
+        }
+        _ => {
+            let value: WireStartMediaV11 = decode(message_id, payload)?;
+            (
+                value.call_reference,
+                value.passthrough_party_id,
+                IpAddr::V4(Ipv4Addr::from(value.remote_ipv4)),
+                value.remote_port,
+                value.packet_millis,
+                value.codec,
+                value.precedence,
+                value.silence_suppression,
+                value.max_frames_per_packet,
+                value.rfc2833_payload,
+                value.encryption,
+                StartMediaTransmissionWire {
+                    conference_id: value.conference_id,
+                    g723_bitrate: value.g723_bitrate,
+                    stream_passthrough_id: value.stream_passthrough_id,
+                    associated_stream_id: value.associated_stream_id,
+                    dtmf_type: value.dtmf_type,
+                    mixing_mode: 0,
+                    direction: 0,
+                    latent_capabilities: [0; 36],
+                },
+            )
+        }
+    };
+    let rtp_port = decode_port(port, message_id, "RTP port")?;
+    let telephone_event_payload = u8::try_from(rfc2833).map_err(|_| CodecError::InvalidValue {
+        message_id,
+        field: "RFC2833 payload",
+        value: u64::from(rfc2833),
+    })?;
+    Ok(ServerMessage::StartMediaTransmission {
+        call_reference,
+        passthrough_party_id,
+        endpoint: MediaEndpoint {
+            address,
+            rtp_port,
+            rtcp_port: rtp_port.saturating_add(1),
+            codec: Codec::from(codec),
+            packet_ms,
+            max_frames_per_packet,
+            telephone_event_payload,
+        },
+        silence_suppression: SilenceSuppression::from(silence_suppression),
+        traffic_class: MediaTrafficClass::from_wire(u8::try_from(precedence).map_err(|_| {
+            CodecError::InvalidValue {
+                message_id,
+                field: "media traffic class",
+                value: u64::from(precedence),
+            }
+        })?),
+        encryption: encryption.to_public(message_id)?,
+        wire: (wire != canonical_start_media_wire(call_reference, protocol)).then_some(wire),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::catalog::MessageDirection;
+    use super::values::SoftKey;
+    use super::wire::{FrameDecoder, MAX_FRAME_SIZE};
+    use super::*;
+
+    fn fixture(source: &str) -> Vec<u8> {
+        source
+            .split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).expect("valid fixture byte"))
+            .collect()
+    }
+
+    fn deterministic_payload(message_id: u32, protocol: u32, length: usize) -> Vec<u8> {
+        let mut state = u64::from(message_id)
+            ^ (u64::from(protocol) << 32)
+            ^ (length as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn fuzz_lengths() -> impl Iterator<Item = usize> {
+        (0..=96).chain([127, 255, 511, 1024, MAX_FRAME_SIZE - 12])
+    }
+
+    const fn test_rtp_payload_number(value: u32) -> RtpPayloadNumber {
+        match RtpPayloadNumber::new(value) {
+            Ok(value) => value,
+            Err(_) => panic!("test RTP payload number is out of range"),
+        }
+    }
+
+    fn typed_video_payload(arm: MultimediaVideoCapabilityArm) -> MultimediaPayload {
+        let payload_number = match arm.codec() {
+            Codec::H261 => 31,
+            Codec::H263 => 34,
+            Codec::H263Plus => 96,
+            Codec::H264 => 97,
+            _ => unreachable!("typed video arms always have a modeled codec"),
+        };
+        MultimediaPayload::new(
+            test_rtp_payload_number(payload_number),
+            MultimediaVideoCapability::new(
+                1_024,
+                [
+                    MultimediaPictureFormat {
+                        format: VideoFormat::Cif4,
+                        minimum_picture_interval: 1,
+                    },
+                    MultimediaPictureFormat {
+                        format: VideoFormat::Cif,
+                        minimum_picture_interval: 2,
+                    },
+                ],
+                7,
+                arm,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn every_catalogued_client_decoder_is_panic_free_for_bounded_property_corpus() {
+        let protocols = [
+            ProtocolVersion::V3,
+            ProtocolVersion::V8,
+            ProtocolVersion::V17,
+            ProtocolVersion::V22,
+        ];
+        let mut cases = 0_usize;
+        for message_id in MessageId::ALL_KNOWN
+            .iter()
+            .copied()
+            .filter(|id| id.direction() == Some(MessageDirection::DeviceToServer))
+        {
+            for protocol in protocols {
+                for length in fuzz_lengths() {
+                    let frame = Frame::new(
+                        protocol.wire(),
+                        message_id.wire_value(),
+                        deterministic_payload(message_id.wire_value(), protocol.wire(), length),
+                    );
+                    let _ = ClientMessage::decode_with_version(frame, protocol);
+                    cases += 1;
+                }
+            }
+        }
+        assert!(
+            cases > 20_000,
+            "property corpus unexpectedly shrank: {cases}"
+        );
+    }
+
+    #[test]
+    fn every_catalogued_server_encoder_round_trips_all_decodable_bounded_inputs() {
+        let protocols = [
+            ProtocolVersion::V3,
+            ProtocolVersion::V8,
+            ProtocolVersion::V17,
+            ProtocolVersion::V22,
+        ];
+        let mut decoded = 0_usize;
+        let mut encoded = 0_usize;
+        for message_id in MessageId::ALL_KNOWN
+            .iter()
+            .copied()
+            .filter(|id| id.direction() == Some(MessageDirection::ServerToDevice))
+        {
+            for protocol in protocols {
+                for length in fuzz_lengths() {
+                    let frame = Frame::new(
+                        protocol.wire(),
+                        message_id.wire_value(),
+                        deterministic_payload(message_id.wire_value(), protocol.wire(), length),
+                    );
+                    let Ok(message) = ServerMessage::decode(frame, protocol) else {
+                        continue;
+                    };
+                    decoded += 1;
+                    let Ok(bytes) = message.encode(protocol) else {
+                        continue;
+                    };
+                    assert!(bytes.len() <= MAX_FRAME_SIZE);
+                    let frames = FrameDecoder::new().push(&bytes).unwrap();
+                    assert_eq!(frames.len(), 1);
+                    assert_eq!(
+                        ServerMessage::decode(frames.into_iter().next().unwrap(), protocol)
+                            .unwrap(),
+                        message
+                    );
+                    encoded += 1;
+                }
+            }
+        }
+        assert!(
+            decoded > 1_000,
+            "decodable encoder corpus unexpectedly shrank: {decoded}"
+        );
+        assert!(
+            encoded > 1_000,
+            "encodable property corpus unexpectedly shrank: {encoded}"
+        );
+    }
+
+    #[test]
+    fn registration_preserves_both_reported_address_families() {
+        let message = ClientMessage::Register(RegistrationMessage {
+            device_id: DeviceId::new("SEP001122334455").unwrap(),
+            reported_address: Some(Ipv4Addr::new(192, 0, 2, 10)),
+            reported_ipv6_address: Some("2001:db8::10".parse().unwrap()),
+            device_type: DeviceType::Cisco7962,
+            advertised_protocol: ProtocolVersion::V22.wire(),
+            features: PhoneFeatures::empty(),
+            firmware: "test-load".into(),
+            configuration_version_stamp: BoundedBytes::default(),
+            wire: Some(RegistrationWireDetails {
+                station_user_id: 17,
+                station_instance: 2,
+                max_streams: 5,
+                active_streams: 1,
+                mac_address_and_padding: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 0, 0, 0, 0, 0],
+                max_conferences: 3,
+                active_conferences: 1,
+                ipv4_address_scope: 3,
+                max_lines: 6,
+                ipv6_address_scope: 2,
+            }),
+        });
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(
+            ClientMessage::decode_with_version(frame, ProtocolVersion::V22).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn registration_preserves_every_bounded_configuration_suffix() {
+        let base = ClientMessage::Register(RegistrationMessage {
+            device_id: DeviceId::new("SEP001122334455").unwrap(),
+            reported_address: None,
+            reported_ipv6_address: None,
+            device_type: DeviceType::Cisco7962,
+            advertised_protocol: ProtocolVersion::V22.wire(),
+            features: PhoneFeatures::empty(),
+            firmware: "test-load".into(),
+            configuration_version_stamp: BoundedBytes::default(),
+            wire: Some(RegistrationWireDetails {
+                station_user_id: 0,
+                station_instance: 1,
+                max_streams: 0,
+                active_streams: 0,
+                mac_address_and_padding: [0; 12],
+                max_conferences: 0,
+                active_conferences: 0,
+                ipv4_address_scope: 0,
+                max_lines: 0,
+                ipv6_address_scope: 0,
+            }),
+        });
+
+        for length in 0..=48 {
+            let mut message = base.clone();
+            let ClientMessage::Register(registration) = &mut message else {
+                unreachable!("test message is registration")
+            };
+            registration.configuration_version_stamp =
+                BoundedBytes::try_from(vec![0xa5; length]).unwrap();
+            let bytes = message.encode(ProtocolVersion::V22).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.payload.len(), 124 + length);
+            assert_eq!(
+                ClientMessage::decode_with_version(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+
+        assert!(matches!(
+            ClientMessage::decode_with_version(
+                Frame::new(0, id::REGISTER, vec![0; 123]),
+                ProtocolVersion::V22,
+            ),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(matches!(
+            ClientMessage::decode_with_version(
+                Frame::new(0, id::REGISTER, vec![0; 173]),
+                ProtocolVersion::V22,
+            ),
+            Err(CodecError::TrailingBytes { .. })
+        ));
+    }
+
+    #[test]
+    fn alarm_preserves_both_supported_wire_lengths() {
+        for parameters in [None, Some([0x1122_3344, 0xaabb_ccdd])] {
+            let message = ClientMessage::Alarm {
+                severity: AlarmSeverity::Warning,
+                text: "TFTP load failed".into(),
+                parameters,
+            };
+            let bytes = message.encode(ProtocolVersion::V17).unwrap();
+            assert_eq!(bytes.len(), if parameters.is_some() { 104 } else { 96 });
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(ClientMessage::decode(frame).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn connection_statistics_reject_oversized_quality_payloads() {
+        let payload = WireConnectionStatisticsV19 {
+            directory_number: WireFixedText::new(
+                id::CONNECTION_STATISTICS_RES,
+                "directory number",
+                "2002",
+            )
+            .unwrap(),
+            alignment: [0; 3],
+            call_reference: 42,
+            processing: StatisticsProcessing::Clear.wire_value(),
+            statistics: WireConnectionStatisticsTail {
+                packets_sent: 1,
+                octets_sent: 2,
+                packets_received: 3,
+                octets_received: 4,
+                packets_lost: 5,
+                jitter_millis: 6,
+                latency_millis: 7,
+                quality_size: (CONNECTION_QUALITY_MAX_BYTES + 1) as u32,
+            },
+            quality: vec![0; CONNECTION_QUALITY_MAX_BYTES + 1],
+        };
+        let mut encoded = encode(id::CONNECTION_STATISTICS_RES, &payload).unwrap();
+        pad_dynamic_payload(&mut encoded);
+        let frame = Frame::new(
+            ProtocolVersion::V22.wire(),
+            id::CONNECTION_STATISTICS_RES,
+            encoded,
+        );
+        assert!(matches!(
+            ClientMessage::decode_with_version(frame, ProtocolVersion::V22),
+            Err(CodecError::CountTooLarge {
+                field: "quality statistics",
+                maximum: CONNECTION_QUALITY_MAX_BYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn media_wire_schemas_round_trip_byte_for_byte() {
+        let start = fixture(include_str!(
+            "../../tests/fixtures/golden/start_media_transmission_v17.hex"
+        ));
+        let start_value: WireStartMediaV17 = decode(0x008a, &start[12..]).unwrap();
+        assert_eq!(encode(0x008a, &start_value).unwrap(), &start[12..]);
+        let start_frame = FrameDecoder::new().push(&start).unwrap().remove(0);
+        let start_message = ServerMessage::decode(start_frame, ProtocolVersion::V17).unwrap();
+        assert_eq!(start_message.encode(ProtocolVersion::V17).unwrap(), start);
+
+        let open = fixture(include_str!(
+            "../../tests/fixtures/golden/open_receive_channel_v17.hex"
+        ));
+        let open_value: WireOpenReceiveV17 = decode(0x0105, &open[12..]).unwrap();
+        assert_eq!(encode(0x0105, &open_value).unwrap(), &open[12..]);
+        let open_frame = FrameDecoder::new().push(&open).unwrap().remove(0);
+        let open_message = ServerMessage::decode(open_frame, ProtocolVersion::V17).unwrap();
+        assert_eq!(open_message.encode(ProtocolVersion::V17).unwrap(), open);
+
+        let ack = fixture(include_str!(
+            "../../tests/fixtures/golden/start_media_transmission_ack_v20.hex"
+        ));
+        let ack_value: WireStartMediaAckV20 = decode(0x0154, &ack[12..]).unwrap();
+        assert_eq!(encode(0x0154, &ack_value).unwrap(), &ack[12..]);
+        let ack_frame = FrameDecoder::new().push(&ack).unwrap().remove(0);
+        let ack_message =
+            ClientMessage::decode_with_version(ack_frame, ProtocolVersion::V20).unwrap();
+        assert_eq!(ack_message.encode(ProtocolVersion::V20).unwrap(), ack);
+    }
+
+    #[test]
+    fn audio_media_version_boundaries_have_exact_payload_sizes() {
+        let endpoint = MediaEndpoint {
+            address: "192.0.2.20".parse().unwrap(),
+            rtp_port: 16_000,
+            rtcp_port: 16_001,
+            codec: Codec::Pcmu,
+            packet_ms: 20,
+            max_frames_per_packet: 2,
+            telephone_event_payload: 101,
+        };
+        for (version, open_size, start_size) in [
+            (11, 92, 108),
+            (12, 108, 116),
+            (16, 108, 116),
+            (17, 128, 132),
+            (18, 132, 132),
+            (20, 132, 132),
+            (21, 168, 168),
+            (22, 168, 168),
+        ] {
+            let protocol = ProtocolVersion::new(version).unwrap();
+            let open = ServerMessage::OpenReceiveChannel {
+                call_reference: 7,
+                passthrough_party_id: 9,
+                packet_ms: 20,
+                codec: Codec::Pcmu,
+                echo_cancellation: EchoCancellation::On,
+                telephone_event_payload: 101,
+                source_address: endpoint.address,
+                source_port: endpoint.rtp_port,
+                encryption: None,
+                wire: None,
+            };
+            let open_bytes = open.encode(protocol).unwrap();
+            assert_eq!(open_bytes.len() - 12, open_size, "protocol {version}");
+            let decoded = ServerMessage::decode(
+                FrameDecoder::new().push(&open_bytes).unwrap().remove(0),
+                protocol,
+            )
+            .unwrap();
+            assert_eq!(decoded.encode(protocol).unwrap(), open_bytes);
+
+            let start = ServerMessage::StartMediaTransmission {
+                call_reference: 7,
+                passthrough_party_id: 9,
+                endpoint,
+                silence_suppression: SilenceSuppression::Off,
+                traffic_class: MediaTrafficClass::default(),
+                encryption: None,
+                wire: None,
+            };
+            let start_bytes = start.encode(protocol).unwrap();
+            assert_eq!(start_bytes.len() - 12, start_size, "protocol {version}");
+            let decoded = ServerMessage::decode(
+                FrameDecoder::new().push(&start_bytes).unwrap().remove(0),
+                protocol,
+            )
+            .unwrap();
+            assert_eq!(decoded.encode(protocol).unwrap(), start_bytes);
+        }
+    }
+
+    #[test]
+    fn audio_acknowledgements_keep_conference_and_call_references_distinct() {
+        for (protocol, address, open_size, start_size, failure_size) in [
+            (
+                ProtocolVersion::V16,
+                "192.0.2.21".parse().unwrap(),
+                20,
+                24,
+                20,
+            ),
+            (
+                ProtocolVersion::V17,
+                "2001:db8::21".parse().unwrap(),
+                36,
+                40,
+                36,
+            ),
+        ] {
+            let open = ClientMessage::OpenReceiveChannelAck {
+                status: MediaStatus::Ok,
+                address,
+                port: 16_000,
+                passthrough_party_id: 9,
+                call_reference: 7,
+            };
+            assert_eq!(open.encode(protocol).unwrap().len() - 12, open_size);
+
+            let start = ClientMessage::StartMediaTransmissionAck(MediaTransmissionAck {
+                conference_id: 6,
+                passthrough_party_id: 9,
+                call_reference: 7,
+                status: MediaStatus::Ok,
+                address,
+                port: 16_000,
+                wire: None,
+            });
+            let start_bytes = start.encode(protocol).unwrap();
+            assert_eq!(start_bytes.len() - 12, start_size);
+            let decoded = ClientMessage::decode_with_version(
+                FrameDecoder::new().push(&start_bytes).unwrap().remove(0),
+                protocol,
+            )
+            .unwrap();
+            assert_eq!(decoded, start);
+
+            let failure = ClientMessage::MediaTransmissionFailure {
+                conference_id: 6,
+                passthrough_party_id: 9,
+                address,
+                port: 16_000,
+                call_reference: 7,
+                status: MediaStatus::UnspecifiedError,
+            };
+            assert_eq!(failure.encode(protocol).unwrap().len() - 12, failure_size);
+        }
+
+        for message_id in [id::CLOSE_RECEIVE_CHANNEL, id::STOP_MEDIA_TRANSMISSION] {
+            let payload = [0_u8; 16];
+            let frame = Frame::new(ProtocolVersion::V22.wire(), message_id, payload.to_vec());
+            let message = ServerMessage::decode(frame, ProtocolVersion::V22).unwrap();
+            assert_eq!(message.encode(ProtocolVersion::V22).unwrap().len() - 12, 16);
+
+            let truncated = Frame::new(
+                ProtocolVersion::V22.wire(),
+                message_id,
+                payload[..12].to_vec(),
+            );
+            assert!(matches!(
+                ServerMessage::decode(truncated, ProtocolVersion::V22),
+                Err(CodecError::Truncated { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn session_and_video_envelopes_preserve_every_wire_byte() {
+        for (protocol, address, expected_size) in [
+            (ProtocolVersion::V16, "192.0.2.30".parse().unwrap(), 8),
+            (ProtocolVersion::V17, "2001:db8::30".parse().unwrap(), 24),
+        ] {
+            for message in [
+                ControlMessage::StartSessionTransmission(SessionTransmission {
+                    remote_address: address,
+                    session_type: 0x1122_3344,
+                }),
+                ControlMessage::StopSessionTransmission(SessionTransmission {
+                    remote_address: address,
+                    session_type: 0x5566_7788,
+                }),
+            ] {
+                let bytes = message.encode(protocol).unwrap();
+                assert_eq!(bytes.len() - 12, expected_size);
+                let decoded = ControlMessage::decode(
+                    FrameDecoder::new().push(&bytes).unwrap().remove(0),
+                    protocol,
+                )
+                .unwrap();
+                assert_eq!(decoded.encode(protocol).unwrap(), bytes);
+            }
+        }
+
+        for (version, address, expected_size) in [
+            (11, "0.0.0.0".parse().unwrap(), 164),
+            (12, "192.0.2.31".parse().unwrap(), 172),
+            (16, "192.0.2.31".parse().unwrap(), 172),
+            (17, "2001:db8::31".parse().unwrap(), 192),
+        ] {
+            let protocol = ProtocolVersion::new(version).unwrap();
+            let message = ServerMessage::OpenMultimediaChannel(OpenMultimediaChannel {
+                conference_id: 42.into(),
+                passthrough_party_id: 9.into(),
+                line_instance: 1,
+                call_reference: 7.into(),
+                payload: typed_video_payload(MultimediaVideoCapabilityArm::H264 {
+                    profile: 100,
+                    level: 42,
+                    custom_max_mbps: 40_500,
+                    custom_max_fs: 1_620,
+                    custom_max_dpb: 8_100,
+                    custom_max_br_and_cpb: 10_000,
+                }),
+                conference_creator: true,
+                encryption: None,
+                stream_passthrough_id: 10,
+                associated_stream_id: 11,
+                source: MediaEndpointAddress {
+                    address,
+                    port: if version < 12 { 0 } else { 16_000 },
+                },
+                requested_address_type: if version >= 17 {
+                    IpAddressType::Ipv6
+                } else {
+                    IpAddressType::Ipv4
+                },
+            });
+            let bytes = message.encode(protocol).unwrap();
+            assert_eq!(bytes.len() - 12, expected_size, "protocol {version}");
+            let decoded = ServerMessage::decode(
+                FrameDecoder::new().push(&bytes).unwrap().remove(0),
+                protocol,
+            )
+            .unwrap();
+            assert_eq!(decoded.encode(protocol).unwrap(), bytes);
+        }
+
+        for (protocol, address, expected_size) in [
+            (ProtocolVersion::V16, "192.0.2.32".parse().unwrap(), 168),
+            (ProtocolVersion::V17, "2001:db8::32".parse().unwrap(), 184),
+        ] {
+            let message = ServerMessage::StartMultimediaTransmission(StartMultimediaTransmission {
+                conference_id: 42.into(),
+                passthrough_party_id: 9.into(),
+                endpoint: MediaEndpointAddress {
+                    address,
+                    port: 16_002,
+                },
+                call_reference: 7.into(),
+                payload: typed_video_payload(MultimediaVideoCapabilityArm::H264 {
+                    profile: 100,
+                    level: 42,
+                    custom_max_mbps: 40_500,
+                    custom_max_fs: 1_620,
+                    custom_max_dpb: 8_100,
+                    custom_max_br_and_cpb: 10_000,
+                }),
+                traffic_class: MediaTrafficClass::from_wire(184),
+                encryption: None,
+                stream_passthrough_id: 10,
+                associated_stream_id: 11,
+            });
+            let bytes = message.encode(protocol).unwrap();
+            assert_eq!(bytes.len() - 12, expected_size);
+            let traffic_class_offset = if protocol >= ProtocolVersion::V17 {
+                60
+            } else {
+                44
+            };
+            assert_eq!(
+                &bytes[traffic_class_offset..traffic_class_offset + 4],
+                &184_u32.to_le_bytes()
+            );
+            let decoded = ServerMessage::decode(
+                FrameDecoder::new().push(&bytes).unwrap().remove(0),
+                protocol,
+            )
+            .unwrap();
+            assert_eq!(decoded.encode(protocol).unwrap(), bytes);
+        }
+
+        let miscellaneous = ServerMessage::MiscellaneousCommand(MiscellaneousCommand {
+            conference_id: 42.into(),
+            passthrough_party_id: 9.into(),
+            call_reference: 7.into(),
+            command: values::MiscCommandType::LostPartialPicture,
+            data: BoundedBytes::try_from((0_u8..36).collect::<Vec<_>>()).unwrap(),
+        });
+        let bytes = miscellaneous.encode(ProtocolVersion::V22).unwrap();
+        assert_eq!(bytes.len() - 12, 52);
+        let decoded = ServerMessage::decode(
+            FrameDecoder::new().push(&bytes).unwrap().remove(0),
+            ProtocolVersion::V22,
+        )
+        .unwrap();
+        assert_eq!(decoded, miscellaneous);
+
+        for (message_id, protocol, expected) in [
+            (id::OPEN_MULTIMEDIA_CHANNEL, ProtocolVersion::V17, 192),
+            (id::START_MULTIMEDIA_TRANSMISSION, ProtocolVersion::V17, 184),
+            (id::MISCELLANEOUS_COMMAND, ProtocolVersion::V22, 52),
+        ] {
+            for actual in [expected - 1, expected + 1] {
+                let frame = Frame::new(protocol.wire(), message_id, vec![0; actual]);
+                assert!(ServerMessage::decode(frame, protocol).is_err());
+            }
+        }
+        for (protocol, expected) in [(ProtocolVersion::V16, 8), (ProtocolVersion::V17, 24)] {
+            for actual in [expected - 1, expected + 1] {
+                let frame = Frame::new(
+                    protocol.wire(),
+                    id::START_SESSION_TRANSMISSION,
+                    vec![0; actual],
+                );
+                assert!(ControlMessage::decode(frame, protocol).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_decoded_multimedia_payloads_are_lossless_and_provenance_bound() {
+        let mut words = [0; MULTIMEDIA_CAPABILITY_BYTES / 4];
+        words[0] = 2_048;
+        words[1] = 1;
+        words[2] = VideoFormat::Cif.wire_value();
+        words[3] = 2;
+        words[12] = 7;
+        words[13..].copy_from_slice(&[61, 62, 63, 64, 65, 66]);
+        let capability = multimedia_capability_bytes(words);
+        let payload = MultimediaPayload::from_wire(
+            0,
+            test_rtp_payload_number(97),
+            capability,
+            Codec::H265,
+            MultimediaPayloadDirection::Receive,
+            ProtocolVersion::V17,
+        );
+        assert_eq!(payload.codec(), Codec::H265);
+        assert_eq!(payload.video_capability(), None);
+        let open = ServerMessage::OpenMultimediaChannel(OpenMultimediaChannel {
+            conference_id: 42.into(),
+            passthrough_party_id: 9.into(),
+            line_instance: 1,
+            call_reference: 7.into(),
+            payload: payload.clone(),
+            conference_creator: false,
+            encryption: None,
+            stream_passthrough_id: 10,
+            associated_stream_id: 0,
+            source: MediaEndpointAddress {
+                address: "192.0.2.31".parse().unwrap(),
+                port: 16_000,
+            },
+            requested_address_type: IpAddressType::Ipv4,
+        });
+        let encoded = open.encode(ProtocolVersion::V17).unwrap();
+        let decoded = ServerMessage::decode(
+            FrameDecoder::new().push(&encoded).unwrap().remove(0),
+            ProtocolVersion::V17,
+        )
+        .unwrap();
+        assert_eq!(decoded.encode(ProtocolVersion::V17).unwrap(), encoded);
+        assert!(matches!(
+            open.encode(ProtocolVersion::V16),
+            Err(CodecError::InvalidValue {
+                message_id: id::OPEN_MULTIMEDIA_CHANNEL,
+                field: "multimedia payload provenance",
+                ..
+            })
+        ));
+
+        let start = ServerMessage::StartMultimediaTransmission(StartMultimediaTransmission {
+            conference_id: 42.into(),
+            passthrough_party_id: 9.into(),
+            endpoint: MediaEndpointAddress {
+                address: "192.0.2.32".parse().unwrap(),
+                port: 16_002,
+            },
+            call_reference: 7.into(),
+            payload,
+            traffic_class: MediaTrafficClass::from_wire(136),
+            encryption: None,
+            stream_passthrough_id: 11,
+            associated_stream_id: 0,
+        });
+        assert!(matches!(
+            start.encode(ProtocolVersion::V17),
+            Err(CodecError::InvalidValue {
+                message_id: id::START_MULTIMEDIA_TRANSMISSION,
+                field: "multimedia payload provenance",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn capabilities_incompatible_with_outer_compression_remain_opaque_and_lossless() {
+        let message = ServerMessage::OpenMultimediaChannel(OpenMultimediaChannel {
+            conference_id: 42.into(),
+            passthrough_party_id: 9.into(),
+            line_instance: 1,
+            call_reference: 7.into(),
+            payload: typed_video_payload(MultimediaVideoCapabilityArm::H264 {
+                profile: 100,
+                level: 42,
+                custom_max_mbps: 40_500,
+                custom_max_fs: 1_620,
+                custom_max_dpb: 8_100,
+                custom_max_br_and_cpb: 10_000,
+            }),
+            conference_creator: false,
+            encryption: None,
+            stream_passthrough_id: 10,
+            associated_stream_id: 0,
+            source: MediaEndpointAddress {
+                address: "192.0.2.31".parse().unwrap(),
+                port: 16_000,
+            },
+            requested_address_type: IpAddressType::Ipv4,
+        });
+        let mut mismatched = message.encode(ProtocolVersion::V17).unwrap();
+        let compression_offset = super::wire::HEADER_SIZE + 8;
+        mismatched[compression_offset..compression_offset + 4]
+            .copy_from_slice(&Codec::H263.wire_value().to_le_bytes());
+
+        let decoded = ServerMessage::decode(
+            FrameDecoder::new().push(&mismatched).unwrap().remove(0),
+            ProtocolVersion::V17,
+        )
+        .unwrap();
+        let ServerMessage::OpenMultimediaChannel(open) = &decoded else {
+            panic!("multimedia message decoded as a different command");
+        };
+        assert_eq!(open.payload.codec(), Codec::H263);
+        assert_eq!(open.payload.compression_codec(), Codec::H263);
+        assert_eq!(open.payload.video_capability(), None);
+        assert_eq!(decoded.encode(ProtocolVersion::V17).unwrap(), mismatched);
+        assert_ne!(decoded, message);
+
+        let mut invalid_payload_number = mismatched;
+        let descriptor_offset = super::wire::HEADER_SIZE + 20;
+        invalid_payload_number[descriptor_offset + 4..descriptor_offset + 8]
+            .copy_from_slice(&128_u32.to_le_bytes());
+        assert!(matches!(
+            ServerMessage::decode(
+                FrameDecoder::new()
+                    .push(&invalid_payload_number)
+                    .unwrap()
+                    .remove(0),
+                ProtocolVersion::V17,
+            ),
+            Err(CodecError::InvalidValue {
+                field: "RTP payload number",
+                value: 128,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn typed_multimedia_video_arms_encode_at_the_evidenced_offsets() {
+        let arms = [
+            (
+                MultimediaVideoCapabilityArm::H261 {
+                    temporal_spatial_trade_off_capability: 11,
+                    still_image_transmission: 12,
+                },
+                [11, 12, 0, 0, 0, 0],
+            ),
+            (
+                MultimediaVideoCapabilityArm::H263 {
+                    capability_bitfield: 21,
+                    annex_n_and_w_future_use: 22,
+                },
+                [21, 22, 0, 0, 0, 0],
+            ),
+            (
+                MultimediaVideoCapabilityArm::H263Plus {
+                    model_number: 31,
+                    bandwidth: 32,
+                },
+                [31, 32, 0, 0, 0, 0],
+            ),
+            (
+                MultimediaVideoCapabilityArm::H264 {
+                    profile: 41,
+                    level: 42,
+                    custom_max_mbps: 43,
+                    custom_max_fs: 44,
+                    custom_max_dpb: 45,
+                    custom_max_br_and_cpb: 46,
+                },
+                [41, 42, 43, 44, 45, 46],
+            ),
+        ];
+
+        for (arm, expected_arm) in arms {
+            let payload = typed_video_payload(arm);
+            let bytes = multimedia_capability_to_wire(&payload);
+            let words = multimedia_capability_words(bytes);
+            assert_eq!(words[0], 1_024);
+            assert_eq!(words[1], 2);
+            assert_eq!(
+                &words[2..6],
+                &[
+                    VideoFormat::Cif4.wire_value(),
+                    1,
+                    VideoFormat::Cif.wire_value(),
+                    2,
+                ]
+            );
+            assert_eq!(&words[6..12], &[0; 6]);
+            assert_eq!(words[12], 7);
+            assert_eq!(&words[13..], &expected_arm);
+
+            let decoded = decoded_multimedia_capability(bytes, arm.codec());
+            let MultimediaCapabilityState::Video(decoded) = decoded else {
+                panic!("typed codec arm was not decoded");
+            };
+            assert_eq!(decoded.arm(), arm);
+            assert_eq!(decoded.picture_formats().len(), 2);
+            let decoded_payload = MultimediaPayload::from_decoded(
+                payload.descriptor(),
+                MultimediaCapabilityState::Video(decoded),
+                MultimediaPayloadDirection::Transmit,
+                ProtocolVersion::V17,
+                arm.codec(),
+            );
+            assert_eq!(multimedia_capability_to_wire(&decoded_payload), bytes);
+        }
+    }
+
+    #[test]
+    fn multimedia_descriptor_carries_the_negotiated_rtp_mapping() {
+        for (arm, expected_payload_number) in [
+            (
+                MultimediaVideoCapabilityArm::H261 {
+                    temporal_spatial_trade_off_capability: 0,
+                    still_image_transmission: 0,
+                },
+                31,
+            ),
+            (
+                MultimediaVideoCapabilityArm::H263 {
+                    capability_bitfield: 0,
+                    annex_n_and_w_future_use: 0,
+                },
+                34,
+            ),
+            (
+                MultimediaVideoCapabilityArm::H263Plus {
+                    model_number: 0,
+                    bandwidth: 0,
+                },
+                96,
+            ),
+            (
+                MultimediaVideoCapabilityArm::H264 {
+                    profile: 0,
+                    level: 0,
+                    custom_max_mbps: 0,
+                    custom_max_fs: 0,
+                    custom_max_dpb: 0,
+                    custom_max_br_and_cpb: 0,
+                },
+                97,
+            ),
+        ] {
+            let payload = typed_video_payload(arm);
+            let descriptor = payload.descriptor();
+            assert_eq!(descriptor.rfc_number(), 0);
+            assert_eq!(descriptor.payload_number().get(), expected_payload_number);
+            assert_eq!(payload.codec(), arm.codec());
+            assert_eq!(
+                encode(
+                    id::OPEN_MULTIMEDIA_CHANNEL,
+                    &WireMultimediaPayloadDescriptor::from(descriptor)
+                )
+                .unwrap(),
+                [0, 0, 0, 0, expected_payload_number, 0, 0, 0,]
+            );
+        }
+
+        let payload = typed_video_payload(MultimediaVideoCapabilityArm::H263 {
+            capability_bitfield: 0,
+            annex_n_and_w_future_use: 0,
+        });
+        let descriptor = MultimediaPayloadDescriptor::new(4, payload.payload_number());
+        assert_eq!(
+            encode(
+                id::OPEN_MULTIMEDIA_CHANNEL,
+                &WireMultimediaPayloadDescriptor::from(descriptor),
+            )
+            .unwrap(),
+            [4, 0, 0, 0, 34, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn multimedia_acknowledgements_use_distinct_versioned_layouts() {
+        for (protocol, address, open_size, start_size) in [
+            (ProtocolVersion::V16, "192.0.2.33".parse().unwrap(), 20, 24),
+            (
+                ProtocolVersion::V17,
+                "2001:db8::33".parse().unwrap(),
+                36,
+                40,
+            ),
+        ] {
+            let open =
+                ClientMessage::OpenMultimediaReceiveChannelAck(OpenMultimediaReceiveChannelAck {
+                    status: MediaStatus::Ok,
+                    endpoint: MediaEndpointAddress {
+                        address,
+                        port: 16_000,
+                    },
+                    passthrough_party_id: 9.into(),
+                    call_reference: 7.into(),
+                });
+            let open_bytes = open.encode(protocol).unwrap();
+            assert_eq!(open_bytes.len() - 12, open_size);
+            assert_eq!(
+                ClientMessage::decode_with_version(
+                    FrameDecoder::new().push(&open_bytes).unwrap().remove(0),
+                    protocol,
+                )
+                .unwrap(),
+                open
+            );
+
+            let start =
+                ClientMessage::StartMultimediaTransmissionAck(StartMultimediaTransmissionAck {
+                    conference_id: 42.into(),
+                    passthrough_party_id: 9.into(),
+                    call_reference: 7.into(),
+                    endpoint: MediaEndpointAddress {
+                        address,
+                        port: 16_002,
+                    },
+                    status: MediaStatus::Ok,
+                });
+            let start_bytes = start.encode(protocol).unwrap();
+            assert_eq!(start_bytes.len() - 12, start_size);
+            assert_eq!(
+                ClientMessage::decode_with_version(
+                    FrameDecoder::new().push(&start_bytes).unwrap().remove(0),
+                    protocol,
+                )
+                .unwrap(),
+                start
+            );
+        }
+    }
+
+    #[test]
+    fn port_messages_switch_layouts_at_protocol_twenty() {
+        for (protocol, request_size, close_size, response_size) in [
+            (ProtocolVersion::V19, 16, 12, 24),
+            (ProtocolVersion::V20, 24, 16, 44),
+        ] {
+            let extended = protocol.wire() >= 20;
+            let request = ServerMessage::PortRequest(PortRequest {
+                conference_id: 42.into(),
+                call_reference: 7.into(),
+                passthrough_party_id: 9.into(),
+                transport: MediaTransport::Rtp,
+                address_type: extended.then_some(IpAddressType::Ipv4AndIpv6),
+                media_type: extended.then_some(MediaType::Audio),
+            });
+            let request_bytes = request.encode(protocol).unwrap();
+            assert_eq!(request_bytes.len() - 12, request_size);
+            assert_eq!(
+                ServerMessage::decode(
+                    FrameDecoder::new().push(&request_bytes).unwrap().remove(0),
+                    protocol,
+                )
+                .unwrap(),
+                request
+            );
+
+            let close = ServerMessage::PortClose(PortClose {
+                conference_id: 42.into(),
+                call_reference: 7.into(),
+                passthrough_party_id: 9.into(),
+                media_type: extended.then_some(MediaType::Audio),
+            });
+            let close_bytes = close.encode(protocol).unwrap();
+            assert_eq!(close_bytes.len() - 12, close_size);
+            assert_eq!(
+                ServerMessage::decode(
+                    FrameDecoder::new().push(&close_bytes).unwrap().remove(0),
+                    protocol,
+                )
+                .unwrap(),
+                close
+            );
+
+            let response = ControlMessage::PortResponse(PortEndpoint {
+                conference_id: 42,
+                call_reference: 7,
+                passthrough_party_id: 9,
+                address: if extended {
+                    "2001:db8::34".parse().unwrap()
+                } else {
+                    "192.0.2.34".parse().unwrap()
+                },
+                rtp_port: 16_000,
+                rtcp_port: 16_001,
+                media_type: extended.then_some(MediaType::Audio),
+            });
+            let response_bytes = response.encode(protocol).unwrap();
+            assert_eq!(response_bytes.len() - 12, response_size);
+            assert_eq!(
+                ControlMessage::decode(
+                    FrameDecoder::new().push(&response_bytes).unwrap().remove(0),
+                    protocol,
+                )
+                .unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn wire_encryption_rejects_invalid_lengths_without_debugging_secrets() {
+        let encryption = WireEncryptionInfo {
+            algorithm: EncryptionMethod::Aes128HmacSha1_80.wire_value(),
+            key_length: 17,
+            salt_length: 16,
+            key: [0xa5; 16],
+            salt: [0x5a; 16],
+            mki_present: 1,
+            key_derivation_rate: 64,
+        };
+        let debug = format!("{encryption:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("165"));
+        assert!(!debug.contains("90"));
+
+        let error = encryption
+            .to_public(id::OPEN_MULTIMEDIA_CHANNEL)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CodecError::SecretTooLong {
+                field: "media encryption key",
+                actual: 17,
+                maximum: 16,
+            }
+        ));
+        assert!(!error.to_string().contains("165"));
+    }
+
+    #[test]
+    fn wire_encryption_preserves_bytes_after_declared_lengths() {
+        let wire = WireEncryptionInfo {
+            algorithm: EncryptionMethod::Aes128HmacSha1_80.wire_value(),
+            key_length: 1,
+            salt_length: 1,
+            key: [0xa5, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            salt: [0x5a, 0x6f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            mki_present: 0,
+            key_derivation_rate: 0,
+        };
+        let encryption = wire.to_public(id::OPEN_MULTIMEDIA_CHANNEL).unwrap();
+
+        assert_eq!(WireEncryptionInfo::from_public(encryption.as_ref()), wire);
+        assert_eq!(encryption.as_ref().unwrap().key(), &[0xa5]);
+        assert_eq!(encryption.as_ref().unwrap().salt(), &[0x5a]);
+    }
+
+    #[test]
+    fn announcement_messages_use_bounded_fixed_wire_layouts() {
+        let message = ControlMessage::StartAnnouncement {
+            announcements: vec![AnnouncementEntry {
+                locale: 1,
+                country: 46,
+                tone: Tone::Zip,
+            }],
+            end_of_ack: EndOfAnnouncementAck::Required,
+            conference_id: 42,
+            matrix_conference_party_ids: vec![7, 9],
+            hearing_conference_party_mask: 0b11,
+            play_mode: AnnouncementPlayMode::Continuous,
+        };
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(frame.message_id, id::START_ANNOUNCEMENT);
+        assert_eq!(frame.payload.len(), 464);
+        assert_eq!(
+            ControlMessage::decode(frame.clone(), ProtocolVersion::V22).unwrap(),
+            message
+        );
+
+        let mut truncated = frame;
+        truncated.payload.pop();
+        assert!(matches!(
+            ControlMessage::decode(truncated, ProtocolVersion::V22),
+            Err(CodecError::Truncated {
+                message_id: id::START_ANNOUNCEMENT,
+                needed: 464,
+                actual: 463,
+            })
+        ));
+
+        for (message, expected_payload_len) in [
+            (ControlMessage::StopAnnouncement { conference_id: 42 }, 4),
+            (
+                ControlMessage::AnnouncementFinish {
+                    conference_id: 42,
+                    play_status: AnnouncementPlayStatus::Unknown(3),
+                },
+                8,
+            ),
+        ] {
+            let bytes = message.encode(ProtocolVersion::V22).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.payload.len(), expected_payload_len);
+            assert_eq!(
+                ControlMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn conference_lifecycle_messages_use_documented_wire_sizes() {
+        let server_messages = [
+            (
+                ControlMessage::ClearConference {
+                    conference_id: 42.into(),
+                    service_number: 3,
+                },
+                id::CLEAR_CONFERENCE,
+                8,
+            ),
+            (
+                ControlMessage::CreateConferenceRequest(CreateConferenceRequest {
+                    conference_id: 42.into(),
+                    reserved_participants: 8,
+                    resource_type: ConferenceResourceType::Conference,
+                    application_id: 7.into(),
+                    application_conference_id: "festival-42".into(),
+                    application_data: "main-stage".into(),
+                    passthrough_data: vec![1, 2, 3],
+                }),
+                id::CREATE_CONFERENCE_REQ,
+                80,
+            ),
+            (
+                ControlMessage::DeleteConferenceRequest {
+                    conference_id: 42.into(),
+                },
+                id::DELETE_CONFERENCE_REQ,
+                4,
+            ),
+            (
+                ControlMessage::ModifyConferenceRequest(ModifyConferenceRequest {
+                    conference_id: 42.into(),
+                    reserved_participants: 12,
+                    application_id: 7.into(),
+                    application_conference_id: "festival-42".into(),
+                    application_data: "main-stage".into(),
+                    passthrough_data: vec![4, 5],
+                }),
+                id::MODIFY_CONFERENCE_REQ,
+                76,
+            ),
+            (
+                ControlMessage::AuditConferenceRequest,
+                id::AUDIT_CONFERENCE_REQ,
+                0,
+            ),
+        ];
+        for (message, expected_id, expected_payload_len) in server_messages {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(ProtocolVersion::V22).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(frame.payload.len(), expected_payload_len);
+            assert_eq!(
+                ControlMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+
+        let audit = AuditConferenceResponse {
+            last: 1,
+            entries: vec![AuditConferenceEntry {
+                conference_id: 42.into(),
+                resource_type: ConferenceResourceType::Conference,
+                reserved_participants: 8,
+                active_participants: 3,
+                application_id: 7.into(),
+                application_conference_id: "festival-42".into(),
+                application_data: "main-stage".into(),
+            }],
+        };
+        let client_messages = [
+            (
+                ControlMessage::CreateConferenceResponse(CreateConferenceResponse {
+                    conference_id: 42.into(),
+                    result: CreateConferenceResult::Ok,
+                    passthrough_data: vec![1, 2, 3],
+                }),
+                id::CREATE_CONFERENCE_RES,
+                16,
+            ),
+            (
+                ControlMessage::DeleteConferenceResponse {
+                    conference_id: 42.into(),
+                    result: DeleteConferenceResult::Ok,
+                },
+                id::DELETE_CONFERENCE_RES,
+                8,
+            ),
+            (
+                ControlMessage::ModifyConferenceResponse(ModifyConferenceResponse {
+                    conference_id: 42.into(),
+                    result: ModifyConferenceResult::Ok,
+                    passthrough_data: vec![4, 5],
+                }),
+                id::MODIFY_CONFERENCE_RES,
+                16,
+            ),
+            (
+                ControlMessage::AuditConferenceResponse(audit),
+                id::AUDIT_CONFERENCE_RES,
+                84,
+            ),
+        ];
+        for (message, expected_id, expected_payload_len) in client_messages {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(ProtocolVersion::V22).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(frame.payload.len(), expected_payload_len);
+            assert_eq!(
+                ControlMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn conference_participant_messages_and_application_changes_round_trip() {
+        let participant = ConferenceParticipant {
+            call_reference: 100.into(),
+            presentation_restrictions: PartyInformationRestrictions::CALLING_NUMBER
+                | PartyInformationRestrictions::LAST_REDIRECT_NAME,
+            name: "Festival Caller".into(),
+            number: "1001".into(),
+            conference_name: "Main Stage".into(),
+        };
+        let server_messages = [
+            (
+                ControlMessage::AddParticipantRequest(AddParticipantRequest {
+                    conference_id: 42.into(),
+                    participant: participant.clone(),
+                }),
+                id::ADD_PARTICIPANT_REQ,
+                108,
+            ),
+            (
+                ControlMessage::DropParticipantRequest {
+                    conference_id: 42.into(),
+                    call_reference: 100.into(),
+                },
+                id::DROP_PARTICIPANT_REQ,
+                8,
+            ),
+            (
+                ControlMessage::AuditParticipantRequest {
+                    conference_id: 42.into(),
+                },
+                id::AUDIT_PARTICIPANT_REQ,
+                4,
+            ),
+        ];
+        for (message, expected_id, expected_payload_len) in server_messages {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(ProtocolVersion::V22).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(frame.payload.len(), expected_payload_len);
+            assert_eq!(
+                ControlMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+
+        let client_messages = [
+            (
+                ControlMessage::AddParticipantResponse(AddParticipantResponse {
+                    conference_id: 42.into(),
+                    call_reference: 100.into(),
+                    result: AddParticipantResult::Ok,
+                    bridge_participant_id: BoundedBytes::try_from(vec![3; 257]).unwrap(),
+                }),
+                id::ADD_PARTICIPANT_RES,
+                272,
+            ),
+            (
+                ControlMessage::AuditParticipantResponse(AuditParticipantResponse {
+                    result: AuditParticipantResult::Ok,
+                    last: 1,
+                    conference_id: 42.into(),
+                    number_of_entries: 2,
+                    participant_entries: vec![1, 2, 3, 4],
+                }),
+                id::AUDIT_PARTICIPANT_RES,
+                20,
+            ),
+        ];
+        for (message, expected_id, expected_payload_len) in client_messages {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(ProtocolVersion::V22).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(frame.payload.len(), expected_payload_len);
+            assert_eq!(
+                ControlMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+
+        let change = ConferenceParticipantChange {
+            conference_id: 42.into(),
+            participant,
+        };
+        let routing = ParticipantChangeRouting {
+            application_id: 7.into(),
+            line_instance: 1,
+            transaction_id: 9.into(),
+            sequence_flag: 1,
+            display_priority: 2,
+            application_instance_id: 3.into(),
+            routing: 4,
+        };
+        let envelope = change.to_user_data_v1(routing).unwrap();
+        assert_eq!(envelope.data.len(), 108);
+        assert_eq!(
+            ConferenceParticipantChange::from_user_data_v1(&envelope).unwrap(),
+            change
+        );
+
+        let mut mismatched = envelope;
+        mismatched.conference_id += 1;
+        assert!(matches!(
+            ConferenceParticipantChange::from_user_data_v1(&mismatched),
+            Err(CodecError::InvalidValue {
+                field: "participant change conference ID",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn participant_messages_enforce_text_and_audit_bounds() {
+        let oversized = ControlMessage::AuditParticipantResponse(AuditParticipantResponse {
+            result: AuditParticipantResult::Ok,
+            last: 1,
+            conference_id: 42.into(),
+            number_of_entries: 1,
+            participant_entries: vec![0; 257],
+        });
+        assert!(matches!(
+            oversized.encode(ProtocolVersion::V22),
+            Err(CodecError::CountTooLarge {
+                field: "participant audit data",
+                count: 257,
+                maximum: 256,
+                ..
+            })
+        ));
+
+        let mut oversized_payload = vec![0; 16 + 257];
+        oversized_payload[8..12].copy_from_slice(&42_u32.to_le_bytes());
+        assert!(matches!(
+            ControlMessage::decode(
+                Frame::new(22, id::AUDIT_PARTICIPANT_RES, oversized_payload),
+                ProtocolVersion::V22,
+            ),
+            Err(CodecError::CountTooLarge {
+                field: "participant audit data",
+                count: 257,
+                maximum: 256,
+                ..
+            })
+        ));
+
+        let long_name = ControlMessage::AddParticipantRequest(AddParticipantRequest {
+            conference_id: 42.into(),
+            participant: ConferenceParticipant {
+                call_reference: 100.into(),
+                presentation_restrictions: PartyInformationRestrictions::empty(),
+                name: "x".repeat(40),
+                number: "1001".into(),
+                conference_name: "Main Stage".into(),
+            },
+        });
+        assert!(matches!(
+            long_name.encode(ProtocolVersion::V22),
+            Err(CodecError::TextTooLong {
+                field: "participant name",
+                actual: 40,
+                maximum: 39,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn multicast_media_layouts_cover_legacy_and_extended_addresses() {
+        let acknowledgement = ClientMessage::MulticastMediaReceptionAck {
+            status: MediaStatus::Ok,
+            passthrough_party_id: 9.into(),
+            call_reference: 7.into(),
+        };
+        let frame = FrameDecoder::new()
+            .push(&acknowledgement.encode(ProtocolVersion::V3).unwrap())
+            .unwrap()
+            .remove(0);
+        assert_eq!(frame.message_id, id::MULTICAST_MEDIA_RECEPTION_ACK);
+        assert_eq!(frame.payload.len(), 12);
+        assert_eq!(ClientMessage::decode(frame).unwrap(), acknowledgement);
+
+        let reception_v3 = ServerMessage::StartMulticastMediaReception(MulticastMediaReception {
+            conference_id: 42.into(),
+            passthrough_party_id: 9.into(),
+            call_reference: 7.into(),
+            address: "239.1.2.3".parse().unwrap(),
+            port: 16_000,
+            packet_millis: 20,
+            codec: Codec::Pcmu,
+            echo_cancellation: EchoCancellation::On,
+            g723_bitrate: G723BitRate::Rate6_3,
+        });
+        let transmission_v3 =
+            ServerMessage::StartMulticastMediaTransmission(MulticastMediaTransmission {
+                conference_id: 42.into(),
+                passthrough_party_id: 9.into(),
+                call_reference: 7.into(),
+                address: "239.1.2.3".parse().unwrap(),
+                port: 16_002,
+                packet_millis: 20,
+                codec: Codec::Pcmu,
+                precedence: 5,
+                silence_suppression: 1,
+                max_frames_per_packet: 2,
+                g723_bitrate: G723BitRate::Rate5_3,
+            });
+        for (message, expected_id, expected_payload_len) in [
+            (reception_v3, id::START_MULTICAST_MEDIA_RECEPTION, 36),
+            (transmission_v3, id::START_MULTICAST_MEDIA_TRANSMISSION, 44),
+        ] {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(ProtocolVersion::V3).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(frame.payload.len(), expected_payload_len);
+            assert_eq!(
+                ServerMessage::decode(frame, ProtocolVersion::V3).unwrap(),
+                message
+            );
+        }
+
+        let reception_v17 = ServerMessage::StartMulticastMediaReception(MulticastMediaReception {
+            conference_id: 43.into(),
+            passthrough_party_id: 10.into(),
+            call_reference: 8.into(),
+            address: "ff3e::1234".parse().unwrap(),
+            port: 17_000,
+            packet_millis: 30,
+            codec: Codec::Pcma,
+            echo_cancellation: EchoCancellation::Unknown(7),
+            g723_bitrate: G723BitRate::Unknown(9),
+        });
+        let transmission_v17 =
+            ServerMessage::StartMulticastMediaTransmission(MulticastMediaTransmission {
+                conference_id: 43.into(),
+                passthrough_party_id: 10.into(),
+                call_reference: 8.into(),
+                address: "ff3e::1234".parse().unwrap(),
+                port: 17_002,
+                packet_millis: 30,
+                codec: Codec::Pcma,
+                precedence: 6,
+                silence_suppression: 2,
+                max_frames_per_packet: 3,
+                g723_bitrate: G723BitRate::Unknown(9),
+            });
+        for (message, expected_id, expected_payload_len) in [
+            (reception_v17, id::START_MULTICAST_MEDIA_RECEPTION, 52),
+            (transmission_v17, id::START_MULTICAST_MEDIA_TRANSMISSION, 60),
+        ] {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(ProtocolVersion::V17).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(frame.payload.len(), expected_payload_len);
+            assert_eq!(
+                ServerMessage::decode(frame, ProtocolVersion::V17).unwrap(),
+                message
+            );
+        }
+
+        for (message, expected_id) in [
+            (
+                ServerMessage::StopMulticastMediaReception {
+                    conference_id: 42.into(),
+                    passthrough_party_id: 9.into(),
+                    call_reference: 100.into(),
+                },
+                id::STOP_MULTICAST_MEDIA_RECEPTION,
+            ),
+            (
+                ServerMessage::StopMulticastMediaTransmission {
+                    conference_id: 42.into(),
+                    passthrough_party_id: 9.into(),
+                    call_reference: 100.into(),
+                },
+                id::STOP_MULTICAST_MEDIA_TRANSMISSION,
+            ),
+        ] {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(ProtocolVersion::V22).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(frame.payload.len(), 12);
+            assert_eq!(
+                ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_multicast_rejects_ipv6_and_invalid_ports() {
+        let ipv6 = ServerMessage::StartMulticastMediaReception(MulticastMediaReception {
+            conference_id: 42.into(),
+            passthrough_party_id: 9.into(),
+            call_reference: 7.into(),
+            address: "ff3e::1234".parse().unwrap(),
+            port: 16_000,
+            packet_millis: 20,
+            codec: Codec::Pcmu,
+            echo_cancellation: EchoCancellation::On,
+            g723_bitrate: G723BitRate::Rate6_3,
+        });
+        assert!(matches!(
+            ipv6.encode(ProtocolVersion::V15),
+            Err(CodecError::InvalidValue {
+                field: "IP address family for pre-v17 protocol",
+                ..
+            })
+        ));
+
+        let mut payload = vec![0; 52];
+        payload[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        payload[28..32].copy_from_slice(&70_000_u32.to_le_bytes());
+        assert!(matches!(
+            ServerMessage::decode(
+                Frame::new(17, id::START_MULTICAST_MEDIA_RECEPTION, payload),
+                ProtocolVersion::V17,
+            ),
+            Err(CodecError::InvalidValue {
+                field: "multicast port",
+                value: 70_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn qos_control_messages_use_field_typed_service_layouts() {
+        let flow = QosFlow {
+            conference_id: 42.into(),
+            call_reference: 7.into(),
+            passthrough_party_id: 9.into(),
+            address: "192.0.2.20".parse().unwrap(),
+            port: 16_000,
+        };
+        let traffic = QosTrafficSpecification {
+            codec: Codec::Pcmu,
+            average_bit_rate: 64_000,
+            burst_size: 1_200,
+            peak_rate: 128_000,
+        };
+        let application = QosApplicationIdentifier {
+            vendor_id: "Cisco".into(),
+            version: "1".into(),
+            application_name: "SCCP audio".into(),
+            sub_application_id: "primary".into(),
+        };
+        let messages = [
+            ControlMessage::QosReservationNotify {
+                flow,
+                direction: QosDirection::Send,
+            },
+            ControlMessage::QosErrorNotify {
+                flow,
+                direction: QosDirection::Send,
+                error_code: QosErrorCode::ListenFailed,
+                failure_node: "198.51.100.9".parse().unwrap(),
+                rsvp_error_code: RsvpErrorCode::NoSenderInformation,
+                rsvp_error_subcode: 5,
+                rsvp_error_flags: 6,
+            },
+            ControlMessage::QosListen {
+                flow,
+                reservation_style: QosReservationStyle::SharedExplicit,
+                maximum_retries: 3,
+                retry_timer: 4,
+                confirmation_required: true,
+                preemption_priority: 5,
+                defending_priority: 6,
+                traffic,
+                application: application.clone(),
+            },
+            ControlMessage::QosPath {
+                flow,
+                reservation_style: QosReservationStyle::SharedExplicit,
+                maximum_retries: 3,
+                retry_timer: 4,
+                preemption_priority: 5,
+                defending_priority: 6,
+                traffic,
+                application: application.clone(),
+            },
+            ControlMessage::QosTeardown {
+                flow,
+                direction: QosDirection::Send,
+            },
+            ControlMessage::UpdateDscp { flow, dscp: 46 },
+            ControlMessage::QosModify {
+                flow,
+                direction: QosDirection::Send,
+                traffic,
+                application,
+            },
+        ];
+        for (message, expected_size) in messages.into_iter().zip([24, 44, 172, 168, 24, 24, 152]) {
+            let bytes = message.encode(ProtocolVersion::V22).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.payload.len(), expected_size);
+            assert_eq!(
+                ControlMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_layout_alignment_bytes_must_be_zero() {
+        let register_ack = WireRegisterAck {
+            keepalive_seconds: 30,
+            date_template: *b"D/M/Y\0",
+            alignment: [1, 0],
+            secondary_keepalive_seconds: 30,
+            protocol_features: [22, 0, 0, 0],
+        };
+        assert!(
+            ServerMessage::decode(
+                Frame::new(
+                    ProtocolVersion::V22.wire(),
+                    id::REGISTER_ACK,
+                    encode(id::REGISTER_ACK, &register_ack).unwrap(),
+                ),
+                ProtocolVersion::V22,
+            )
+            .is_err()
+        );
+
+        let notification = WireMessageWaitingNotification {
+            target_number: WireFixedText::new(id::MWI_NOTIFICATION, "target", "1001").unwrap(),
+            control_number: WireFixedText::new(id::MWI_NOTIFICATION, "control", "5000").unwrap(),
+            alignment: [1, 0],
+            messages_waiting: 1,
+            total_voicemail_new: 0,
+            total_voicemail_old: 0,
+            priority_voicemail_new: 0,
+            priority_voicemail_old: 0,
+            total_fax_new: 0,
+            total_fax_old: 0,
+            priority_fax_new: 0,
+            priority_fax_old: 0,
+        };
+        let notification = encode(id::MWI_NOTIFICATION, &notification).unwrap();
+        assert_eq!(notification.len(), 88);
+        assert!(
+            ControlMessage::decode(
+                Frame::new(
+                    ProtocolVersion::V22.wire(),
+                    id::MWI_NOTIFICATION,
+                    notification,
+                ),
+                ProtocolVersion::V22,
+            )
+            .is_err()
+        );
+
+        let response = WireMessageWaitingResponse {
+            target_number: WireFixedText::new(id::MWI_RESPONSE, "target", "1001").unwrap(),
+            alignment: [0, 1, 0],
+            result: MessageWaitingResult::Ok.wire_value(),
+        };
+        let response = encode(id::MWI_RESPONSE, &response).unwrap();
+        assert_eq!(response.len(), 32);
+        assert!(
+            ControlMessage::decode(
+                Frame::new(ProtocolVersion::V22.wire(), id::MWI_RESPONSE, response,),
+                ProtocolVersion::V22,
+            )
+            .is_err()
+        );
+
+        let connection_statistics = WireConnectionStatisticsV19 {
+            directory_number: WireFixedText::new(
+                id::CONNECTION_STATISTICS_RES,
+                "directory number",
+                "2002",
+            )
+            .unwrap(),
+            alignment: [1, 0, 0],
+            call_reference: 42,
+            processing: StatisticsProcessing::Clear.wire_value(),
+            statistics: WireConnectionStatisticsTail {
+                packets_sent: 0,
+                octets_sent: 0,
+                packets_received: 0,
+                octets_received: 0,
+                packets_lost: 0,
+                jitter_millis: 0,
+                latency_millis: 0,
+                quality_size: 0,
+            },
+            quality: Vec::new(),
+        };
+        assert!(
+            ClientMessage::decode_with_version(
+                Frame::new(
+                    ProtocolVersion::V22.wire(),
+                    id::CONNECTION_STATISTICS_RES,
+                    encode(id::CONNECTION_STATISTICS_RES, &connection_statistics).unwrap(),
+                ),
+                ProtocolVersion::V22,
+            )
+            .is_err()
+        );
+
+        let mut enbloc = FrameDecoder::new()
+            .push(
+                &ClientMessage::EnblocCall {
+                    called_party: "2001".into(),
+                    line_instance: 2,
+                }
+                .encode(ProtocolVersion::V19)
+                .unwrap(),
+            )
+            .unwrap()
+            .remove(0);
+        enbloc.payload[25] = 1;
+        assert!(ClientMessage::decode_with_version(enbloc, ProtocolVersion::V19).is_err());
+
+        let mut off_hook = FrameDecoder::new()
+            .push(
+                &ClientMessage::OffHookWithCallingParty {
+                    calling_party_number: "2001".into(),
+                    voice_mailbox: "5000".into(),
+                    line_instance: 2,
+                }
+                .encode(ProtocolVersion::V19)
+                .unwrap(),
+            )
+            .unwrap()
+            .remove(0);
+        off_hook.payload[50] = 1;
+        assert!(ClientMessage::decode_with_version(off_hook, ProtocolVersion::V19).is_err());
+
+        let mut dialed = FrameDecoder::new()
+            .push(
+                &ServerMessage::DialedNumber {
+                    number: "2001".into(),
+                    line_instance: 2,
+                    call_reference: 42,
+                }
+                .encode(ProtocolVersion::V19)
+                .unwrap(),
+            )
+            .unwrap()
+            .remove(0);
+        dialed.payload[25] = 1;
+        assert!(ServerMessage::decode(dialed, ProtocolVersion::V19).is_err());
+
+        let mut forwarding = FrameDecoder::new()
+            .push(
+                &ServerMessage::ForwardStatus {
+                    line_instance: 2,
+                    forward_all: Some("2001".into()),
+                    forward_busy: None,
+                    forward_no_answer: None,
+                }
+                .encode(ProtocolVersion::V19)
+                .unwrap(),
+            )
+            .unwrap()
+            .remove(0);
+        forwarding.payload[37] = 1;
+        assert!(ServerMessage::decode(forwarding, ProtocolVersion::V19).is_err());
+    }
+
+    #[test]
+    fn boolean_control_words_reject_non_boolean_values() {
+        let recording = encode(
+            id::RECORDING_STATUS,
+            &WireRecordingStatus {
+                call_reference: 7,
+                active: 2,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            ServerMessage::decode(
+                Frame::new(ProtocolVersion::V22.wire(), id::RECORDING_STATUS, recording),
+                ProtocolVersion::V22,
+            ),
+            Err(CodecError::InvalidValue {
+                field: "recording active",
+                value: 2,
+                ..
+            })
+        ));
+
+        let notification = WireMessageWaitingNotification {
+            target_number: WireFixedText::new(id::MWI_NOTIFICATION, "target", "1001").unwrap(),
+            control_number: WireFixedText::new(id::MWI_NOTIFICATION, "control", "5000").unwrap(),
+            alignment: [0; 2],
+            messages_waiting: 2,
+            total_voicemail_new: 0,
+            total_voicemail_old: 0,
+            priority_voicemail_new: 0,
+            priority_voicemail_old: 0,
+            total_fax_new: 0,
+            total_fax_old: 0,
+            priority_fax_new: 0,
+            priority_fax_old: 0,
+        };
+        let payload = encode(id::MWI_NOTIFICATION, &notification).unwrap();
+        assert!(matches!(
+            ControlMessage::decode(
+                Frame::new(ProtocolVersion::V22.wire(), id::MWI_NOTIFICATION, payload),
+                ProtocolVersion::V22,
+            ),
+            Err(CodecError::InvalidValue {
+                field: "messages waiting",
+                value: 2,
+                ..
+            })
+        ));
+
+        let flow = QosFlow {
+            conference_id: 1.into(),
+            call_reference: 2.into(),
+            passthrough_party_id: 3.into(),
+            address: "192.0.2.1".parse().unwrap(),
+            port: 16_000,
+        };
+        let traffic = QosTrafficSpecification {
+            codec: Codec::Pcmu,
+            average_bit_rate: 64_000,
+            burst_size: 1_200,
+            peak_rate: 128_000,
+        };
+        let application = QosApplicationIdentifier {
+            vendor_id: "Cisco".into(),
+            version: "1".into(),
+            application_name: "SCCP audio".into(),
+            sub_application_id: "primary".into(),
+        };
+        let mut qos_listen = FrameDecoder::new()
+            .push(
+                &ControlMessage::QosListen {
+                    flow,
+                    reservation_style: QosReservationStyle::SharedExplicit,
+                    maximum_retries: 3,
+                    retry_timer: 4,
+                    confirmation_required: true,
+                    preemption_priority: 5,
+                    defending_priority: 6,
+                    traffic,
+                    application,
+                }
+                .encode(ProtocolVersion::V22)
+                .unwrap(),
+            )
+            .unwrap()
+            .remove(0);
+        qos_listen.payload[32..36].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(matches!(
+            ControlMessage::decode(qos_listen, ProtocolVersion::V22),
+            Err(CodecError::InvalidValue {
+                field: "QoS confirmation required",
+                value: 2,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            ControlMessage::UpdateDscp { flow, dscp: 64 }.encode(ProtocolVersion::V22),
+            Err(CodecError::InvalidValue {
+                field: "DSCP",
+                value: 64,
+                ..
+            })
+        ));
+
+        let invalid_dscp = encode(
+            id::UPDATE_DSCP,
+            &WireUpdateDscp {
+                flow: qos_flow_to_wire(flow),
+                dscp: 64,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            ControlMessage::decode(
+                Frame::new(ProtocolVersion::V22.wire(), id::UPDATE_DSCP, invalid_dscp),
+                ProtocolVersion::V22,
+            ),
+            Err(CodecError::InvalidValue {
+                field: "DSCP",
+                value: 64,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn compact_multimedia_dtmf_and_addon_layouts_round_trip_exactly() {
+        let open_ack = OpenMultimediaReceiveChannelAck {
+            status: MediaStatus::Ok,
+            endpoint: MediaEndpointAddress {
+                address: "2001:db8::20".parse().unwrap(),
+                port: 16_000,
+            },
+            passthrough_party_id: 9.into(),
+            call_reference: 7.into(),
+        };
+        let start_ack = StartMultimediaTransmissionAck {
+            conference_id: 42.into(),
+            passthrough_party_id: 9.into(),
+            call_reference: 7.into(),
+            endpoint: MediaEndpointAddress {
+                address: "2001:db8::20".parse().unwrap(),
+                port: 16_000,
+            },
+            status: MediaStatus::Ok,
+        };
+        for (message, expected_len) in [
+            (ClientMessage::OpenMultimediaReceiveChannelAck(open_ack), 48),
+            (ClientMessage::StartMultimediaTransmissionAck(start_ack), 52),
+        ] {
+            let bytes = message.encode(ProtocolVersion::V22).unwrap();
+            assert_eq!(bytes.len(), expected_len);
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(ClientMessage::decode(frame).unwrap(), message);
+        }
+
+        let addon = ClientMessage::ExtensionDeviceCapabilities(ExtensionDeviceCapabilities {
+            unknown_1: 1,
+            unknown_2: 2,
+            unknown_3: 3,
+            description: "7914 sidecar".into(),
+        });
+        let bytes = addon.encode(ProtocolVersion::V22).unwrap();
+        assert_eq!(bytes.len(), 176);
+        assert_eq!(
+            ClientMessage::decode(FrameDecoder::new().push(&bytes).unwrap().remove(0)).unwrap(),
+            addon
+        );
+
+        let dtmf = DtmfToneControl {
+            tone: Tone::Dtmf5,
+            conference_id: 42.into(),
+            passthrough_party_id: 9,
+        };
+        for message in [
+            ServerMessage::NotifyDtmfTone(dtmf),
+            ServerMessage::SendDtmfTone(dtmf),
+        ] {
+            let bytes = message.encode(ProtocolVersion::V22).unwrap();
+            assert_eq!(bytes.len(), 24);
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(
+                ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+
+        let lifecycle = MultimediaStreamControl {
+            conference_id: 42.into(),
+            passthrough_party_id: 9.into(),
+            call_reference: 7.into(),
+            port_handling_flag: 1,
+        };
+        let flow = VideoFlowControl {
+            conference_id: 42.into(),
+            passthrough_party_id: 9.into(),
+            call_reference: 7.into(),
+            maximum_bit_rate: 512_000,
+        };
+        for message in [
+            ServerMessage::StopMultimediaTransmission(lifecycle),
+            ServerMessage::CloseMultimediaReceiveChannel(lifecycle),
+            ServerMessage::FlowControlCommand(flow),
+            ServerMessage::FlowControlNotify(flow),
+        ] {
+            let bytes = message.encode(ProtocolVersion::V22).unwrap();
+            assert_eq!(bytes.len(), 28);
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(
+                ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+        let display = ServerMessage::VideoDisplayCommand {
+            conference_id: 42.into(),
+            call_reference: 7.into(),
+            layout_id: 2,
+        };
+        let bytes = display.encode(ProtocolVersion::V22).unwrap();
+        assert_eq!(bytes.len(), 24);
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            display
+        );
+
+        let failure_detection = ServerMessage::StartMediaFailureDetection(MediaFailureDetection {
+            conference_id: 42.into(),
+            passthrough_party_id: 9,
+            packet_millis: 20,
+            codec: Codec::Pcmu,
+            echo_cancellation: EchoCancellation::On,
+            codec_qualifier: [1, 2, 3, 4],
+            call_reference: 7.into(),
+        });
+        let bytes = failure_detection.encode(ProtocolVersion::V22).unwrap();
+        assert_eq!(bytes.len(), 40);
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            failure_detection
+        );
+
+        let dynamic = ServerMessage::ConfigStatus(ConfigurationStatus {
+            device_name: "SEP001122334455".into(),
+            station_user_id: 0xfeed,
+            station_instance: 2,
+            line_count: 6,
+            speed_dial_count: 12,
+            user_name: "festival".into(),
+            server_name: "sccp.example.test".into(),
+        });
+        let bytes = dynamic.encode(ProtocolVersion::V22).unwrap();
+        assert_eq!(bytes.len() % 4, 0);
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            dynamic
+        );
+    }
+
+    #[test]
+    fn soft_key_template_keeps_cisco_event_positions() {
+        let bytes = ServerMessage::SoftKeyTemplate {
+            actions: SoftKeyProfile::default().template_actions(),
+        }
+        .encode(ProtocolVersion::V22)
+        .unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        let payload: WireSoftKeyTemplate = decode(frame.message_id, &frame.payload).unwrap();
+        assert_eq!(payload.count, 32);
+        assert_eq!(payload.definitions[31].event, 32);
+        assert_eq!(
+            payload
+                .definitions
+                .iter()
+                .map(|definition| definition.event)
+                .collect::<Vec<_>>(),
+            (1..=32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn line_only_button_template_preserves_the_fixed_wire_layout() {
+        let message = ServerMessage::ButtonTemplate {
+            buttons: vec![ButtonTemplateEntry {
+                instance: 1,
+                button_type: ButtonType::Line,
+            }],
+        };
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        let payload: WireButtonTemplate = decode(frame.message_id, &frame.payload).unwrap();
+
+        assert_eq!(payload.offset, 0);
+        assert_eq!(payload.count, 42);
+        assert_eq!(payload.total, 42);
+        assert_eq!(
+            payload.definitions[0],
+            WireButtonDefinition {
+                instance: 1,
+                button_type: ButtonType::Line.wire_value() as u8,
+            }
+        );
+        assert!(
+            payload.definitions[1..]
+                .iter()
+                .all(|definition| *definition == WireButtonDefinition::default())
+        );
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn mixed_button_template_round_trips_ordered_semantic_entries() {
+        let message = ServerMessage::ButtonTemplate {
+            buttons: vec![
+                ButtonTemplateEntry {
+                    instance: 1,
+                    button_type: ButtonType::Line,
+                },
+                ButtonTemplateEntry {
+                    instance: 2,
+                    button_type: ButtonType::SpeedDial,
+                },
+                ButtonTemplateEntry {
+                    instance: 3,
+                    button_type: ButtonType::DoNotDisturb,
+                },
+                ButtonTemplateEntry {
+                    instance: 4,
+                    button_type: ButtonType::ServiceUrl,
+                },
+                ButtonTemplateEntry {
+                    instance: 0,
+                    button_type: ButtonType::Unused,
+                },
+                ButtonTemplateEntry {
+                    instance: 5,
+                    button_type: ButtonType::BlfSpeedDial,
+                },
+            ],
+        };
+
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn button_template_rejects_unrepresentable_entries_and_counts() {
+        let too_many = ServerMessage::ButtonTemplate {
+            buttons: vec![
+                ButtonTemplateEntry {
+                    instance: 1,
+                    button_type: ButtonType::Line,
+                };
+                43
+            ],
+        };
+        assert!(matches!(
+            too_many.encode(ProtocolVersion::V22),
+            Err(CodecError::CountTooLarge { .. })
+        ));
+
+        let large_instance = ServerMessage::ButtonTemplate {
+            buttons: vec![ButtonTemplateEntry {
+                instance: 256,
+                button_type: ButtonType::Line,
+            }],
+        };
+        assert!(matches!(
+            large_instance.encode(ProtocolVersion::V22),
+            Err(CodecError::InvalidValue {
+                field: "button instance",
+                ..
+            })
+        ));
+
+        let payload = WireButtonTemplate {
+            offset: 0,
+            count: 43,
+            total: 42,
+            definitions: [WireButtonDefinition::default(); 42],
+        };
+        let frame = Frame::new(
+            ProtocolVersion::V22.wire(),
+            id::BUTTON_TEMPLATE,
+            encode(id::BUTTON_TEMPLATE, &payload).unwrap(),
+        );
+        assert!(matches!(
+            ServerMessage::decode(frame, ProtocolVersion::V22),
+            Err(CodecError::CountTooLarge {
+                field: "button definitions in message",
+                ..
+            })
+        ));
+
+        let payload = WireButtonTemplate {
+            offset: 1,
+            count: 42,
+            total: 42,
+            definitions: [WireButtonDefinition::default(); 42],
+        };
+        let frame = Frame::new(
+            ProtocolVersion::V22.wire(),
+            id::BUTTON_TEMPLATE,
+            encode(id::BUTTON_TEMPLATE, &payload).unwrap(),
+        );
+        assert!(matches!(
+            ServerMessage::decode(frame, ProtocolVersion::V22),
+            Err(CodecError::InvalidValue {
+                field: "button template range",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn station_statuses_select_and_round_trip_dynamic_layouts() {
+        let cases = [
+            (
+                ServerMessage::LineStatus {
+                    instance: 3,
+                    number: "1003".into(),
+                    display_name: "A dynamic line label".into(),
+                },
+                ProtocolVersion::V8,
+                id::LINE_STAT,
+            ),
+            (
+                ServerMessage::LineStatus {
+                    instance: 3,
+                    number: "1003".into(),
+                    display_name: "A dynamic line label".into(),
+                },
+                ProtocolVersion::V9,
+                id::LINE_STAT_DYNAMIC,
+            ),
+            (
+                ServerMessage::SpeedDialStatus {
+                    instance: 4,
+                    number: "2004".into(),
+                    display_name: "Warehouse".into(),
+                },
+                ProtocolVersion::new(14).unwrap(),
+                id::SPEED_DIAL_STAT,
+            ),
+            (
+                ServerMessage::SpeedDialStatus {
+                    instance: 4,
+                    number: "2004".into(),
+                    display_name: "Warehouse".into(),
+                },
+                ProtocolVersion::V15,
+                id::SPEED_DIAL_STAT_DYNAMIC,
+            ),
+            (
+                ServerMessage::FeatureStatus {
+                    instance: 5,
+                    button_type: ButtonType::DoNotDisturb,
+                    label: "Do not disturb".into(),
+                    state: 0x0002_0101,
+                },
+                ProtocolVersion::V22,
+                id::FEATURE_STAT,
+            ),
+            (
+                ServerMessage::ServiceUrlStatus {
+                    index: 6,
+                    url: "http://services.invalid/directory".into(),
+                    label: "Directory".into(),
+                    extension_text: String::new(),
+                },
+                ProtocolVersion::V8,
+                id::SERVICE_URL_STAT,
+            ),
+            (
+                ServerMessage::ServiceUrlStatus {
+                    index: 6,
+                    url: "http://services.invalid/directory".into(),
+                    label: "Directory".into(),
+                    extension_text: String::new(),
+                },
+                ProtocolVersion::V9,
+                id::SERVICE_URL_STAT_DYNAMIC,
+            ),
+        ];
+
+        for (message, protocol, expected_id) in cases {
+            let bytes = message.encode(protocol).unwrap();
+            assert_eq!(bytes.len() % 4, 0, "message 0x{expected_id:04x}");
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(ServerMessage::decode(frame, protocol).unwrap(), message);
+        }
+
+        let message = ServerMessage::FeatureStatus {
+            instance: 5,
+            button_type: ButtonType::DoNotDisturb,
+            label: "Do not disturb".into(),
+            state: 0x0002_0101,
+        };
+        let session =
+            StationSessionContext::new(ProtocolVersion::V8, PhoneFeatures::DYNAMIC_MESSAGES);
+        let bytes = message.encode_for_session(session).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(frame.message_id, id::FEATURE_STAT_DYNAMIC);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V8).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn configuration_status_is_lossless_across_session_selected_layouts() {
+        let message = ServerMessage::ConfigStatus(ConfigurationStatus {
+            device_name: "SEP001122334455".into(),
+            station_user_id: 17,
+            station_instance: 2,
+            line_count: 6,
+            speed_dial_count: 12,
+            user_name: "festival".into(),
+            server_name: "sccp.example.test".into(),
+        });
+        for (session, expected_id) in [
+            (
+                StationSessionContext::from(ProtocolVersion::V8),
+                id::CONFIG_STAT,
+            ),
+            (
+                StationSessionContext::new(ProtocolVersion::V8, PhoneFeatures::DYNAMIC_MESSAGES),
+                id::CONFIG_STAT_DYNAMIC,
+            ),
+            (
+                StationSessionContext::from(ProtocolVersion::V9),
+                id::CONFIG_STAT_DYNAMIC,
+            ),
+        ] {
+            let bytes = message.encode_for_session(session).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(
+                ServerMessage::decode(frame, session.protocol).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_call_information_uses_the_versioned_string_count() {
+        let message = ServerMessage::CallInfo {
+            info: CallInfo {
+                direction: crate::types::CallDirection::Inbound,
+                calling_name: "Alice".into(),
+                calling_number: "1001".into(),
+                called_name: "Bob".into(),
+                called_number: "2001".into(),
+                original_called_name: "Carol".into(),
+                original_called_number: "3001".into(),
+                last_redirecting_name: "Dave".into(),
+                last_redirecting_number: "4001".into(),
+                original_redirect_reason: 2,
+                last_redirect_reason: 4,
+                party_restrictions: 0,
+            },
+            line_instance: 2,
+            call_reference: 42,
+        };
+
+        for (protocol, count) in [
+            (ProtocolVersion::V15, 12),
+            (ProtocolVersion::V16, 13),
+            (ProtocolVersion::V18, 13),
+            (ProtocolVersion::V19, 15),
+        ] {
+            let bytes = message.encode(protocol).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.message_id, id::CALL_INFO_DYNAMIC);
+            assert_eq!(
+                decode_dynamic_texts(frame.message_id, &frame.payload, 32, count)
+                    .unwrap()
+                    .len(),
+                count
+            );
+            assert_eq!(ServerMessage::decode(frame, protocol).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn dynamic_service_status_adds_the_extension_field_from_version_nineteen() {
+        let unsupported = ServerMessage::ServiceUrlStatus {
+            index: 3,
+            url: "http://services.invalid/directory".into(),
+            label: "Directory".into(),
+            extension_text: "extension".into(),
+        };
+        assert!(matches!(
+            unsupported.encode(ProtocolVersion::V18),
+            Err(CodecError::InvalidValue {
+                field: "service URL extension for this protocol version",
+                ..
+            })
+        ));
+
+        let before = ServerMessage::ServiceUrlStatus {
+            index: 3,
+            url: "http://services.invalid/directory".into(),
+            label: "Directory".into(),
+            extension_text: String::new(),
+        };
+        let bytes = before.encode(ProtocolVersion::V18).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(
+            decode_dynamic_texts(frame.message_id, &frame.payload, 4, 2).unwrap(),
+            ["http://services.invalid/directory", "Directory"]
+        );
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V18).unwrap(),
+            before
+        );
+
+        let from = ServerMessage::ServiceUrlStatus {
+            index: 3,
+            url: "http://services.invalid/directory".into(),
+            label: "Directory".into(),
+            extension_text: "extension".into(),
+        };
+        let bytes = from.encode(ProtocolVersion::V19).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(
+            decode_dynamic_texts(frame.message_id, &frame.payload, 4, 3).unwrap(),
+            [
+                "http://services.invalid/directory",
+                "Directory",
+                "extension"
+            ]
+        );
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V19).unwrap(),
+            from
+        );
+    }
+
+    #[test]
+    fn dynamic_7961_line_status_has_cisco_word_padding() {
+        let bytes = ServerMessage::LineStatus {
+            instance: 1,
+            number: "1006".into(),
+            display_name: "1006".into(),
+        }
+        .encode(ProtocolVersion::V22)
+        .unwrap();
+        assert_eq!(bytes.len(), 36);
+        assert_eq!(&bytes[..4], &28_u32.to_le_bytes());
+        assert_eq!(
+            &bytes[12..],
+            b"\x01\0\0\0\x0f\0\0\x001006\x001006\x001006\0\0"
+        );
+    }
+
+    #[test]
+    fn dynamic_station_decoders_reject_missing_or_nonzero_word_padding() {
+        let bytes = ServerMessage::LineStatus {
+            instance: 1,
+            number: "1006".into(),
+            display_name: "1006".into(),
+        }
+        .encode(ProtocolVersion::V22)
+        .unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+
+        let mut missing_padding = frame.clone();
+        missing_padding.payload.pop();
+        assert!(matches!(
+            ServerMessage::decode(missing_padding, ProtocolVersion::V22),
+            Err(CodecError::InvalidAlignment { actual: 23, .. })
+        ));
+
+        let mut nonzero_padding = frame.clone();
+        *nonzero_padding.payload.last_mut().unwrap() = 0x7f;
+        assert!(matches!(
+            ServerMessage::decode(nonzero_padding, ProtocolVersion::V22),
+            Err(CodecError::TrailingBytes { count: 1, .. })
+        ));
+
+        let mut extension = frame;
+        extension.payload.extend_from_slice(&[0; 4]);
+        assert!(matches!(
+            ServerMessage::decode(extension, ProtocolVersion::V22),
+            Err(CodecError::TrailingBytes { count: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn dynamic_display_decoders_validate_the_same_padding_contract() {
+        let bytes = ServerMessage::DisplayNotify {
+            timeout_seconds: 4,
+            text: "status".into(),
+        }
+        .encode(ProtocolVersion::V22)
+        .unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(frame.payload.len() % 4, 0);
+
+        let mut bad = frame;
+        bad.payload.extend_from_slice(&[0, 0, 0, 1]);
+        assert!(matches!(
+            ServerMessage::decode(bad, ProtocolVersion::V22),
+            Err(CodecError::TrailingBytes { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_station_labels_use_the_configured_single_byte_code_page() {
+        let message = ServerMessage::LineStatus {
+            instance: 1,
+            number: "1001".into(),
+            display_name: "Räksmörgås".into(),
+        };
+        let latin1 = message
+            .encode_for_legacy_station(ProtocolVersion::V3, LegacyCodePage::Iso8859_1)
+            .unwrap();
+        let latin1 = FrameDecoder::new().push(&latin1).unwrap().remove(0);
+        let expected = b"R\xe4ksm\xf6rg\xe5s";
+        assert!(
+            latin1
+                .payload
+                .windows(expected.len())
+                .any(|bytes| bytes == expected)
+        );
+
+        let ascii = message
+            .encode_for_legacy_station(ProtocolVersion::V3, LegacyCodePage::Ascii)
+            .unwrap();
+        let ascii = FrameDecoder::new().push(&ascii).unwrap().remove(0);
+        assert!(
+            ascii
+                .payload
+                .windows(10)
+                .any(|bytes| bytes == b"R?ksm?rg?s")
+        );
+
+        let utf8 = message.encode(ProtocolVersion::V3).unwrap();
+        let utf8 = FrameDecoder::new().push(&utf8).unwrap().remove(0);
+        assert!(
+            utf8.payload
+                .windows(13)
+                .any(|bytes| bytes == "Räksmörgås".as_bytes())
+        );
+    }
+
+    #[test]
+    fn dynamic_station_statuses_support_extended_labels_and_require_terminators() {
+        let label = "A label that is intentionally longer than the static forty-byte field";
+        for message in [
+            ServerMessage::LineStatus {
+                instance: 1,
+                number: "1001".into(),
+                display_name: label.into(),
+            },
+            ServerMessage::ServiceUrlStatus {
+                index: 3,
+                url: "http://services.invalid/directory".into(),
+                label: label.into(),
+                extension_text: String::new(),
+            },
+        ] {
+            let bytes = message.encode(ProtocolVersion::V17).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(
+                ServerMessage::decode(frame, ProtocolVersion::V17).unwrap(),
+                message
+            );
+        }
+
+        let feature = ServerMessage::FeatureStatus {
+            instance: 2,
+            button_type: ButtonType::DoNotDisturb,
+            label: label.into(),
+            state: 1,
+        };
+        let session =
+            StationSessionContext::new(ProtocolVersion::V8, PhoneFeatures::DYNAMIC_MESSAGES);
+        let bytes = feature.encode_for_session(session).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(frame.message_id, id::FEATURE_STAT_DYNAMIC);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V8).unwrap(),
+            feature
+        );
+
+        let unterminated_service = Frame::new(
+            ProtocolVersion::V17.wire(),
+            id::SERVICE_URL_STAT_DYNAMIC,
+            [3_u32.to_le_bytes().as_slice(), b"x\0YZ"].concat(),
+        );
+        assert!(matches!(
+            ServerMessage::decode(unterminated_service, ProtocolVersion::V17),
+            Err(CodecError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn call_info_layouts_preserve_redirecting_and_presentation_fields() {
+        let info = CallInfo {
+            direction: crate::types::CallDirection::Inbound,
+            calling_name: "Festival Caller".into(),
+            calling_number: "1001".into(),
+            called_name: "Festival Phone".into(),
+            called_number: "1006".into(),
+            original_called_name: "Reception".into(),
+            original_called_number: "1000".into(),
+            last_redirecting_name: "Front Desk".into(),
+            last_redirecting_number: "1002".into(),
+            original_redirect_reason: 4,
+            last_redirect_reason: 2,
+            party_restrictions: 0xf,
+        };
+        for (protocol, expected_id) in [
+            (ProtocolVersion::V3, id::CALL_INFO),
+            (ProtocolVersion::V8, id::CALL_INFO),
+            (ProtocolVersion::V16, id::CALL_INFO_DYNAMIC),
+            (ProtocolVersion::V22, id::CALL_INFO_DYNAMIC),
+        ] {
+            let message = ServerMessage::CallInfo {
+                info: info.clone(),
+                line_instance: 1,
+                call_reference: 42,
+            };
+            let bytes = message.encode(protocol).unwrap();
+            assert_eq!(bytes.len() % 4, 0, "message 0x{expected_id:04x}");
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(ServerMessage::decode(frame, protocol).unwrap(), message);
+        }
+
+        let bytes = ServerMessage::DisplayPrompt {
+            timeout_seconds: 0,
+            text: "From Festival Caller (1001)".into(),
+            line_instance: 1,
+            call_reference: 42,
+        }
+        .encode(ProtocolVersion::V22)
+        .unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(frame.message_id, id::DISPLAY_DYNAMIC_PROMPT_STATUS);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            ServerMessage::DisplayPrompt {
+                timeout_seconds: 0,
+                text: "From Festival Caller (1001)".into(),
+                line_instance: 1,
+                call_reference: 42,
+            }
+        );
+    }
+
+    #[test]
+    fn notification_frames_select_static_or_dynamic_layout_and_keep_priority_six() {
+        for (protocol, expected_id) in [
+            (ProtocolVersion::V3, id::DISPLAY_PRIORITY_NOTIFY),
+            (ProtocolVersion::V22, id::DISPLAY_DYNAMIC_PRIORITY_NOTIFY),
+        ] {
+            let message = ServerMessage::DisplayPriorityNotify {
+                timeout_seconds: 10,
+                priority: NotificationPriority::Timed,
+                text: "Status line".into(),
+            };
+            let bytes = message.encode(protocol).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(ServerMessage::decode(frame, protocol).unwrap(), message);
+        }
+
+        let message = ServerMessage::DisplayNotify {
+            timeout_seconds: 3,
+            text: "Dynamic notification text longer than thirty-one bytes".into(),
+        };
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(frame.message_id, id::DISPLAY_DYNAMIC_NOTIFY);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn call_state_uses_cisco_visibility_then_precedence_layout() {
+        let bytes = ServerMessage::CallState {
+            state: CallState::RingIn,
+            line_instance: 1,
+            call_reference: 42,
+        }
+        .encode(ProtocolVersion::V22)
+        .unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        let words = (0..frame.payload.len() / 4)
+            .map(|index| {
+                let offset = index * 4;
+                u32::from_le_bytes([
+                    frame.payload[offset],
+                    frame.payload[offset + 1],
+                    frame.payload[offset + 2],
+                    frame.payload[offset + 3],
+                ])
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            words,
+            vec![CallState::RingIn.wire_value(), 1, 42, 0, 2, 0],
+            "CallState is state, line, call, visibility, priority, domain"
+        );
+
+        for (state, expected) in [
+            (CallState::OffHook, 3),
+            (CallState::Proceed, 3),
+            (CallState::Connected, 3),
+            (CallState::RingOut, 4),
+        ] {
+            let bytes = ServerMessage::CallState {
+                state,
+                line_instance: 1,
+                call_reference: 42,
+            }
+            .encode(ProtocolVersion::V22)
+            .unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(
+                u32::from_le_bytes(frame.payload[16..20].try_into().unwrap()),
+                expected,
+                "wrong precedence for {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_key_sets_and_masks_only_advertise_implemented_actions() {
+        let profile = SoftKeyProfile::default();
+        let bytes = ServerMessage::SoftKeySet {
+            profile: profile.clone(),
+        }
+        .encode(ProtocolVersion::V22)
+        .unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        let payload: WireSoftKeySet = decode(frame.message_id, &frame.payload).unwrap();
+
+        assert_eq!(
+            &payload.sets[KeyMode::RingIn.wire_value() as usize].template_indexes[..2],
+            &[
+                SoftKey::Answer.wire_value() as u8,
+                SoftKey::EndCall.wire_value() as u8
+            ]
+        );
+        assert_eq!(profile.valid_mask(KeyMode::RingIn), 0b11);
+        assert_eq!(profile.valid_mask(KeyMode::Connected), 0b111);
+        assert_eq!(profile.valid_mask(KeyMode::Empty), 0);
+    }
+
+    #[test]
+    fn configured_soft_key_set_round_trips_order_and_empty_modes() {
+        let profile = SoftKeyProfile::new(KeyMode::ALL_KNOWN.iter().copied().map(|mode| {
+            let actions = match mode {
+                KeyMode::OnHook => vec![SoftKey::Redial, SoftKey::NewCall],
+                KeyMode::Connected => vec![SoftKey::EndCall, SoftKey::Hold],
+                _ => Vec::new(),
+            };
+            (mode, actions)
+        }))
+        .unwrap();
+        let message = ServerMessage::SoftKeySet {
+            profile: profile.clone(),
+        };
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        let payload: WireSoftKeySet = decode(frame.message_id, &frame.payload).unwrap();
+
+        assert_eq!(
+            &payload.sets[KeyMode::OnHook.wire_value() as usize].template_indexes[..3],
+            &[
+                SoftKey::Redial.wire_value() as u8,
+                SoftKey::NewCall.wire_value() as u8,
+                0,
+            ]
+        );
+        assert_eq!(
+            &payload.sets[KeyMode::Connected.wire_value() as usize].template_indexes[..3],
+            &[
+                SoftKey::EndCall.wire_value() as u8,
+                SoftKey::Hold.wire_value() as u8,
+                0,
+            ]
+        );
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            message
+        );
+        assert_eq!(profile.valid_mask(KeyMode::OnHook), 0b11);
+        assert_eq!(profile.valid_mask(KeyMode::RingIn), 0);
+
+        let template = ServerMessage::SoftKeyTemplate {
+            actions: profile.template_actions(),
+        };
+        let bytes = template.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        let payload: WireSoftKeyTemplate = decode(frame.message_id, &frame.payload).unwrap();
+        assert_eq!(payload.definitions[0].event, SoftKey::Redial.wire_value());
+        assert_eq!(payload.definitions[2].event, SoftKey::Hold.wire_value());
+        assert_eq!(payload.definitions[3].event, 0);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            template
+        );
+    }
+
+    #[test]
+    fn nominally_empty_requests_accept_bounded_extensions() {
+        for message_id in [
+            id::CONFIG_STAT_REQ,
+            id::TIME_DATE_REQ,
+            id::VERSION_REQ,
+            id::SERVER_REQ,
+            id::SOFT_KEY_SET_REQ,
+            id::SOFT_KEY_TEMPLATE_REQ,
+        ] {
+            ClientMessage::decode(Frame::new(22, message_id, 34_u32.to_le_bytes().to_vec()))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn dtmf_payload_messages_use_their_structural_word_layouts() {
+        let identity = DtmfPayloadIdentity {
+            payload_type: 101,
+            conference_id: 0x1122_3344,
+            passthrough_party_id: 0x5566_7788,
+        };
+        let request = DtmfPayloadRequest {
+            payload_type: identity.payload_type,
+            conference_id: identity.conference_id,
+            passthrough_party_id: identity.passthrough_party_id,
+            dtmf_type: 2,
+        };
+        let identity_payload = [
+            identity.payload_type.to_le_bytes(),
+            identity.conference_id.to_le_bytes(),
+            identity.passthrough_party_id.to_le_bytes(),
+        ]
+        .concat();
+        let request_payload = [
+            request.payload_type.to_le_bytes(),
+            request.conference_id.to_le_bytes(),
+            request.passthrough_party_id.to_le_bytes(),
+            request.dtmf_type.to_le_bytes(),
+        ]
+        .concat();
+
+        for message in [
+            ClientMessage::SubscribeDtmfPayloadResponse(identity),
+            ClientMessage::UnsubscribeDtmfPayloadResponse(identity),
+        ] {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(ProtocolVersion::V22).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.payload, identity_payload);
+            assert_eq!(
+                ClientMessage::decode_with_version(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+
+        for (message, expected_payload) in [
+            (
+                ServerMessage::SubscribeDtmfPayloadRequest(request),
+                request_payload.as_slice(),
+            ),
+            (
+                ServerMessage::SubscribeDtmfPayloadError(identity),
+                identity_payload.as_slice(),
+            ),
+            (
+                ServerMessage::UnsubscribeDtmfPayloadRequest(request),
+                request_payload.as_slice(),
+            ),
+            (
+                ServerMessage::UnsubscribeDtmfPayloadError(identity),
+                identity_payload.as_slice(),
+            ),
+        ] {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(ProtocolVersion::V22).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.payload.as_slice(), expected_payload);
+            assert_eq!(
+                ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
+        }
+
+        assert!(
+            ClientMessage::decode_with_version(
+                Frame::new(22, id::SUBSCRIBE_DTMF_PAYLOAD_RES, vec![0; 13]),
+                ProtocolVersion::V22,
+            )
+            .is_err()
+        );
+        assert!(
+            ServerMessage::decode(
+                Frame::new(22, id::SUBSCRIBE_DTMF_PAYLOAD_REQ, vec![0; 17]),
+                ProtocolVersion::V22,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn add_participant_response_preserves_progressive_identifier_bytes() {
+        for identifier_len in [0, 1, 64, 256] {
+            let identifier = (0..identifier_len)
+                .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
+                .collect::<Vec<_>>();
+            let mut payload = [
+                42_u32.to_le_bytes(),
+                100_u32.to_le_bytes(),
+                0_u32.to_le_bytes(),
+            ]
+            .concat();
+            payload.extend_from_slice(&identifier);
+            let decoded = ControlMessage::decode(
+                Frame::new(22, id::ADD_PARTICIPANT_RES, payload),
+                ProtocolVersion::V22,
+            )
+            .unwrap();
+            let ControlMessage::AddParticipantResponse(response) = &decoded else {
+                panic!("expected add-participant response");
+            };
+            assert_eq!(response.bridge_participant_id.as_bytes(), identifier);
+            let frame = FrameDecoder::new()
+                .push(&decoded.encode(ProtocolVersion::V22).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.payload.len(), 272);
+            assert_eq!(&frame.payload[12..12 + identifier_len], identifier);
+            assert!(
+                frame.payload[12 + identifier_len..]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            );
+        }
+
+        let identifier = (0..257)
+            .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
+            .collect::<Vec<_>>();
+        let canonical = ControlMessage::AddParticipantResponse(AddParticipantResponse {
+            conference_id: 42.into(),
+            call_reference: 100.into(),
+            result: AddParticipantResult::Ok,
+            bridge_participant_id: BoundedBytes::try_from(identifier).unwrap(),
+        });
+        let frame = FrameDecoder::new()
+            .push(&canonical.encode(ProtocolVersion::V22).unwrap())
+            .unwrap()
+            .remove(0);
+        assert_eq!(frame.payload.len(), 272);
+        assert_eq!(
+            ControlMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            canonical
+        );
+
+        for invalid_len in [270, 271, 273] {
+            assert!(
+                ControlMessage::decode(
+                    Frame::new(22, id::ADD_PARTICIPANT_RES, vec![0; invalid_len]),
+                    ProtocolVersion::V22,
+                )
+                .is_err()
+            );
+        }
+        let mut invalid_alignment = vec![0; 272];
+        invalid_alignment[271] = 1;
+        assert!(
+            ControlMessage::decode(
+                Frame::new(22, id::ADD_PARTICIPANT_RES, invalid_alignment),
+                ProtocolVersion::V22,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn xml_alarm_accepts_and_preserves_every_bounded_frame_form() {
+        for payload_len in [0, 1, 2_000, 2_004, 2_048] {
+            let payload = (0..payload_len)
+                .map(|index| (index as u8).wrapping_mul(29).wrapping_add(1))
+                .collect::<Vec<_>>();
+            let decoded = ClientMessage::decode_with_version(
+                Frame::new(22, id::XML_ALARM, payload.clone()),
+                ProtocolVersion::V22,
+            )
+            .unwrap();
+            let ClientMessage::XmlAlarm(message) = &decoded else {
+                panic!("expected XML alarm");
+            };
+            assert_eq!(message.wire_payload(), payload.as_slice());
+            let frame = FrameDecoder::new()
+                .push(&decoded.encode(ProtocolVersion::V22).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(frame.payload, payload);
+        }
+
+        assert!(matches!(
+            ClientMessage::decode_with_version(
+                Frame::new(22, id::XML_ALARM, vec![0; 2_049]),
+                ProtocolVersion::V22,
+            ),
+            Err(CodecError::CountTooLarge {
+                message_id: id::XML_ALARM,
+                count: 2_049,
+                maximum: 2_048,
+                ..
+            })
+        ));
+
+        let with_suffix =
+            XmlAlarmMessage::from_wire_payload(b"<alarm/>\0ignored".to_vec()).unwrap();
+        assert_eq!(with_suffix.xml_bytes(), b"<alarm/>");
+        assert_eq!(with_suffix.wire_payload(), b"<alarm/>\0ignored");
+
+        let canonical = XmlAlarmMessage::from_xml(vec![b'x'; 2_000]).unwrap();
+        assert_eq!(canonical.xml_bytes().len(), 2_000);
+        assert_eq!(canonical.wire_payload().len(), 2_004);
+        assert!(XmlAlarmMessage::from_xml(vec![b'x'; 2_001]).is_err());
+    }
+
+    #[test]
+    fn xml_alarm_preserves_bounded_wire_payload() {
+        let xml = "<?xml version=\"1.0\"?><x-cisco-alarm></x-cisco-alarm>";
+        let mut payload = vec![0; 2_000];
+        payload[..xml.len()].copy_from_slice(xml.as_bytes());
+
+        let decoded = ClientMessage::decode(Frame::new(0, id::XML_ALARM, payload.clone())).unwrap();
+        let ClientMessage::XmlAlarm(message) = &decoded else {
+            panic!("expected XML alarm");
+        };
+        assert_eq!(message.xml_bytes(), xml.as_bytes());
+        assert_eq!(message.wire_payload(), payload);
+        let frame = FrameDecoder::new()
+            .push(&decoded.encode(ProtocolVersion::V22).unwrap())
+            .unwrap()
+            .remove(0);
+        assert_eq!(frame.payload, payload);
+    }
+
+    #[test]
+    fn location_information_uses_text_storage_followed_by_zero_alignment() {
+        let maximum = "x".repeat(2_400);
+        let encoded = ClientMessage::LocationInfo {
+            xml: maximum.clone(),
+        }
+        .encode(ProtocolVersion::V22)
+        .unwrap();
+        let frame = FrameDecoder::new().push(&encoded).unwrap().remove(0);
+        assert_eq!(frame.payload.len(), 2_404);
+        assert_eq!(&frame.payload[2_400..], &[0, 0, 0, 0]);
+        assert_eq!(
+            ClientMessage::decode_with_version(frame, ProtocolVersion::V22).unwrap(),
+            ClientMessage::LocationInfo { xml: maximum }
+        );
+
+        assert!(matches!(
+            ClientMessage::LocationInfo {
+                xml: "x".repeat(2_401),
+            }
+            .encode(ProtocolVersion::V22),
+            Err(CodecError::TextTooLong {
+                message_id: id::LOCATION_INFO,
+                maximum: 2_400,
+                ..
+            })
+        ));
+
+        let mut nonzero_alignment = vec![0; 2_404];
+        nonzero_alignment[2_401] = 1;
+        assert!(matches!(
+            ClientMessage::decode_with_version(
+                Frame::new(22, id::LOCATION_INFO, nonzero_alignment),
+                ProtocolVersion::V22,
+            ),
+            Err(CodecError::InvalidValue {
+                message_id: id::LOCATION_INFO,
+                field: "reserved payload byte",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decodes_7961_button_template_request_with_payload() {
+        assert_eq!(
+            ClientMessage::decode(Frame::new(
+                22,
+                id::BUTTON_TEMPLATE_REQ,
+                34_u32.to_le_bytes().to_vec(),
+            ))
+            .unwrap(),
+            ClientMessage::ButtonTemplateRequest
+        );
+    }
+}

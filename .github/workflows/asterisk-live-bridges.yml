@@ -1,0 +1,52 @@
+name: chan_sccp2 live bridge matrix
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "asterisk-module/live-tests/**"
+      - "asterisk-module/src/**"
+      - "asterisk-module/test-native-lifecycle.sh"
+      - "asterisk-module/Cargo.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/asterisk-live-bridges.yml"
+  pull_request:
+    paths:
+      - "asterisk-module/live-tests/**"
+      - "asterisk-module/src/**"
+      - "asterisk-module/test-native-lifecycle.sh"
+      - "asterisk-module/Cargo.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/asterisk-live-bridges.yml"
+
+jobs:
+  bridges:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asterisk: 22.7.0
+            feature: asterisk-22
+          - asterisk: 23.4.1
+            feature: asterisk-23
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Exercise live channel and bridge ownership
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: asterisk-module/live-tests/Dockerfile
+          build-args: |
+            ASTERISK_VERSION=${{ matrix.asterisk }}
+            ASTERISK_FEATURE=${{ matrix.feature }}
+          cache-from: type=gha,scope=asterisk-ci-${{ matrix.asterisk }}
+          cache-to: type=gha,mode=max,scope=asterisk-ci-${{ matrix.asterisk }}
+          pull: true
+          push: false

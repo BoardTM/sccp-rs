@@ -1,0 +1,34 @@
+[package]
+name = "sccp-protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Typed Cisco Skinny Client Control Protocol (SCCP/SPCP) codec and async server"
+publish = ["crates-io"]
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/sccp-protocol"
+keywords = ["sccp", "skinny", "cisco", "voip", "telephony"]
+categories = ["network-programming", "encoding", "parser-implementations"]
+
+[lints]
+workspace = true
+
+[dependencies]
+binrw.workspace = true
+bitflags.workspace = true
+form_urlencoded.workspace = true
+percent-encoding.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+toml.workspace = true

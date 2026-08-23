@@ -1,0 +1,42 @@
+[sccp]
+bind = "0.0.0.0:2000"
+keepalive_seconds = 30
+server_name = "sccp-bridge"
+# Leave empty to keep the handset's installed SCCP firmware.
+firmware_version = ""
+
+[sip]
+bind = "0.0.0.0:5060"
+# Set when SIP must advertise an address other than the bind address.
+# advertised_address = "192.168.1.10"
+conference_feature_code = "*3"
+interdigit_timeout_ms = 3000
+
+[media]
+bind_address = "0.0.0.0"
+advertised_address = "192.168.1.10"
+port_range = "30000-39999"
+# Calls use direct handset-to-peer RTP only when the phone and negotiated SIP
+# media addresses match the two sides of the same route. With no routes, all
+# calls use the encoded-packet relay.
+
+#[[media.direct_routes]]
+#phones = ["192.168.10.0/24"]
+#sip = ["192.168.20.0/24", "192.168.30.0/24"]
+
+# One [[phones]] entry describes one physical Cisco handset.
+[[phones]]
+device = "SEP001122334455"
+description = "Reception"
+
+# Each nested [[phones.lines]] entry is a line button on the most recently
+# declared handset and owns one SIP registration. Declaration order maps to
+# SCCP line instances 1, 2, and so on.
+[[phones.lines]]
+number = "1001"
+display_name = "Reception"
+registrar = "sip:asterisk.local"
+username = "1001"
+password = "change-me"
+# auth_username = "1001-auth"
+# outbound_proxy = "sip:asterisk.local;lr"

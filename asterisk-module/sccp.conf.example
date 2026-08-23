@@ -1,0 +1,269 @@
+; This sample uses one canonical spelling for each supported semantic option.
+; Accepted compatibility aliases are documented in README.md instead of being
+; duplicated here, because aliases for one setting may not be combined.
+[general]
+; Uncomment both names to overlay ordered realtime device and line rows on
+; this file. A failed query or invalid merged candidate leaves the live
+; configuration unchanged. No SQL schemas are bundled; these are Asterisk
+; realtime family names supplied by the deployment.
+; devicetable = sccp_devices
+; linetable = sccp_lines
+; `bind = 0.0.0.0:2000` is the equivalent compact clear-listener form.
+bindaddr = 0.0.0.0
+port = 2000
+; Addresses placed in media and server responses. At least one family must be
+; reachable by the phones. Use `none` to clear one family explicitly.
+advertised_ipv4 = 192.0.2.10
+advertised_ipv6 = 2001:db8::10
+; Ordered general ACL and the networks considered local for NAT selection.
+; NAT/address selection is active. ACL admission, QoS socket marking, and
+; per-device transport enforcement are validated policy but not runtime yet.
+deny = 0.0.0.0/0
+permit = internal
+permit = 2001:db8:100::/64
+localnet = internal
+localnet = 2001:db8:100::/64
+; Use either externip or externhost. externrefresh is valid only for a host.
+externhost = pbx.example.test
+externrefresh = 60
+nat = auto
+; Signaling/audio/video DSCP are 0..63 or a standard name; COS is 0..7.
+sccp_dscp = AF31
+sccp_cos = 4
+audio_dscp = EF
+audio_cos = 6
+video_dscp = AF41
+video_cos = 5
+; TLS policy is validated and retained, but this build currently serves only
+; the clear listener above. These values are ready for the future TLS listener
+; and may instead use one combined `certfile` containing certificate and key.
+tls_bind = 0.0.0.0:2443
+tls_certificate = /etc/asterisk/tls/server.crt
+tls_private_key = /etc/asterisk/tls/server.key
+tls_trust_store = /etc/asterisk/tls/ca.pem
+server_name = Asterisk SCCP
+; Station date/time presentation. `dateformat` uses the validated SCCP template
+; alphabet; `tzoffset` is whole hours from UTC in the range -14..14.
+dateformat = D/M/Y
+tzoffset = 0
+; Lines inherit the PBX language and optional CDR account code.
+language = en
+accountcode = voice-default
+keepalive = 30
+secondary_keepalive = 30
+; Repeat signaling_server to advertise an ordered failover set. Each entry is
+; priority,name,address,clear-port-or-none,secure-port-or-none.
+; signaling_server = 1, Asterisk SCCP, 192.0.2.10, 2000, 2443
+; signaling_server = 2, Asterisk SCCP Backup, 192.0.2.20, 2000, 2443
+; Seconds to wait for the first digit and between subsequent digits.
+firstdigittimeout = 10
+digittimeout = 5
+; Use `interdigit_timeout_ms = 1250` instead of `digittimeout` when sub-second
+; precision is required; configuring both forms is rejected.
+digittimeoutchar = #
+recorddigittimeoutchar = no
+simulate_enbloc = yes
+; Unsafe unless the dialplan and downstream provider both accept overlap DTMF.
+allowoverlap = no
+; Disabled by default. When enabled, hanging up an eligible ringing or
+; connected consultation leg completes its already-started transfer.
+transfer_on_hangup = no
+; Select the oldest or last-added answerable call.
+callanswerorder = OldestFirst
+; Ordinary inbound calls use this typed station ring pattern. Call-waiting
+; presentations are silent single rings unless this is Urgent.
+ringtype = Outside
+; A numeric zero disables the initial and repeated call-waiting tone.
+callwaitingtone = CallWaiting
+; Seconds between repeated tones; zero keeps the initial tone only.
+callwaitinginterval = 0
+; Registration-token policy used when a phone asks whether it should move
+; back from another configured call-control server. `fallback` accepts yes,
+; no, odd, or even.
+fallback = no
+backoff_time = 60
+server_priority = 1
+; Registration contexts are an ordered `&`-separated list. Lines without an
+; explicit regexten use their logical line number in every listed context.
+regcontext = sccp-registrations&branch-registrations
+autoanswer_ring_time = 1
+autoanswer_tone = Zip
+; A numeric zero disables the brief passive remote-hangup notification.
+remotehangup_tone = Zip
+; Unknown devices may register only when this guest hotline is enabled.
+hotline_enabled = no
+hotline_extension = 111
+hotline_context = from-sccp
+hotline_label = Guest hotline
+directrtp = no
+earlyrtp = yes
+; Handset audio-processing defaults. Lines may override either setting.
+echocancel = yes
+silencesuppression = no
+; Asterisk per-channel jitter buffer. Forced mode also suppresses direct RTP.
+jbenable = no
+jbforce = no
+jblog = no
+jbmaxsize = 200
+jbresyncthreshold = 1000
+jbimpl = fixed
+; With no codec directives, each registered phone advertises its mapped audio
+; formats and Asterisk chooses the best direct or translated path. Use
+; disallow/allow only when an administrator needs to restrict that set.
+; Defaults for destination-based conference dialing. `meetmeopts` is passed to
+; the selected conference application; `Mac` is suitable for ConfBridge.
+meetme = yes
+meetmeopts = Mac
+
+[reception-softkeys]
+type = softkey_profile
+; Actions retain their declared order. An empty value disables soft keys in
+; that mode. Modes omitted from a custom profile are also empty.
+on_hook = redial, new_call
+connected = hold, end_call, transfer, conference, park
+on_hold = resume, new_call, end_call
+ring_in = answer, immediate_divert, end_call
+off_hook = end_call
+connected_transfer = direct_transfer, end_call
+digits_following = backspace, end_call, dial
+connected_conference = hold, conference_list, join, end_call
+ring_out = callback, end_call
+off_hook_feature = resume, new_call, end_call
+in_use_hint = barge
+on_hook_stealable = intercept, new_call
+hold_conference = resume, new_call, end_call
+empty =
+
+[standard-device](!)
+type = device
+softkey_profile = reception-softkeys
+; Device variables apply to outbound channels before line variables.
+setvar = ENDPOINT_CLASS=desk
+; Device ACL/host entries replace their general/template counterparts when
+; present. Empty repeated values clear earlier inherited entries.
+deny =
+permit = 192.0.2.0/24
+permit = 2001:db8:100::/64
+permit_host = phone.example.test
+nat = auto
+; clear, tls, or either. TLS requires complete general TLS credentials.
+transport = either
+; Device QoS values override only the named traffic class.
+sccp_dscp = AF31
+sccp_cos = 4
+audio_dscp = EF
+audio_cos = 6
+video_dscp = AF41
+video_cos = 5
+cfwdall = yes
+cfwdbusy = yes
+cfwdnoanswer = yes
+forward_no_answer_timeout = 30
+forward_all = none
+forward_busy = none
+forward_no_answer = none
+dnd_feature = yes
+dnd = off
+privacy_feature = yes
+privacy = no
+; Open the phone's Placed Calls application for Redial instead of immediately
+; dialing the last number, and show ringing notification for hinted lines.
+useRedialMenu = no
+allowRinginNotification = no
+; Message-waiting lamp mode: off, on, wink, flash, or blink. `mwioncall`
+; controls whether MWI remains visible during a call.
+mwilamp = on
+mwioncall = no
+park = yes
+conf_allow = yes
+conf_music_on_hold_class = default
+conf_play_general_announce = yes
+conf_play_part_announce = yes
+conf_mute_on_entry = no
+conf_show_conflist = yes
+meetme = yes
+meetmeopts = Mac
+allowoverlap = no
+force_dtmfmode = auto
+directrtp = no
+earlyrtp = yes
+; Device codec restrictions remain accepted for compatibility. Omitted policy
+; leaves this template phone-driven.
+
+[standard-line](!)
+type = line
+context = from-sccp
+language = en
+; Line variables apply to inbound and outbound channels. A same-named line
+; value replaces the device value on outbound channels.
+setvar = SERVICE_CLASS=voice
+; The initial tone defaults to Inside Dial Tone. A nonempty prefix (up to nine
+; DTMF characters) starts the configured secondary tone on an exact match.
+initial_dialtone_tone = Inside Dial Tone
+secondary_dialtone_digits = 9
+secondary_dialtone_tone = Outside Dial Tone
+directed_pickup = yes
+pickup_mode_answer = yes
+parkinglot = default
+meetme = yes
+meetmenum = 700
+meetmeopts = Mac
+adhocNumber =
+videomode = auto
+echocancel = yes
+silencesuppression = no
+; Optional example restriction:
+; disallow = all
+; allow = ulaw, alaw, g722
+
+[SEP001122334455](standard-device)
+description = Reception phone
+; Buttons are provisioned in the order listed. Supported kinds are line,
+; speed_dial, blf, feature, service, addon, and empty.
+; Line buttons may override the logical line's label/caller ID and carry
+; per-device ringing, subscription, and privacy policy.
+button = line, 1001, label=Main desk, caller_name=Reception, caller_number=1001, ring=normal, subscription=1001@from-internal, privacy=no
+button = speed_dial, Helpdesk, 2000
+button = blf, Warehouse, 2001, 2001@from-internal
+; Omit the final argument to cycle off/reject/silent. Use silent or reject for
+; a fixed-mode toggle (busy is accepted and normalized to reject).
+button = feature, Do not disturb, dnd, silent
+; Retrieve the only parked call directly; otherwise show the lot menu. Use
+; AlwaysShowMenu as the final argument to force the menu for a single call.
+button = feature, Parked calls, parkinglot, default, RetrieveSingle
+button = feature, Forward all, forward_all
+button = feature, Forward busy, forward_busy
+button = feature, Forward no answer, forward_no_answer
+button = service, Directory, http://pbx.example.test/sccp/directory
+button = addon, 1, 7914
+button = empty
+; Feature defaults address feature-button instances, not physical positions.
+feature_default = 1, off
+; The original line syntax remains a shorthand for a line button and keeps
+; its position relative to surrounding button entries.
+line = 1002
+
+[1001](standard-line)
+label = Reception
+callerid = "Reception" <1001>
+accountcode = reception
+; Maximum concurrent logical inbound PBX calls on this line.
+incominglimit = 6
+; Mobility PINs contain one to seven digits. `regexten` entries are separated
+; with `&`; an optional `@context` selects a context for just that entry.
+pin = 1234
+regexten = 1001&91001@branch-registrations
+mailbox = 1001@default
+voicemail_number = 600
+voicemail_transfer = 61001
+call_group = 1
+pickup_group = 1, 3-4
+named_call_group = reception
+named_pickup_group = front-desk
+directed_pickup_context = from-sccp
+
+[1002](standard-line)
+label = Reception private
+callerid = "Reception private" <1002>
+mailbox = 1002@default
+voicemail_number = 600

@@ -1,0 +1,4 @@
+[env]
+# Tokio's per-test runtimes and the SCCP socket tests can exhaust macOS's
+# default 256-file-descriptor limit when libtest uses full CPU parallelism.
+RUST_TEST_THREADS = { value = "8", force = false }

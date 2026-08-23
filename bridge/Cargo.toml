@@ -1,0 +1,20 @@
+[package]
+name = "bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sccp-protocol = { path = "../sccp-protocol" }
+pjsua = { path = "pjsua" }
+ipnet = { version = "2", features = ["serde"] }
+rtrb = "0.3"
+serde = { version = "1", features = ["derive"] }
+thiserror.workspace = true
+tokio.workspace = true
+toml = "0.9"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -1,0 +1,16 @@
+[package]
+name = "pjsua"
+version = "2.1.2"
+edition = "2024"
+description = "Rust bindings for pjsua (pjproject SIP library)"
+publish = false
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"
+cmake = "0.1"

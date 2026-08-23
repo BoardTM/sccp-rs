@@ -1,0 +1,6 @@
+[submodule "bridge/pjsua/pjproject"]
+	path = bridge/pjsua/pjproject
+	url = https://github.com/pjsip/pjproject.git
+[submodule "asterisk-module/asterisk"]
+	path = asterisk-module/asterisk
+	url = https://github.com/asterisk/asterisk.git

@@ -1,0 +1,283 @@
+format_version = 2
+
+[[capture]]
+id = "historical_media_layouts"
+source_kind = "legacy_extract"
+phone_model = "unspecified"
+annotation = "Original capture unavailable; retained as independently copied frame evidence."
+outcome = "not_observed"
+
+[[capture]]
+id = "cisco_6901_transfer"
+source_kind = "legacy_extract"
+phone_model = "Cisco 6901"
+annotation = "Captured during transfer; original capture is not retained in Git."
+outcome = "accepted"
+
+[[capture]]
+id = "cisco_7961_capabilities_20260820"
+source_kind = "external_pcap"
+source_file = "scratch/2026-08-20-7961g-live/capabilities-0030-ea665f97.pcap"
+source_sha256 = "4c79dabe5eb583473f86728f378fc7c182a158946e79e175ad10e0f00248d54d"
+captured_on = "2026-08-20"
+phone_model = "Cisco 7961G"
+firmware = "SCCP41.9-4-2SR3-1S"
+asterisk_version = "22.7.0"
+module_sha256 = "ea665f9739874d1135aef5b81a8c52e1d16c1dd446c5fec8aad9992bb64318d0"
+annotation = "Live reconnect; header is V22 while the 1,840-byte body uses the legacy Version1 layout. Raw PCAP remains ignored."
+outcome = "accepted"
+
+[[capture]]
+id = "cisco_7961_ui_alignment_20260820"
+source_kind = "external_pcap"
+source_file = "scratch/2026-08-20-7961g-live/ui-alignment-calls-9b717c81.pcap"
+source_sha256 = "fa803938146c5f22148427416e77726974137d55bdb58939a986cb2359d0437a"
+captured_on = "2026-08-20"
+phone_model = "Cisco 7961G"
+firmware = "SCCP41.9-4-2SR3-1S"
+asterisk_version = "22.7.0"
+module_sha256 = "9b717c8165d5b65022e418f3e1aaf7c2274c72ac649630c9e60b377e19096a7c"
+annotation = "Post-reboot registration where padded dynamic line status made the configured line visible. Raw PCAP remains ignored."
+outcome = "accepted"
+
+[[capture]]
+id = "cisco_7961_ack_gated_success_20260820"
+source_kind = "external_pcap"
+source_file = "scratch/2026-08-20-7961g-live/ack-gated-success-75ad3195.pcap"
+source_sha256 = "021157cc87ef81c7cdd8908f744e60ac0e8bbadb9f1d1b4fd0891956624e3cca"
+captured_on = "2026-08-20"
+phone_model = "Cisco 7961G"
+firmware = "SCCP41.9-4-2SR3-1S"
+asterisk_version = "22.7.0"
+module_sha256 = "75ad31959d6ab2203c90d5d89baa41649ad469844f43153d48e7c7aa3d51453d"
+annotation = "Successful physical answer, acknowledged media setup, symmetric RTP, and clean handset teardown. Raw PCAP remains ignored."
+outcome = "accepted"
+
+[[capture]]
+id = "cisco_7961_wildcard_no_ack_20260820"
+source_kind = "external_pcap"
+source_file = "scratch/2026-08-20-7961g-live/wildcard-source-7527a10c.pcap"
+source_sha256 = "debb8026bd040c7685118a470a771ff84d7faa09db09329c95f9cfe848bd72fe"
+captured_on = "2026-08-20"
+phone_model = "Cisco 7961G"
+firmware = "SCCP41.9-4-2SR3-1S"
+asterisk_version = "22.7.0"
+module_sha256 = "7527a10cc44096f43cd93c54f7e21ea242a3935c09f1f3214ac73f543bfaa9b5"
+annotation = "The OpenReceive frame is byte-identical to the acknowledged wildcard fixture, but in this different lifecycle context it received no SCCP acknowledgement. This demonstrates that frame bytes alone do not determine the outcome. Raw PCAP remains ignored."
+outcome = "no_ack"
+
+[[capture]]
+id = "cisco_7961_party_same_no_ack_20260820"
+source_kind = "external_pcap"
+source_file = "scratch/2026-08-20-7961g-live/party-same-68898e12.pcap"
+source_sha256 = "bbd85e0eaf2f6fa60d70881f2eaf1493e8cfe009144b3b18a5959947356d8946"
+captured_on = "2026-08-20"
+phone_model = "Cisco 7961G"
+firmware = "SCCP41.9-4-2SR3-1S"
+asterisk_version = "22.7.0"
+annotation = "After consistent identity and privacy normalization, the concrete source filter is the only byte range that differs from the accepted wildcard frame. No ACK followed, but this pair records a byte delta rather than claiming the filter was the sole cause. Raw PCAP remains ignored."
+outcome = "no_ack"
+
+[[fixture]]
+name = "start_media_transmission_v17"
+file = "start_media_transmission_v17.hex"
+capture = "historical_media_layouts"
+direction = "server_to_device"
+message_id = 0x008a
+header_protocol = 17
+decode_protocol = 17
+contains = "frame"
+sha256 = "ee4f69997825532252d3046b3c0c9a3e17d6e1bd55da82e01cbd9ff7b9af1ba6"
+handset_observation = "not_observed"
+expect = { result = "decoded", canonical = "exact", semantic = { type = "start_media_transmission", call_reference = 27110996, passthrough_party_id = 16777299, address = "192.168.9.44", rtp_port = 19654, rtcp_port = 19655, packet_ms = 20, max_frames_per_packet = 0, codec = 4, telephone_event_payload = 0, silence_suppression = 0, wire = { conference_id = 27110996, precedence = 184, g723_bitrate = 0, stream_passthrough_id = 0, associated_stream_id = 0, dtmf_type = 10, mixing_mode = 0, direction = 0, latent_nonzero_bytes = 0 } } }
+
+[[fixture]]
+name = "open_receive_channel_v17"
+file = "open_receive_channel_v17.hex"
+capture = "historical_media_layouts"
+direction = "server_to_device"
+message_id = 0x0105
+header_protocol = 17
+decode_protocol = 17
+contains = "frame"
+sha256 = "6b01140e037d656751392e411f9ef0b3d5df65acd0be6d2d898fe62af4517cc0"
+handset_observation = "not_observed"
+expect = { result = "decoded", canonical = "exact", semantic = { type = "open_receive_channel", call_reference = 23641324, passthrough_party_id = 16777223, packet_ms = 20, codec = 4, echo_cancellation = 0, telephone_event_payload = 10, source_address = "192.168.9.44", source_port = 4000, wire = { conference_id = 23641324, g723_bitrate = 0, stream_passthrough_id = 0, associated_stream_id = 0, dtmf_type = 0, mixing_mode = 0, direction = 0, requested_address_type = 0, audio_level_adjustment = 0, latent_nonzero_bytes = 0 } } }
+
+[[fixture]]
+name = "start_media_transmission_ack_v20"
+file = "start_media_transmission_ack_v20.hex"
+capture = "cisco_6901_transfer"
+direction = "device_to_server"
+message_id = 0x0154
+header_protocol = 20
+decode_protocol = 20
+contains = "frame"
+sha256 = "205bd7b2d430bfd4e42fc48ee008fa7311e7db8b8705e07e10ba30ee3bc315a5"
+handset_observation = "emitted"
+expect = { result = "decoded", canonical = "exact", semantic = { type = "start_media_transmission_ack", conference_id = 0, call_reference = 18, passthrough_party_id = 0, address = "10.1.2.44", port = 12276, status = 0, wire = { extension_hex = "0000000000000000" } } }
+
+[[fixture]]
+name = "update_capabilities_7961_v22_legacy"
+file = "update_capabilities_7961_v22_legacy.hex"
+capture = "cisco_7961_capabilities_20260820"
+direction = "device_to_server"
+message_id = 0x0030
+header_protocol = 22
+decode_protocol = 22
+contains = "frame"
+sha256 = "82fa0525d4f7292e120427eefcd7bf270e2a26161c346166b5fcca86f9c82eb4"
+handset_observation = "emitted"
+extraction = { tool = "sccp_fixtures_tshark", version = 1, tcp_stream = 0, direction_ordinal = 16 }
+expect = { result = "decoded", canonical = "exact", semantic = { type = "capabilities_update", variant = "version1", payload_bytes = 1840, rtp_payload_format = 0, audio_codecs = [25, 4, 2, 15, 16, 11, 12, 257], video_count = 0, data_count = 0 } }
+
+[[fixture]]
+name = "line_status_7961_v22_sanitized"
+file = "line_status_7961_v22_sanitized.hex"
+capture = "cisco_7961_ui_alignment_20260820"
+direction = "server_to_device"
+message_id = 0x0147
+header_protocol = 22
+decode_protocol = 22
+contains = "frame"
+sha256 = "c0342561ddd571d593b649405db90105b5b27eb4d5e9ba8854b3503af928c58a"
+handset_observation = "displayed"
+extraction = { tool = "sccp_fixtures_tshark", version = 1, tcp_stream = 1, direction_ordinal = 7 }
+sanitization = [
+  { field = "line_number", replacement = "1001" },
+  { field = "display_name", replacement = "1001" },
+]
+expect = { result = "decoded", canonical = "exact", semantic = { type = "line_status", instance = 1, number = "1001", display_name = "1001" } }
+
+[[fixture]]
+name = "open_receive_7961_v22_accepted_wildcard"
+file = "open_receive_7961_v22_accepted_wildcard.hex"
+capture = "cisco_7961_ack_gated_success_20260820"
+direction = "server_to_device"
+message_id = 0x0105
+header_protocol = 22
+decode_protocol = 22
+contains = "frame"
+sha256 = "b91c31f2975eddd54d9b9d397347bfff397d69ae1cc17b77d7bad7a319c0dfe2"
+handset_observation = "acknowledged"
+extraction = { tool = "sccp_fixtures_tshark", version = 1, tcp_stream = 14, direction_ordinal = 54 }
+expect = { result = "decoded", canonical = "exact", semantic = { type = "open_receive_channel", call_reference = 1, passthrough_party_id = 1, packet_ms = 20, codec = 2, echo_cancellation = 0, telephone_event_payload = 101, source_address = "0.0.0.0", source_port = 0 } }
+
+[[fixture]]
+name = "open_receive_ack_7961_v22_sanitized"
+file = "open_receive_ack_7961_v22_sanitized.hex"
+capture = "cisco_7961_ack_gated_success_20260820"
+direction = "device_to_server"
+message_id = 0x0022
+header_protocol = 22
+decode_protocol = 22
+contains = "frame"
+sha256 = "8fedf1b4880f661b3b260d6276da4a4da4e921cfe541f3a8383ef4749592418e"
+handset_observation = "emitted"
+extraction = { tool = "sccp_fixtures_tshark", version = 1, tcp_stream = 14, direction_ordinal = 52 }
+sanitization = [
+  { field = "network_address", replacement = "192.0.2.1" },
+  { field = "network_port", replacement = "4000" },
+]
+expect = { result = "decoded", canonical = "exact", semantic = { type = "open_receive_channel_ack", call_reference = 1, passthrough_party_id = 1, address = "192.0.2.1", port = 4000, status = 0 } }
+
+[[fixture]]
+name = "start_media_7961_v22_sanitized"
+file = "start_media_7961_v22_sanitized.hex"
+capture = "cisco_7961_ack_gated_success_20260820"
+direction = "server_to_device"
+message_id = 0x008a
+header_protocol = 22
+decode_protocol = 22
+contains = "frame"
+sha256 = "eb003a3718177ee412e80d77201791faaadc52efd03a632a490b8ec79c4dc298"
+handset_observation = "acknowledged"
+extraction = { tool = "sccp_fixtures_tshark", version = 1, tcp_stream = 14, direction_ordinal = 55 }
+sanitization = [
+  { field = "network_address", replacement = "192.0.2.1" },
+  { field = "network_port", replacement = "4000/4001" },
+]
+expect = { result = "decoded", canonical = "exact", semantic = { type = "start_media_transmission", call_reference = 1, passthrough_party_id = 1, address = "192.0.2.1", rtp_port = 4000, rtcp_port = 4001, packet_ms = 20, max_frames_per_packet = 40, codec = 2, telephone_event_payload = 101, silence_suppression = 0 } }
+
+[[fixture]]
+name = "start_media_ack_7961_v22_sanitized"
+file = "start_media_ack_7961_v22_sanitized.hex"
+capture = "cisco_7961_ack_gated_success_20260820"
+direction = "device_to_server"
+message_id = 0x0154
+header_protocol = 22
+decode_protocol = 22
+contains = "frame"
+sha256 = "c09c5b783078aa7812d5be77df55e377d9a7e676181bd418f3164a7a2b8d1c6c"
+handset_observation = "emitted"
+extraction = { tool = "sccp_fixtures_tshark", version = 1, tcp_stream = 14, direction_ordinal = 53 }
+sanitization = [
+  { field = "network_address", replacement = "192.0.2.1" },
+  { field = "network_port", replacement = "4000" },
+]
+expect = { result = "decoded", canonical = "exact", semantic = { type = "start_media_transmission_ack", conference_id = 1, call_reference = 1, passthrough_party_id = 1, address = "192.0.2.1", port = 4000, status = 0 } }
+
+[[fixture]]
+name = "open_receive_7961_v22_no_ack_wildcard"
+file = "open_receive_7961_v22_no_ack_wildcard.hex"
+capture = "cisco_7961_wildcard_no_ack_20260820"
+direction = "server_to_device"
+message_id = 0x0105
+header_protocol = 22
+decode_protocol = 22
+contains = "frame"
+sha256 = "b91c31f2975eddd54d9b9d397347bfff397d69ae1cc17b77d7bad7a319c0dfe2"
+handset_observation = "no_response"
+extraction = { tool = "sccp_fixtures_tshark", version = 1, tcp_stream = 50, direction_ordinal = 37 }
+expect = { result = "decoded", canonical = "exact", semantic = { type = "open_receive_channel", call_reference = 1, passthrough_party_id = 1, packet_ms = 20, codec = 2, echo_cancellation = 0, telephone_event_payload = 101, source_address = "0.0.0.0", source_port = 0 } }
+
+[[fixture]]
+name = "open_receive_7961_v22_no_ack_concrete_sanitized"
+file = "open_receive_7961_v22_no_ack_concrete_sanitized.hex"
+capture = "cisco_7961_party_same_no_ack_20260820"
+direction = "server_to_device"
+message_id = 0x0105
+header_protocol = 22
+decode_protocol = 22
+contains = "frame"
+sha256 = "bf12e9da97f10108b8a85a496e5e9f2a697c19e18e963686209e48737b6d8a5d"
+handset_observation = "no_response"
+extraction = { tool = "sccp_fixtures_tshark", version = 1, tcp_stream = 11, direction_ordinal = 33 }
+sanitization = [
+  { field = "network_address", replacement = "192.0.2.1" },
+  { field = "network_port", replacement = "4000" },
+]
+expect = { result = "decoded", canonical = "exact", semantic = { type = "open_receive_channel", call_reference = 1, passthrough_party_id = 1, packet_ms = 20, codec = 2, echo_cancellation = 0, telephone_event_payload = 101, source_address = "192.0.2.1", source_port = 4000 } }
+
+[[trace]]
+name = "7961_dynamic_line_displayed"
+capture = "cisco_7961_ui_alignment_20260820"
+tcp_stream = 1
+outcome = "accepted"
+step = [{ sequence = 1, fixture = "line_status_7961_v22_sanitized", frame_number = 118, timestamp_epoch = "1787237329.415376000", inventory_sequence = 17, wire_validity = "exact", handset_observation = "displayed" }]
+
+[[trace]]
+name = "7961_ack_gated_media_success"
+capture = "cisco_7961_ack_gated_success_20260820"
+tcp_stream = 14
+outcome = "accepted"
+step = [
+  { sequence = 1, fixture = "open_receive_7961_v22_accepted_wildcard", frame_number = 1760, timestamp_epoch = "1787254046.762644000", inventory_sequence = 107, wire_validity = "exact", handset_observation = "acknowledged" },
+  { sequence = 2, fixture = "open_receive_ack_7961_v22_sanitized", frame_number = 1762, timestamp_epoch = "1787254046.901569000", inventory_sequence = 108, wire_validity = "exact", handset_observation = "emitted" },
+  { sequence = 3, fixture = "start_media_7961_v22_sanitized", frame_number = 1763, timestamp_epoch = "1787254046.902621000", inventory_sequence = 109, wire_validity = "exact", handset_observation = "acknowledged" },
+  { sequence = 4, fixture = "start_media_ack_7961_v22_sanitized", frame_number = 1770, timestamp_epoch = "1787254046.946585000", inventory_sequence = 118, wire_validity = "exact", handset_observation = "emitted" },
+]
+
+[[trace]]
+name = "7961_wildcard_open_receive_no_ack"
+capture = "cisco_7961_wildcard_no_ack_20260820"
+tcp_stream = 50
+outcome = "no_ack"
+step = [{ sequence = 1, fixture = "open_receive_7961_v22_no_ack_wildcard", frame_number = 610, timestamp_epoch = "1787250980.439015000", inventory_sequence = 60, wire_validity = "exact", handset_observation = "no_response" }]
+
+[[trace]]
+name = "7961_party_same_concrete_source_no_ack"
+capture = "cisco_7961_party_same_no_ack_20260820"
+tcp_stream = 11
+outcome = "no_ack"
+step = [{ sequence = 1, fixture = "open_receive_7961_v22_no_ack_concrete_sanitized", frame_number = 152, timestamp_epoch = "1787249782.721509000", inventory_sequence = 56, wire_validity = "exact", handset_observation = "no_response" }]

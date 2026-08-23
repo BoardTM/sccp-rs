@@ -1,0 +1,753 @@
+use super::super::*;
+use crate::media::formats::{OwnedNegotiatedVideo, negotiate_video_owned};
+use crate::runtime::controller::{VideoFallbackReason, VideoPlan, VideoPlanReadiness};
+use sccp_protocol::{
+    IpAddressType, MultimediaPayload, ProtocolVersion, RtpPayloadNumber, SessionGeneration,
+};
+
+pub fn handset_effect_call_id(effect: &HandsetEffect) -> Option<CallId> {
+    Some(effect.subject_call_id())
+}
+
+pub fn take_pending_retrieval_by_pbx(
+    access: &Access,
+    pbx_id: PbxCallId,
+) -> Option<PendingRetrieval> {
+    let mut pending = access.shared.pending_retrievals.lock_unpoisoned();
+    let call_id = pending
+        .iter()
+        .find(|(_, attempt)| attempt.pbx_id == pbx_id)
+        .map(|(call_id, _)| *call_id)?;
+    pending.remove(&call_id)
+}
+
+pub fn preferred_codec(
+    access: &Access,
+    device: &DeviceId,
+    line_instance: u32,
+    pbx_formats: &[PbxAudioFormat],
+) -> Option<Codec> {
+    let (codecs, capabilities) = codec_policy(access, device, line_instance)?;
+    preferred_codec_from_policy(
+        &codecs,
+        capabilities
+            .as_ref()
+            .map(StationMediaCapabilities::audio)
+            .filter(|capabilities| !capabilities.is_empty()),
+        pbx_formats,
+    )
+}
+
+fn codec_policy(
+    access: &Access,
+    device: &DeviceId,
+    line_instance: u32,
+) -> Option<(Vec<Codec>, Option<StationMediaCapabilities>)> {
+    let config = access.config();
+    let capabilities = controller_step(&access.shared.controller, |controller| {
+        controller
+            .registered_device(device)
+            .map(|state| state.capabilities.clone())
+    });
+    let codecs = config
+        .media_for_binding(&access.line_binding(device, line_instance)?)
+        .map(|media| media.codecs)
+        .or_else(|| {
+            config
+                .guest_hotline_binding(device, line_instance)
+                .map(|_| config.general.codecs.clone())
+        })?;
+    Some((codecs, capabilities))
+}
+
+struct SelectedVideo {
+    session_generation: SessionGeneration,
+    protocol: ProtocolVersion,
+    mode: VideoMode,
+    negotiated: OwnedNegotiatedVideo,
+    payload_type: RtpPayloadNumber,
+    payload: MultimediaPayload,
+}
+
+enum VideoSelection {
+    Disabled,
+    AudioOnly {
+        session_generation: SessionGeneration,
+        reason: VideoFallbackReason,
+    },
+    Ready(SelectedVideo),
+}
+
+impl VideoSelection {
+    fn ready(&self) -> Option<&SelectedVideo> {
+        match self {
+            Self::Ready(selected) => Some(selected),
+            Self::Disabled | Self::AudioOnly { .. } => None,
+        }
+    }
+}
+
+fn preferred_video(
+    access: &Access,
+    device: &DeviceId,
+    line_instance: u32,
+    pbx_formats: &[PbxVideoFormat],
+) -> VideoSelection {
+    let config = access.config();
+    let Some(binding) = access.line_binding(device, line_instance) else {
+        return VideoSelection::Disabled;
+    };
+    let Some(media) = config.media_for_binding(&binding) else {
+        return VideoSelection::Disabled;
+    };
+    if media.video_mode == VideoMode::Off {
+        return VideoSelection::Disabled;
+    }
+    let Some((session_generation, protocol, capabilities)) =
+        controller_step(&access.shared.controller, |controller| {
+            controller.registered_device(device).map(|state| {
+                (
+                    state.session_generation,
+                    state.registration.protocol,
+                    state.capabilities.clone(),
+                )
+            })
+        })
+    else {
+        return VideoSelection::Disabled;
+    };
+    let representable = pbx_formats
+        .iter()
+        .copied()
+        .filter(|format| format.payload_type().is_some())
+        .collect::<Vec<_>>();
+    let Ok(negotiated) = negotiate_video_owned(
+        &media.codecs,
+        capabilities,
+        &representable,
+        ReceiveTransmit::RECEIVE | ReceiveTransmit::TRANSMIT,
+    ) else {
+        return VideoSelection::AudioOnly {
+            session_generation,
+            reason: VideoFallbackReason::NotNegotiated,
+        };
+    };
+    let Some(payload_type) = negotiated.pbx_format.payload_type() else {
+        return VideoSelection::AudioOnly {
+            session_generation,
+            reason: VideoFallbackReason::DescriptorUnavailable,
+        };
+    };
+    let Ok(payload) = negotiated.multimedia_payload(payload_type) else {
+        return VideoSelection::AudioOnly {
+            session_generation,
+            reason: VideoFallbackReason::DescriptorUnavailable,
+        };
+    };
+    VideoSelection::Ready(SelectedVideo {
+        session_generation,
+        protocol,
+        mode: media.video_mode,
+        negotiated,
+        payload_type,
+        payload,
+    })
+}
+
+fn video_endpoint_is_supported(selected: &SelectedVideo, endpoint: MediaEndpointAddress) -> bool {
+    if selected.protocol < ProtocolVersion::V17 && endpoint.address.is_ipv6() {
+        return false;
+    }
+    match selected.negotiated.capability().address_type {
+        None | Some(IpAddressType::Ipv4) => endpoint.address.is_ipv4(),
+        Some(IpAddressType::Ipv6) => endpoint.address.is_ipv6(),
+        Some(IpAddressType::Ipv4AndIpv6) => true,
+        Some(IpAddressType::Invalid | IpAddressType::Unknown(_)) => false,
+    }
+}
+
+fn preferred_codec_from_policy(
+    configured: &[Codec],
+    station: Option<&[MediaCapability]>,
+    pbx_formats: &[PbxAudioFormat],
+) -> Option<Codec> {
+    negotiate_audio(configured, station, pbx_formats)
+        .ok()
+        .map(|negotiated| negotiated.codec)
+}
+
+/// Select the codec for an Asterisk-originated inbound channel request.
+///
+/// The original request capability set is compared with this exact station's
+/// mapped capabilities by Asterisk's translator graph. This avoids proving a
+/// path to the technology-wide union and then selecting an unreachable codec
+/// for a particular phone.
+pub unsafe fn preferred_inbound_codec(
+    access: &Access,
+    device: &DeviceId,
+    line_instance: u32,
+    requested: NonNull<sys::ast_format_cap>,
+) -> Option<Codec> {
+    let (codecs, capabilities) = codec_policy(access, device, line_instance)?;
+    let station = capabilities
+        .as_ref()
+        .map(StationMediaCapabilities::audio)
+        .filter(|capabilities| !capabilities.is_empty());
+    let ordered = station
+        .map(|capabilities| {
+            capabilities
+                .iter()
+                .map(|capability| capability.codec)
+                .filter(|codec| codecs.contains(codec))
+                .fold(Vec::new(), |mut ordered, codec| {
+                    if !ordered.contains(&codec) {
+                        ordered.push(codec);
+                    }
+                    ordered
+                })
+        })
+        .unwrap_or(codecs);
+    let candidates = ordered
+        .into_iter()
+        .filter_map(|codec| {
+            let format = pbx_audio_format(codec).ok()?;
+            let station_supports = station.is_none_or(|capabilities| {
+                capabilities.iter().any(|capability| {
+                    capability.codec == codec && capability.max_frames_per_packet != 0
+                })
+            });
+            station_supports.then_some((codec, format))
+        })
+        .collect::<Vec<_>>();
+    let destinations = candidates
+        .iter()
+        .map(|(_, format)| native_audio_format(*format))
+        .fold(Vec::new(), |mut formats, format| {
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+            formats
+        });
+    let selected =
+        unsafe { native_channel::best_translated_audio_format(requested, &destinations) }
+            .map(pbx_audio_format_from_native)?;
+    candidates
+        .into_iter()
+        .find_map(|(codec, format)| (format == selected).then_some(codec))
+}
+
+pub unsafe fn queue_unavailable(channel: *mut sys::ast_channel) {
+    if let Some(channel) = NonNull::new(channel) {
+        let _ = unsafe { native_channel::hangup(channel, REQUESTED_CHANNEL_UNAVAILABLE) };
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelAllocationOwner {
+    Asterisk,
+    Module,
+}
+
+pub fn allocate_channel(
+    access: &Access,
+    sccp_id: CallId,
+    pbx_id: PbxCallId,
+    binding: &LineBinding,
+    codec: Codec,
+    pbx_video_formats: &[PbxVideoFormat],
+    assigned_ids: *const sys::ast_assigned_ids,
+    requestor: *const sys::ast_channel,
+    metadata: Option<CallMetadata>,
+    owner: ChannelAllocationOwner,
+) -> bool {
+    let Some(format) = format_for(codec) else {
+        return false;
+    };
+    let line = c_string(&binding.line.number);
+    let context = c_string(&binding.line.context);
+    let caller_number = c_string(&binding.line.caller_number);
+    let caller_name = c_string(&binding.line.caller_name);
+    let config = access.config();
+    let metadata = match metadata {
+        Some(metadata) => metadata,
+        None => {
+            let Some(metadata) = configured_channel_metadata(access, &config, binding, pbx_id)
+            else {
+                return false;
+            };
+            metadata
+        }
+    };
+    let media_bind_address = c_string(&config.general.bind.ip().to_string());
+    let network = config.network_for_device(&binding.device_id);
+    let audio_qos = network
+        .map(|network| network.qos.audio)
+        .unwrap_or(config.general.qos.audio);
+    let video_qos = network
+        .map(|network| network.qos.video)
+        .unwrap_or(config.general.qos.video);
+    let selected_video = preferred_video(
+        access,
+        &binding.device_id,
+        binding.appearance.instance,
+        pbx_video_formats,
+    );
+    let symmetric_rtp =
+        station_nat_active(access, &config, &binding.device_id).unwrap_or_else(|| {
+            network.is_some_and(|network| matches!(network.nat, NatMode::On | NatMode::AutoOn))
+        });
+    let signaling_secure = controller_step(&access.shared.controller, |controller| {
+        controller
+            .registered_device(&binding.device_id)
+            .is_some_and(|device| device.registration.transport == StationTransport::Secure)
+    });
+    let assigned_uniqueid = access
+        .shared
+        .assigned_channel_ids
+        .lock_unpoisoned()
+        .get(&pbx_id)
+        .cloned()
+        .map(|uniqueid| c_string(&uniqueid));
+    let allocation = unsafe {
+        native_channel::allocate_channel(native_channel::ChannelAllocation {
+            line: &line,
+            context: &context,
+            caller_number: &caller_number,
+            caller_name: &caller_name,
+            identity: ChannelState { pbx_id, sccp_id }.into(),
+            format,
+            media_bind_address: &media_bind_address,
+            assigned_ids: assigned_ids.as_ref(),
+            assigned_uniqueid: assigned_uniqueid.as_deref(),
+            requestor,
+            rtp_policy: native_channel::RtpPolicy {
+                symmetric: symmetric_rtp,
+                dscp: audio_qos.dscp.0,
+                cos: audio_qos.cos.0,
+            },
+            video: selected_video.ready().map(|selected| {
+                native_channel::video::VideoRtpConfiguration {
+                    format: selected.negotiated.pbx_format,
+                    payload_type: selected.payload_type,
+                    media_bind_address: &media_bind_address,
+                    policy: native_channel::RtpPolicy {
+                        symmetric: symmetric_rtp,
+                        dscp: video_qos.dscp.0,
+                        cos: video_qos.cos.0,
+                    },
+                }
+            }),
+            security: native_channel::NativeChannelSecurity {
+                signaling: signaling_secure,
+                media: false,
+            },
+        })
+    };
+    let Ok(allocation) = allocation else {
+        return false;
+    };
+    for failure in allocation.qos.failures() {
+        ast_log(
+            LogLevel::Warning,
+            &format!("unable to apply configured audio socket QoS: {failure}"),
+        );
+    }
+    let (video_readiness, video_allocated) = match allocation.video {
+        native_channel::VideoRtpAllocation::Active(report) => {
+            for failure in report.failures() {
+                ast_log(
+                    LogLevel::Warning,
+                    &format!("unable to apply configured video socket QoS: {failure}"),
+                );
+            }
+            (Some(Ok(())), true)
+        }
+        native_channel::VideoRtpAllocation::Unavailable(error) => {
+            ast_log(
+                LogLevel::Warning,
+                &format!("unable to allocate optional video RTP: {error:?}"),
+            );
+            (Some(Err(VideoFallbackReason::NativeRtpUnavailable)), false)
+        }
+        native_channel::VideoRtpAllocation::NotRequested => (None, false),
+    };
+    let channel = allocation.channel.as_ptr();
+    let channel_metadata = AsteriskChannelMetadata::new();
+    let Ok(channel_borrow) = (unsafe { AsteriskChannel::from_raw(channel.cast()) }) else {
+        unsafe { queue_unavailable(channel) };
+        return false;
+    };
+    if let Err(error) = AsteriskCallCompletion::new().configure(&channel_borrow) {
+        ast_log(
+            LogLevel::Debug,
+            &format!("SCCP call completion is not active for this channel: {error}"),
+        );
+    }
+    if !requestor.is_null() {
+        let Ok(requestor_borrow) =
+            (unsafe { AsteriskChannel::from_raw((requestor as *mut sys::ast_channel).cast()) })
+        else {
+            unsafe { queue_unavailable(channel) };
+            return false;
+        };
+        if let Err(error) = channel_metadata.inherit_variables(&requestor_borrow, &channel_borrow) {
+            ast_log(
+                LogLevel::Warning,
+                &format!("unable to inherit PBX channel variables: {error}"),
+            );
+            unsafe { queue_unavailable(channel) };
+            return false;
+        }
+    }
+    if let Err(error) = channel_metadata.apply(&channel_borrow, &metadata) {
+        ast_log(
+            LogLevel::Warning,
+            &format!("unable to apply PBX channel metadata: {error}"),
+        );
+        unsafe { queue_unavailable(channel) };
+        return false;
+    }
+    let media = config.media_for_binding(binding);
+    let jitter = config.general.jitter_buffer;
+    if jitter.should_configure_channel(media.is_some_and(|media| media.direct_media)) {
+        if raw::bridge::configure_jitter_buffer(
+            &channel_borrow,
+            jitter.enabled,
+            jitter.forced,
+            jitter.log_frames,
+            jitter.max_size_ms,
+            jitter.resync_threshold_ms,
+            jitter.implementation,
+        )
+        .is_err()
+        {
+            unsafe { queue_unavailable(channel) };
+            return false;
+        }
+    }
+    let private_call = controller_step(&access.shared.controller, |controller| {
+        controller.call_privacy(sccp_id).unwrap_or(false)
+    });
+    if configure_pickup_policy(access, binding, channel, private_call).is_err() {
+        unsafe { queue_unavailable(channel) };
+        return false;
+    }
+    let parking_lot = access
+        .config()
+        .parking_for_line(&binding.line.number)
+        .and_then(|parking| parking.lot.clone());
+    if let Some(parking_lot) = parking_lot {
+        if raw::bridge::set_channel_parking_lot(&channel_borrow, &parking_lot).is_err() {
+            unsafe { queue_unavailable(channel) };
+            return false;
+        }
+    }
+    let Some(retained) = (unsafe { ChannelRef::acquire(channel) }) else {
+        unsafe { queue_unavailable(channel) };
+        return false;
+    };
+    access
+        .shared
+        .channels
+        .lock_unpoisoned()
+        .insert(pbx_id, ChannelBinding::new(retained));
+    let (installed, keep_video) = match selected_video {
+        VideoSelection::Disabled => (true, false),
+        VideoSelection::AudioOnly {
+            session_generation,
+            reason,
+        } => (
+            controller_step(&access.shared.controller, |controller| {
+                controller.set_video_audio_only_for_device(
+                    &binding.device_id,
+                    session_generation,
+                    sccp_id,
+                    reason,
+                )
+            }),
+            false,
+        ),
+        VideoSelection::Ready(selected) => {
+            let state = video_readiness.unwrap_or(Err(VideoFallbackReason::NativeRtpUnavailable));
+            match state {
+                Ok(()) => local_video_endpoint(access, pbx_id)
+                    .filter(|endpoint| video_endpoint_is_supported(&selected, *endpoint))
+                    .map_or_else(
+                        || {
+                            (
+                                controller_step(&access.shared.controller, |controller| {
+                                    controller.set_video_audio_only_for_device(
+                                        &binding.device_id,
+                                        selected.session_generation,
+                                        sccp_id,
+                                        VideoFallbackReason::LocalEndpointUnavailable,
+                                    )
+                                }),
+                                false,
+                            )
+                        },
+                        |local_endpoint| {
+                            let plan = VideoPlan {
+                                session_generation: selected.session_generation,
+                                protocol: selected.protocol,
+                                mode: selected.mode,
+                                negotiated: selected.negotiated,
+                                payload: selected.payload,
+                                local_endpoint,
+                            };
+                            let installed =
+                                controller_step(&access.shared.controller, |controller| {
+                                    controller.install_video_plan_for_device(
+                                        &binding.device_id,
+                                        sccp_id,
+                                        plan,
+                                        VideoPlanReadiness::Ready,
+                                    )
+                                });
+                            (installed, installed)
+                        },
+                    ),
+                Err(reason) => (
+                    controller_step(&access.shared.controller, |controller| {
+                        controller.set_video_audio_only_for_device(
+                            &binding.device_id,
+                            selected.session_generation,
+                            sccp_id,
+                            reason,
+                        )
+                    }),
+                    false,
+                ),
+            }
+        }
+    };
+    if !installed {
+        ast_log(
+            LogLevel::Warning,
+            &format!("unable to install video media state for call {pbx_id:?}"),
+        );
+    }
+    if video_allocated
+        && !keep_video
+        && (unsafe { native_channel::video::disable_video(NonNull::new_unchecked(channel)) })
+            .is_err()
+    {
+        let binding = access.shared.channels.lock_unpoisoned().remove(&pbx_id);
+        if let Some(binding) = binding {
+            drop(binding.close());
+        }
+        unsafe { queue_unavailable(channel) };
+        return false;
+    }
+    if owner == ChannelAllocationOwner::Asterisk
+        && (unsafe { native_channel::handoff_channel_to_asterisk(NonNull::new_unchecked(channel)) })
+            .is_err()
+    {
+        let binding = access.shared.channels.lock_unpoisoned().remove(&pbx_id);
+        if let Some(binding) = binding {
+            drop(binding.close());
+        }
+        unsafe { queue_unavailable(channel) };
+        return false;
+    }
+    true
+}
+
+pub fn configured_channel_metadata(
+    access: &Access,
+    config: &ModuleConfig,
+    binding: &LineBinding,
+    pbx_id: PbxCallId,
+) -> Option<CallMetadata> {
+    let (direction, digits, metadata) = controller_step(&access.shared.controller, |controller| {
+        let call = controller.pbx_call(pbx_id)?;
+        Some((call.direction, call.digits.clone(), call.metadata.clone()))
+    })?;
+    let device_variables = config
+        .devices
+        .get(&binding.device_id)
+        .map(|device| device.channel_variables.as_slice())
+        .unwrap_or_default();
+    let metadata = compose_channel_metadata(
+        metadata,
+        ConfiguredChannelMetadata {
+            direction,
+            caller_number: &binding.line.caller_number,
+            dialed_number: (!digits.is_empty()).then_some(digits.as_str()),
+            account_code: binding.line.account_code.as_deref(),
+            language: &binding.line.language,
+            device_variables,
+            line_variables: &binding.line.channel_variables,
+        },
+    )
+    .ok()?;
+    if !matches!(
+        controller_step(&access.shared.controller, |controller| {
+            controller.set_call_metadata(pbx_id, metadata.clone())
+        }),
+        Ok(true)
+    ) {
+        return None;
+    }
+    Some(metadata)
+}
+
+pub fn configure_pickup_policy(
+    access: &Access,
+    binding: &LineBinding,
+    channel: *mut sys::ast_channel,
+    private_call: bool,
+) -> Result<(), CallFeatureError> {
+    let config = access.config();
+    let pickup = config
+        .features_for_line(&binding.line.number)
+        .map(|features| &features.pickup);
+    let group_mask = |groups: Option<&std::collections::BTreeSet<u8>>| {
+        groups.into_iter().flatten().fold(0_u64, |mask, group| {
+            mask | 1_u64.checked_shl(u32::from(*group)).unwrap_or(0)
+        })
+    };
+    let call_groups = group_mask(pickup.map(|pickup| &pickup.call_groups));
+    let pickup_groups = group_mask(pickup.map(|pickup| &pickup.pickup_groups));
+    let named_call_groups = pickup
+        .map(|pickup| {
+            pickup
+                .named_call_groups
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let named_pickup_groups = pickup
+        .map(|pickup| {
+            pickup
+                .named_pickup_groups
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let channel = unsafe { AsteriskChannel::from_raw(channel.cast()) }.map_err(|_| {
+        CallFeatureError::InvalidInput {
+            operation: "configure pickup policy",
+        }
+    })?;
+    AsteriskCallFeatures::new().configure_pickup(
+        &channel,
+        call_groups,
+        pickup_groups,
+        &named_call_groups,
+        &named_pickup_groups,
+        private_call,
+    )
+}
+
+pub fn remove_channel(access: &Access, pbx_id: PbxCallId) {
+    let destination = access
+        .shared
+        .conference_destination_tasks
+        .lock_unpoisoned()
+        .cancel(pbx_id);
+    if let Some(destination) = destination {
+        ConferenceTaskCancellation::cancel(destination);
+    }
+    access
+        .shared
+        .media_anchors
+        .lock_unpoisoned()
+        .remove_call(pbx_id);
+    access
+        .shared
+        .media_anchor_restores
+        .lock_unpoisoned()
+        .remove_call(pbx_id);
+    access
+        .shared
+        .audio_packet_ms
+        .lock_unpoisoned()
+        .remove(&pbx_id);
+    access
+        .shared
+        .audio_preferences
+        .lock_unpoisoned()
+        .remove(&pbx_id);
+    access
+        .shared
+        .audio_encryption_admissions
+        .lock_unpoisoned()
+        .remove(&pbx_id);
+    access
+        .shared
+        .forwarded_calls
+        .lock_unpoisoned()
+        .remove(&pbx_id);
+    clear_no_answer_route(access, pbx_id);
+    let binding = access.shared.channels.lock_unpoisoned().remove(&pbx_id);
+    if let Some(binding) = binding {
+        drop(binding.close());
+    }
+}
+
+pub fn with_channel<T>(
+    access: &Access,
+    pbx_id: PbxCallId,
+    operation: impl FnOnce(*mut sys::ast_channel) -> T,
+) -> Option<T> {
+    let binding = channel_binding(access, pbx_id)?;
+    let permit = binding.enter()?;
+    Some(operation(permit.resource().as_ptr()))
+}
+
+pub fn channel_binding(access: &Access, pbx_id: PbxCallId) -> Option<Arc<ChannelBinding>> {
+    access
+        .shared
+        .channels
+        .lock_unpoisoned()
+        .get(&pbx_id)
+        .cloned()
+}
+
+pub fn with_two_channels<T>(
+    access: &Access,
+    first: PbxCallId,
+    second: PbxCallId,
+    operation: impl FnOnce(*mut sys::ast_channel, *mut sys::ast_channel) -> T,
+) -> Option<T> {
+    let (first_channel, second_channel) = retain_two_channels(access, first, second)?;
+    Some(operation(
+        first_channel.resource().as_ptr(),
+        second_channel.resource().as_ptr(),
+    ))
+}
+
+pub fn retain_two_channels(
+    access: &Access,
+    first: PbxCallId,
+    second: PbxCallId,
+) -> Option<(ChannelOperationPermit, ChannelOperationPermit)> {
+    let first = channel_binding(access, first)?;
+    let second = channel_binding(access, second)?;
+    Some((first.try_enter()?, second.try_enter()?))
+}
+
+pub fn with_channels<T>(
+    access: &Access,
+    call_ids: &[PbxCallId],
+    operation: impl FnOnce(&[*mut sys::ast_channel]) -> T,
+) -> Option<T> {
+    let bindings = call_ids
+        .iter()
+        .map(|call_id| channel_binding(access, *call_id))
+        .collect::<Option<Vec<_>>>()?;
+    let permits = bindings
+        .into_iter()
+        .map(|binding| binding.try_enter())
+        .collect::<Option<Vec<_>>>()?;
+    let pointers = permits
+        .iter()
+        .map(|permit| permit.resource().as_ptr())
+        .collect::<Vec<_>>();
+    Some(operation(&pointers))
+}

@@ -1,0 +1,14 @@
+[package]
+name = "chan-sccp2-config-checker"
+version = "0.0.0"
+edition = "2024"
+publish = false
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+asterisk-module = { path = "../../asterisk-module" }
+
+[dev-dependencies]
+tempfile.workspace = true
