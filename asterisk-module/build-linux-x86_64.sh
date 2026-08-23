@@ -32,6 +32,8 @@ case "${1:-}" in
 		;;
 esac
 
+asterisk_abi=${asterisk_version%%.*}
+
 if ! command -v docker >/dev/null 2>&1; then
 	printf 'error: Docker is required; install and start Docker Desktop first.\n' >&2
 	exit 1
@@ -60,5 +62,5 @@ docker buildx build \
 	--file "$script_dir/Dockerfile.linux-x86_64" \
 	"$repo_dir"
 
-artifact="$output_dir/chan_sccp2-asterisk-${asterisk_version}-linux-x86_64.so"
+artifact="$output_dir/chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"
 printf 'Built %s\n' "$artifact"

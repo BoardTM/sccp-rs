@@ -25,17 +25,17 @@ jobs:
             image: ubuntu:26.04
             package_family: deb
             asterisk_major: "22"
-            artifact: chan_sccp2-asterisk-22.7.0-linux-x86_64
+            artifact: chan_sccp2-asterisk-22-linux-x86_64
           - distro: Debian testing
             image: debian:testing-slim
             package_family: deb
             asterisk_major: "22"
-            artifact: chan_sccp2-asterisk-22.7.0-linux-x86_64
+            artifact: chan_sccp2-asterisk-22-linux-x86_64
           - distro: Fedora 45
             image: fedora:45
             package_family: rpm
             asterisk_major: "23"
-            artifact: chan_sccp2-asterisk-23.4.1-linux-x86_64
+            artifact: chan_sccp2-asterisk-23-linux-x86_64
 
     name: ${{ matrix.distro }} / Asterisk ${{ matrix.asterisk_major }}
 

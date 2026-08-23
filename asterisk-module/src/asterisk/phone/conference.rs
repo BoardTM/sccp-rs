@@ -1120,6 +1120,75 @@ pub(super) async fn execute_conference_invite_start(
     });
 }
 
+const CONFERENCE_BRIDGE_READY_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+const CONFERENCE_BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn is_transient_conference_bridge_readiness_error(
+    error: &EffectExecutionError<AsteriskBackendError, String>,
+) -> bool {
+    matches!(
+        error,
+        EffectExecutionError::Backend {
+            effect,
+            error: AsteriskBackendError::CallFeature(CallFeatureError::NotFound {
+                operation: "merge conference consultation",
+            }),
+            ..
+        } if matches!(
+            effect.as_ref(),
+            PbxEffect::Bridge {
+                operation: BridgeOperation::MergeConsultation { .. },
+            }
+        )
+    )
+}
+
+/// Asterisk documents that a two-party bridge can temporarily have no bridge
+/// (or fewer than two members) while its members finish joining. SCCP answer
+/// and soft-key events are asynchronous to that transition, so wait for the
+/// exact consultation-bridge lookup to become ready without retrying topology
+/// conflicts or native merge failures.
+async fn execute_conference_merge_effect(
+    access: &Access,
+    backend: &AsteriskBackend<'_>,
+    index: usize,
+    effect: DriverEffect,
+    mutation: ConferenceMutationToken,
+) -> Result<bool, EffectExecutionError<AsteriskBackendError, String>> {
+    let started = Instant::now();
+    let mut retries = 0_u32;
+    loop {
+        match execute_one_effect(access, backend, index, effect.clone()).await {
+            Ok(()) => {
+                if retries != 0 {
+                    ast_log(
+                        LogLevel::Debug,
+                        &format!(
+                            "conference bridge became ready after {retries} retr{}",
+                            if retries == 1 { "y" } else { "ies" }
+                        ),
+                    );
+                }
+                return Ok(true);
+            }
+            Err(error)
+                if is_transient_conference_bridge_readiness_error(&error)
+                    && started.elapsed() < CONFERENCE_BRIDGE_READY_TIMEOUT =>
+            {
+                if !conference_mutation_is_active(access, mutation) {
+                    return Ok(false);
+                }
+                retries += 1;
+                tokio::time::sleep(CONFERENCE_BRIDGE_READY_RETRY_INTERVAL).await;
+                if !conference_mutation_is_active(access, mutation) {
+                    return Ok(false);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub(super) async fn execute_conference_merge(
     access: &Access,
     session: crate::runtime::controller::ConferenceSession,
@@ -1141,34 +1210,43 @@ pub(super) async fn execute_conference_merge(
             })
         );
         let completed_resume = matches!(effect, DriverEffect::Backend(PbxEffect::Resume { .. }));
-        if let Err(error) = execute_one_effect(access, &backend, index, effect).await {
-            ast_log(
-                LogLevel::Warning,
-                &format!("conference merge failed: {error}"),
-            );
-            let cleanup = controller_step(&access.shared.controller, |controller| {
-                if !controller.conference_mutation_is_active(mutation) {
-                    return Vec::new();
-                }
-                let cleanup = controller.abort_conference(
-                    session.consultation_handset_call_id,
-                    bridge_created,
-                    true,
-                    !original_resumed,
-                    true,
+        let completed =
+            execute_conference_merge_effect(access, &backend, index, effect, mutation).await;
+        let completed = match completed {
+            Ok(completed) => completed,
+            Err(error) => {
+                ast_log(
+                    LogLevel::Warning,
+                    &format!("conference merge failed: {error}"),
                 );
-                controller.complete_conference_mutation(mutation);
-                cleanup
-            });
-            execute_cleanup_effects(access, cleanup).await;
+                let cleanup = controller_step(&access.shared.controller, |controller| {
+                    if !controller.conference_mutation_is_active(mutation) {
+                        return Vec::new();
+                    }
+                    let cleanup = controller.abort_conference(
+                        session.consultation_handset_call_id,
+                        bridge_created,
+                        true,
+                        !original_resumed,
+                        true,
+                    );
+                    controller.complete_conference_mutation(mutation);
+                    cleanup
+                });
+                execute_cleanup_effects(access, cleanup).await;
+                remove_channel(access, session.consultation_call_id);
+                display_conference_prompt(
+                    access,
+                    session.device_id,
+                    session.original_handset_call_id,
+                    "Unable to create conference",
+                )
+                .await;
+                return;
+            }
+        };
+        if !completed {
             remove_channel(access, session.consultation_call_id);
-            display_conference_prompt(
-                access,
-                session.device_id,
-                session.original_handset_call_id,
-                "Unable to create conference",
-            )
-            .await;
             return;
         }
         bridge_created |= completed_create;

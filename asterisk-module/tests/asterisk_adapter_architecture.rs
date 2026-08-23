@@ -708,3 +708,34 @@ fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
     assert!(!workflow.contains("test-native-lifecycle.sh"));
     assert!(workflow.contains("rust_sccp_|sccp_ast_"));
 }
+
+#[test]
+fn release_artifacts_are_named_for_the_asterisk_abi_lane() {
+    let script = fs::read_to_string(crate_root().join("build-linux-x86_64.sh")).unwrap();
+    assert!(script.contains("asterisk_abi=${asterisk_version%%.*}"));
+    assert!(script.contains("chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"));
+    assert!(!script.contains("chan_sccp2-asterisk-${asterisk_version}-linux-x86_64.so"));
+
+    let docker = fs::read_to_string(crate_root().join("Dockerfile.linux-x86_64")).unwrap();
+    assert!(docker.contains("asterisk_abi=\"${ASTERISK_VERSION%%.*}\""));
+    assert!(docker.contains("chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"));
+    assert!(!docker.contains("chan_sccp2-asterisk-${ASTERISK_VERSION}-linux-x86_64.so"));
+
+    let crate_directory = crate_root();
+    let repository = crate_directory.parent().unwrap();
+    let release =
+        fs::read_to_string(repository.join(".github/workflows/asterisk-module.yml")).unwrap();
+    let compatibility =
+        fs::read_to_string(repository.join(".github/workflows/asterisk-distro-compatibility.yml"))
+            .unwrap();
+    for lane in ["22", "23"] {
+        let artifact = format!("chan_sccp2-asterisk-{lane}-linux-x86_64");
+        assert!(release.contains(&artifact));
+        assert!(compatibility.contains(&artifact));
+    }
+    for patch in ["22.7.0", "23.4.1"] {
+        let artifact = format!("chan_sccp2-asterisk-{patch}-linux-x86_64");
+        assert!(!release.contains(&artifact));
+        assert!(!compatibility.contains(&artifact));
+    }
+}

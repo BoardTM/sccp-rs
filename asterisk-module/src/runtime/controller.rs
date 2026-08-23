@@ -5957,15 +5957,14 @@ impl Controller {
             stored.phase = ConferencePhase::Merging;
         }
         debug_assert!(self.invariant_error().is_none());
+        // Preserve both live two-party bridges until the atomic merge owns
+        // them. Queueing Unhold first lets Asterisk transiently reconfigure
+        // the original bridge before the immediately following lookup.
         let mut effects = vec![
             PbxEffect::Bridge {
                 operation: crate::runtime::backend::BridgeOperation::Create {
                     bridge_id: session.bridge_id,
                 },
-            }
-            .into(),
-            PbxEffect::Resume {
-                call_id: session.original_call_id,
             }
             .into(),
             PbxEffect::Bridge {
@@ -5974,6 +5973,10 @@ impl Controller {
                     original_call_id: session.original_call_id,
                     consultation_call_id: session.consultation_call_id,
                 },
+            }
+            .into(),
+            PbxEffect::Resume {
+                call_id: session.original_call_id,
             }
             .into(),
         ];
@@ -17769,15 +17772,15 @@ mod tests {
                         bridge_id: PbxBridgeId(1),
                     },
                 }),
-                DriverEffect::Backend(PbxEffect::Resume {
-                    call_id: PbxCallId(1),
-                }),
                 DriverEffect::Backend(PbxEffect::Bridge {
                     operation: crate::runtime::backend::BridgeOperation::MergeConsultation {
                         bridge_id: PbxBridgeId(1),
                         original_call_id: PbxCallId(1),
                         consultation_call_id: PbxCallId(2),
                     },
+                }),
+                DriverEffect::Backend(PbxEffect::Resume {
+                    call_id: PbxCallId(1),
                 }),
             ]
         );
@@ -18140,7 +18143,7 @@ mod tests {
             assert!(!participant_muted(&controller, CallId(2), 2));
             let effects = controller.confirm_conference(CallId(2)).unwrap();
             assert!(matches!(
-                effects.get(2),
+                effects.get(1),
                 Some(DriverEffect::Backend(PbxEffect::Bridge {
                     operation: crate::runtime::backend::BridgeOperation::MergeConsultation { .. }
                 }))

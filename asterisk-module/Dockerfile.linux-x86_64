@@ -57,8 +57,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && ! grep -Eq ' [TDB] (rust_sccp_|sccp_ast_)' \
         /tmp/chan-sccp2-exported-symbols \
     && mkdir /output \
+    && asterisk_abi="${ASTERISK_VERSION%%.*}" \
     && cp target/release/libchan_sccp2.so \
-        "/output/chan_sccp2-asterisk-${ASTERISK_VERSION}-linux-x86_64.so"
+        "/output/chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"
 
 FROM scratch AS artifact
 COPY --from=build /output/ /
