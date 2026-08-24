@@ -683,7 +683,7 @@ fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
     assert!(script.contains("autoload = no"));
     assert!(!script.contains("autoload = yes"));
 
-    let docker = fs::read_to_string(crate_root().join("Dockerfile.linux-x86_64")).unwrap();
+    let docker = fs::read_to_string(crate_root().join("Dockerfile.linux")).unwrap();
     assert!(docker.contains("make include/asterisk/buildopts.h"));
     assert!(!docker.contains("make -j"));
     assert!(!docker.contains("make install"));
@@ -710,16 +710,19 @@ fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
 }
 
 #[test]
-fn release_artifacts_are_named_for_the_asterisk_abi_lane() {
+fn release_artifacts_are_named_for_the_oldest_compatible_abi_baseline() {
     let script = fs::read_to_string(crate_root().join("build-linux-x86_64.sh")).unwrap();
     assert!(script.contains("asterisk_abi=${asterisk_version%%.*}"));
     assert!(script.contains("chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"));
     assert!(!script.contains("chan_sccp2-asterisk-${asterisk_version}-linux-x86_64.so"));
 
-    let docker = fs::read_to_string(crate_root().join("Dockerfile.linux-x86_64")).unwrap();
-    assert!(docker.contains("asterisk_abi=\"${ASTERISK_VERSION%%.*}\""));
-    assert!(docker.contains("chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"));
-    assert!(!docker.contains("chan_sccp2-asterisk-${ASTERISK_VERSION}-linux-x86_64.so"));
+    let docker = fs::read_to_string(crate_root().join("Dockerfile.linux")).unwrap();
+    assert!(docker.contains("ASTERISK_ARTIFACT_LANE"));
+    assert!(docker.contains("artifact_lane=\"${ASTERISK_ARTIFACT_LANE:-"));
+    assert!(docker.contains("amd64) artifact_arch=x86_64"));
+    assert!(docker.contains("arm64) artifact_arch=aarch64"));
+    assert!(docker.contains("chan_sccp2-asterisk-${artifact_lane}-linux-${artifact_arch}.so"));
+    assert!(!docker.contains("chan_sccp2-asterisk-${ASTERISK_VERSION}-linux-"));
 
     let crate_directory = crate_root();
     let repository = crate_directory.parent().unwrap();
@@ -728,14 +731,26 @@ fn release_artifacts_are_named_for_the_asterisk_abi_lane() {
     let compatibility =
         fs::read_to_string(repository.join(".github/workflows/asterisk-distro-compatibility.yml"))
             .unwrap();
-    for lane in ["22", "23"] {
-        let artifact = format!("chan_sccp2-asterisk-{lane}-linux-x86_64");
+    for architecture in ["x86_64", "aarch64"] {
+        let artifact = format!("chan_sccp2-asterisk-22plus-linux-{architecture}");
         assert!(release.contains(&artifact));
         assert!(compatibility.contains(&artifact));
     }
-    for patch in ["22.7.0", "23.4.1"] {
-        let artifact = format!("chan_sccp2-asterisk-{patch}-linux-x86_64");
-        assert!(!release.contains(&artifact));
-        assert!(!compatibility.contains(&artifact));
+
+    for lane in ["22", "23", "22.7.0", "23.4.1"] {
+        for architecture in ["x86_64", "aarch64"] {
+            let artifact = format!("chan_sccp2-asterisk-{lane}-linux-{architecture}");
+            assert!(!release.contains(&artifact));
+            assert!(!compatibility.contains(&artifact));
+        }
     }
+
+    assert!(release.contains("runs-on: ubuntu-24.04-arm"));
+    assert!(release.contains("--platform linux/arm64"));
+    assert!(release.contains("publish: false"));
+    assert!(release.contains("if: matrix.publish"));
+    assert!(compatibility.contains("runner: ubuntu-24.04-arm"));
+
+    let build = fs::read_to_string(crate_root().join("build.rs")).unwrap();
+    assert!(build.contains("\"x86_64\" | \"aarch64\""));
 }

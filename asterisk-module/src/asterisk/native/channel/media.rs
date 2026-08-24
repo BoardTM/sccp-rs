@@ -1,6 +1,6 @@
 //! Channel format capability and RTP endpoint operations.
 
-use std::ffi::{CStr, CString, c_int};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::net::{IpAddr, SocketAddr};
 use std::ptr::NonNull;
 
@@ -40,7 +40,7 @@ pub unsafe fn send_digit_begin(
 ) -> Result<(), MediaOperationError> {
     unsafe {
         with_locked_rtp(channel, |rtp| {
-            (sys::ast_rtp_instance_dtmf_begin(rtp.as_ptr(), digit as i8) == 0)
+            (sys::ast_rtp_instance_dtmf_begin(rtp.as_ptr(), c_char::from_ne_bytes([digit])) == 0)
                 .then_some(())
                 .ok_or(MediaOperationError::Rejected)
         })
@@ -54,8 +54,11 @@ pub unsafe fn send_digit_end(
 ) -> Result<(), MediaOperationError> {
     unsafe {
         with_locked_rtp(channel, |rtp| {
-            (sys::ast_rtp_instance_dtmf_end_with_duration(rtp.as_ptr(), digit as i8, duration_ms)
-                == 0)
+            (sys::ast_rtp_instance_dtmf_end_with_duration(
+                rtp.as_ptr(),
+                c_char::from_ne_bytes([digit]),
+                duration_ms,
+            ) == 0)
                 .then_some(())
                 .ok_or(MediaOperationError::Rejected)
         })

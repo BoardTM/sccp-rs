@@ -20,10 +20,12 @@ fn main() {
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    if (target_os != "linux" || target_arch != "x86_64")
+    if (target_os != "linux" || !matches!(target_arch.as_str(), "x86_64" | "aarch64"))
         && env::var_os("SCCP_ALLOW_UNSUPPORTED_TARGET").is_none()
     {
-        panic!("the first supported module target is Linux x86_64, got {target_os} {target_arch}");
+        panic!(
+            "supported module targets are Linux x86_64 and aarch64, got {target_os} {target_arch}"
+        );
     }
 
     let crate_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());

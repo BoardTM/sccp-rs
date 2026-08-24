@@ -81,11 +81,13 @@ jobs:
       matrix:
         include:
           - asterisk: 22.7.0
-            abi: "22"
+            abi: 22plus
             feature: asterisk-22
+            publish: true
           - asterisk: 23.4.1
             abi: "23"
             feature: asterisk-23
+            publish: false
 
     steps:
       - uses: actions/checkout@v7
@@ -135,9 +137,47 @@ jobs:
           cp target/release/libchan_sccp2.so "chan_sccp2-asterisk-${{ matrix.abi }}-linux-x86_64.so"
 
       - uses: actions/upload-artifact@v4
+        if: matrix.publish
         with:
           name: chan_sccp2-asterisk-${{ matrix.abi }}-linux-x86_64
           path: chan_sccp2-asterisk-${{ matrix.abi }}-linux-x86_64.so
+          if-no-files-found: error
+          retention-days: 1
+
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asterisk: 22.7.0
+            abi: 22plus
+            feature: asterisk-22
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and verify ARM64 ELF module
+        run: |
+          docker buildx build \
+            --pull \
+            --platform linux/arm64 \
+            --progress plain \
+            --build-arg "ASTERISK_VERSION=${{ matrix.asterisk }}" \
+            --build-arg "ASTERISK_FEATURE=${{ matrix.feature }}" \
+            --build-arg "ASTERISK_ARTIFACT_LANE=${{ matrix.abi }}" \
+            --cache-from "type=gha,scope=asterisk-arm64-${{ matrix.abi }}" \
+            --cache-to "type=gha,mode=max,scope=asterisk-arm64-${{ matrix.abi }}" \
+            --output type=local,dest=dist \
+            --file asterisk-module/Dockerfile.linux \
+            .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chan_sccp2-asterisk-${{ matrix.abi }}-linux-aarch64
+          path: dist/chan_sccp2-asterisk-${{ matrix.abi }}-linux-aarch64.so
           if-no-files-found: error
           retention-days: 1
 
@@ -147,6 +187,7 @@ jobs:
       - realtime
       - config-checker
       - build
+      - build-arm64
     runs-on: ubuntu-26.04
     permissions:
       actions: read
@@ -173,11 +214,11 @@ jobs:
             exit 0
           fi
           gh release create "$release_tag" \
-            dist/chan_sccp2-asterisk-22-linux-x86_64.so \
-            dist/chan_sccp2-asterisk-23-linux-x86_64.so \
+            dist/chan_sccp2-asterisk-22plus-linux-x86_64.so \
+            dist/chan_sccp2-asterisk-22plus-linux-aarch64.so \
             dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "chan_sccp2 modules ${GITHUB_SHA}" \
-            --notes "Automated Linux x86_64 modules for the Asterisk 22 and 23 ABI lanes, built against Asterisk 22.7.0 and 23.4.1 respectively." \
+            --notes "Automated Linux x86_64 and ARM64/aarch64 modules for the Asterisk 22+ ABI generation. Built against Asterisk 22.7.0 and compatibility-tested with Asterisk 22 and 23." \
             --latest

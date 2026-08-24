@@ -2,8 +2,8 @@
 //!
 //! The crate intentionally has a development mode that does not require an
 //! Asterisk checkout. Production modules are built with exactly one of the
-//! `asterisk-22` or `asterisk-23` features and against a configured Asterisk
-//! source/build tree.
+//! `asterisk-22` or `asterisk-23` baseline features and against a configured
+//! Asterisk source/build tree.
 //!
 //! Public modules follow domain ownership: [`call`], [`config`], [`media`],
 //! [`conference`], [`presence`], and [`state`] contain policy and state;
@@ -15,10 +15,10 @@
 //!
 //! - The default `development` feature keeps native Asterisk headers out of
 //!   ordinary tests and documentation builds.
-//! - `asterisk-22` and `asterisk-23` are mutually exclusive ABI lanes. A
+//! - `asterisk-22` and `asterisk-23` are mutually exclusive ABI baselines. A
 //!   production artifact is generated from one configured source tree and may
-//!   run on distribution builds and patch releases in that same major lane.
-//!   Module startup rejects every other Asterisk major.
+//!   run on that Asterisk major or newer majors in the same ABI generation.
+//!   Module startup rejects majors older than its compiled baseline.
 //! - The crate emits `libchan_sccp2.so`; installation renames that Cargo output
 //!   to `chan_sccp2.so`. Bindgen's configured Asterisk ABI remains private to
 //!   the Rust-native adapter.

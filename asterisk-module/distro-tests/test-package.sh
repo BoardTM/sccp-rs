@@ -42,6 +42,7 @@ asterisk_module_dir=
 for candidate in \
 	/usr/lib64/asterisk/modules \
 	/usr/lib/x86_64-linux-gnu/asterisk/modules \
+	/usr/lib/aarch64-linux-gnu/asterisk/modules \
 	/usr/lib/asterisk/modules; do
 	if [ -d "$candidate" ]; then
 		asterisk_module_dir=$candidate

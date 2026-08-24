@@ -16,28 +16,50 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
-    runs-on: ubuntu-26.04
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - distro: Ubuntu 26.04
+            architecture: x86_64
+            runner: ubuntu-26.04
             image: ubuntu:26.04
             package_family: deb
             asterisk_major: "22"
-            artifact: chan_sccp2-asterisk-22-linux-x86_64
+            artifact: chan_sccp2-asterisk-22plus-linux-x86_64
           - distro: Debian testing
+            architecture: x86_64
+            runner: ubuntu-26.04
             image: debian:testing-slim
             package_family: deb
             asterisk_major: "22"
-            artifact: chan_sccp2-asterisk-22-linux-x86_64
+            artifact: chan_sccp2-asterisk-22plus-linux-x86_64
           - distro: Fedora 45
+            architecture: x86_64
+            runner: ubuntu-26.04
             image: fedora:45
             package_family: rpm
             asterisk_major: "23"
-            artifact: chan_sccp2-asterisk-23-linux-x86_64
+            artifact: chan_sccp2-asterisk-22plus-linux-x86_64
+          - distro: Ubuntu 26.04
+            architecture: aarch64
+            runner: ubuntu-24.04-arm
+            image: ubuntu:26.04
+            package_family: deb
+            asterisk_major: "22"
+            artifact: chan_sccp2-asterisk-22plus-linux-aarch64
+          - distro: Fedora 45
+            architecture: aarch64
+            runner: ubuntu-24.04-arm
+            image: fedora:45
+            package_family: rpm
+            asterisk_major: "23"
+            artifact: chan_sccp2-asterisk-22plus-linux-aarch64
 
-    name: ${{ matrix.distro }} / Asterisk ${{ matrix.asterisk_major }}
+    name: >-
+      ${{ matrix.distro }} ${{ matrix.architecture }} /
+      Asterisk ${{ matrix.asterisk_major }}
 
     steps:
       - uses: actions/checkout@v7

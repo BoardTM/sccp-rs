@@ -25,6 +25,8 @@ RUN apt-get update \
 
 ARG ASTERISK_VERSION
 ARG ASTERISK_FEATURE
+ARG ASTERISK_ARTIFACT_LANE
+ARG TARGETARCH
 
 RUN git clone --depth 1 --branch "${ASTERISK_VERSION}" \
         https://github.com/asterisk/asterisk.git /opt/asterisk \
@@ -45,9 +47,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/workspace/target \
     cargo build --locked --release -p asterisk-module --no-default-features \
         --features "${ASTERISK_FEATURE}" \
+    && case "${TARGETARCH}" in \
+        amd64) artifact_arch=x86_64; elf_machine='Advanced Micro Devices X86-64' ;; \
+        arm64) artifact_arch=aarch64; elf_machine=AArch64 ;; \
+        *) printf 'unsupported Docker target architecture: %s\n' "${TARGETARCH}" >&2; exit 2 ;; \
+    esac \
     && readelf -h target/release/libchan_sccp2.so > /tmp/chan-sccp2-elf-header \
-    && grep -q 'Machine:.*Advanced Micro Devices X86-64' \
-        /tmp/chan-sccp2-elf-header \
+    && grep -q "Machine:.*${elf_machine}" /tmp/chan-sccp2-elf-header \
     && readelf -d target/release/libchan_sccp2.so > /tmp/chan-sccp2-elf-dynamic \
     && grep -q 'SONAME.*chan_sccp2.so' /tmp/chan-sccp2-elf-dynamic \
     && nm -D --defined-only target/release/libchan_sccp2.so \
@@ -57,9 +63,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && ! grep -Eq ' [TDB] (rust_sccp_|sccp_ast_)' \
         /tmp/chan-sccp2-exported-symbols \
     && mkdir /output \
-    && asterisk_abi="${ASTERISK_VERSION%%.*}" \
+    && artifact_lane="${ASTERISK_ARTIFACT_LANE:-${ASTERISK_VERSION%%.*}}" \
     && cp target/release/libchan_sccp2.so \
-        "/output/chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"
+        "/output/chan_sccp2-asterisk-${artifact_lane}-linux-${artifact_arch}.so"
 
 FROM scratch AS artifact
 COPY --from=build /output/ /

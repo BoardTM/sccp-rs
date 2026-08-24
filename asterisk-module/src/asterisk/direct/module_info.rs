@@ -39,11 +39,19 @@ unsafe extern "C" fn reload() -> c_int {
     })
 }
 
-fn version_matches_lane(version: &[u8]) -> bool {
-    version
+fn numeric_major(version: &[u8]) -> Option<u32> {
+    let major = version
         .split(|byte| *byte == b'.')
         .next()
-        .is_some_and(|major| major == env!("SCCP_ASTERISK_LANE").as_bytes())
+        .filter(|major| !major.is_empty())?;
+    std::str::from_utf8(major).ok()?.parse().ok()
+}
+
+fn version_matches_lane(version: &[u8]) -> bool {
+    let Some(baseline) = numeric_major(env!("SCCP_ASTERISK_LANE").as_bytes()) else {
+        return false;
+    };
+    numeric_major(version).is_some_and(|major| major >= baseline)
 }
 
 fn running_asterisk_matches_lane() -> bool {
@@ -67,7 +75,7 @@ unsafe extern "C" fn register_module() {
         info.flags = sys::AST_MODFLAG_LOAD_ORDER;
         // An empty sum is Asterisk's supported opt-out from its exact build
         // option checksum. Release modules intentionally span distribution
-        // builds and patch releases within one explicitly checked major lane.
+        // builds and patch releases within the explicitly checked ABI lane.
         info.buildopt_sum = [0; 33];
         info.load_pri = sys::AST_MODPRI_CHANNEL_DRIVER as u8;
         info.support_level = sys::AST_MODULE_SUPPORT_EXTENDED;
@@ -120,13 +128,17 @@ mod tests {
     use super::version_matches_lane;
 
     #[test]
-    fn release_lane_accepts_patch_versions_and_rejects_other_majors() {
-        let lane = env!("SCCP_ASTERISK_LANE");
+    fn release_lane_accepts_its_baseline_and_newer_majors() {
+        let lane = env!("SCCP_ASTERISK_LANE").parse::<u32>().unwrap();
         assert!(version_matches_lane(format!("{lane}.0.0").as_bytes()));
         assert!(version_matches_lane(format!("{lane}.99.1-rc1").as_bytes()));
+        assert!(version_matches_lane(format!("{}.0.0", lane + 1).as_bytes()));
 
-        let other = if lane == "22" { "23.4.1" } else { "22.7.0" };
-        assert!(!version_matches_lane(other.as_bytes()));
-        assert!(!version_matches_lane(b""));
+        assert!(!version_matches_lane(
+            format!("{}.99.0", lane - 1).as_bytes()
+        ));
+        for malformed in [b"".as_slice(), b"dev", b"22beta", b".22"] {
+            assert!(!version_matches_lane(malformed));
+        }
     }
 }

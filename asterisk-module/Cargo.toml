@@ -3,7 +3,7 @@ name = "asterisk-module"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
-description = "Rust SCCP channel driver for Asterisk 22 and 23"
+description = "Rust SCCP channel driver for Asterisk 22 and newer"
 publish = false
 authors.workspace = true
 license.workspace = true
@@ -19,7 +19,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # Ordinary workspace builds exercise the Asterisk-independent parts of the
 # adapter. A release module must disable this feature and select exactly one
-# Asterisk ABI lane.
+# Asterisk ABI baseline.
 default = ["development"]
 development = []
 asterisk-22 = []

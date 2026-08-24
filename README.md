@@ -26,11 +26,11 @@ The crate deliberately contains no SIP or PBX policy. It can be used as the phon
 
 ## Asterisk Module
 
-In `asterisk-module` you will find a completely new channel driver called `chan_sccp2`, written in Rust. It targets Asterisk 22 and 23; production builds select one of those major-version ABI lanes and reject a different major at load time.
+In `asterisk-module` you will find a completely new channel driver called `chan_sccp2`, written in Rust. The current production module targets the Asterisk 22+ ABI generation: it is built against Asterisk 22, accepts newer majors, and is currently tested with Asterisk 22 and 23.
 
 The driver exposes SCCP as a native Asterisk channel and connects the protocol server to Asterisk's dialplan, RTP/media, device state, hints, message waiting, parking, pickup, transfers, conferencing, call forwarding, CLI, AMI, and realtime configuration. It is a new **completely new** implementation built on `sccp-protocol`, not a fork of the old `chan_sccp` module.
 
-You can find the latest [pre-compiled release](https://github.com/coral/sccp-rs/releases) if you'd rather just sling an .so from the internet, if not then the easiest way to produce a Linux x86-64 module is with Docker.
+You can find the latest [pre-compiled release](https://github.com/coral/sccp-rs/releases) for Linux x86-64 and ARM64/aarch64. This includes 64-bit Raspberry Pi 4 and 5 systems. If you'd rather build the x86-64 module locally, the easiest path is Docker.
 
 ```sh
 # For Asterisk 22
@@ -39,13 +39,13 @@ You can find the latest [pre-compiled release](https://github.com/coral/sccp-rs/
 ./asterisk-module/build-linux-x86_64.sh 23
 ```
 
-The artifact is written to `dist/chan_sccp2-asterisk-<major>-linux-x86_64.so`. Install it in Asterisk's module directory as `chan_sccp2.so`, copy `asterisk-module/sccp.conf.example` ( or [copy it from here](https://github.com/coral/sccp-rs/blob/master/asterisk-module/sccp.conf.example)) to Asterisk's configuration directory as `sccp.conf`, and edit the example device and line definitions for your phones.
+The local artifact is written to `dist/chan_sccp2-asterisk-<major>-linux-x86_64.so`; published releases use `22plus` to identify the current ABI baseline. Install it in Asterisk's module directory as `chan_sccp2.so`, copy `asterisk-module/sccp.conf.example` ( or [copy it from here](https://github.com/coral/sccp-rs/blob/master/asterisk-module/sccp.conf.example)) to Asterisk's configuration directory as `sccp.conf`, and edit the example device and line definitions for your phones.
 
 *Why is there only one .so file? Doesn't Asterisk modules normally need to be compiled for each distribution and exact Asterisk build?*
 
 Many Asterisk modules depend heavily on Asterisk internals and compile-time features, which ties their binaries to the distribution's particular Asterisk package and build options. `chan_sccp2` keeps that dependency behind a deliberately narrow native adapter. The SCCP wire protocol, Cisco IP Phone XML, TCP/TLS servers, runtime, thread pool, call state machines, and most feature policy are implemented independently in Rust rather than inherited from the host Asterisk build.
 
-The remaining boundary is Asterisk's C ABI. Release modules deliberately opt out of Asterisk's exact build-option checksum and instead select and verify one major-version ABI lane at load time. This doesn't work for another CPU architecture, a non-glibc system etc but should work in most cases. If you happen to find yourself in that situation, compiling this is easy thanks to the tooling in Rust
+The remaining boundary is Asterisk's C ABI. Release modules deliberately opt out of Asterisk's exact build-option checksum and instead verify that the running major is at least their ABI baseline. If a future Asterisk major breaks this ABI generation, releases will add a new baseline artifact at that point. Release files are architecture-specific and require a glibc-based Linux system. If you happen to use another platform, compiling this is easy thanks to the tooling in Rust.
 
 ## SCCP<->SIP app
 
@@ -67,7 +67,7 @@ in progress
 
 | Area | Supported | Not supported |
 | --- | --- | --- |
-| Platform | Asterisk 22 and 23 on Linux x86-64 | Other Asterisk majors |
+| Platform | Asterisk 22+ on Linux x86-64 and ARM64/aarch64; currently tested with 22 and 23 | Asterisk 21 and older, 32-bit ARM, and non-glibc systems |
 | Signaling and network | SCCP over TCP or TLS, IPv4/IPv6, NAT address selection, DSCP/COS, registration failover, and per-device transport policy | Configured network/hostname ACL admission |
 | Calling features | Inbound/outbound calls, hold, call waiting, auto-answer, shared lines, transfer, forwarding, pickup, park, barge, DND/privacy, voicemail/MWI, BLF/hints, mobility, call completion, recording, and conferencing | Phone firmware/TFTP provisioning and a built-in PBX or SIP stack |
 | Audio media | Native RTP, early media, jitter buffer, direct RTP, DTMF, and mapped G.711/G.722/G.723/G.729/G.726, GSM, iLBC, Siren7, SLIN16, and Opus | Protected/SRTP media and SCCP codecs with no Asterisk format mapping |

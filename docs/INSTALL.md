@@ -13,26 +13,40 @@ your distribution.
 
 The published modules currently support:
 
-- Asterisk 22 or Asterisk 23
-- 64-bit x86 Linux (`x86_64`)
+- Asterisk 22 or newer (currently tested with Asterisk 22 and 23)
+- 64-bit x86 Linux (`x86_64`) or 64-bit ARM Linux (`aarch64`)
 - A glibc-based Linux distribution
 
-There is a separate `.so` for each supported Asterisk major version. Patch
-releases within the same major use the same file: for example, every Asterisk
-22.x installation uses the Asterisk 22 build.
+There is one `.so` per CPU architecture for the current Asterisk 22+ ABI
+generation. It is built against Asterisk 22 and accepts newer Asterisk majors.
+If a future major introduces an incompatible ABI change, releases will add a
+new baseline-specific file at that point.
 
-If the first command reports Asterisk 22, download the file with `asterisk-22`
-in its name. If it reports Asterisk 23, use the `asterisk-23` file. Do not try
-to load the other build; the module checks the running Asterisk major and will
-decline to load when it does not match.
+The ARM64 build supports Raspberry Pi 4 and Raspberry Pi 5 systems running a
+64-bit OS, such as 64-bit Raspberry Pi OS. `uname -m` must report `aarch64`;
+`armv7l` indicates a 32-bit OS and cannot load this module.
+
+Check both the Asterisk major and the machine architecture:
+
+```console
+$ asterisk -V
+Asterisk 22.7.0
+$ uname -m
+aarch64
+```
+
+The Asterisk major must be 22 or newer. Use the `asterisk-22plus` file and
+match the architecture: `x86_64` systems use `linux-x86_64`, while `aarch64`
+systems use `linux-aarch64`. The module rejects Asterisk 21 and older, and Linux
+itself rejects a file built for the wrong CPU architecture.
 
 ## Before installation
 
 You will need:
 
-- A working Asterisk 22 or 23 installation
+- A working Asterisk 22 or newer installation
 - Root or equivalent access to install a module and configuration file
-- A Cisco phone already running SCCP firmwared
+- A Cisco phone already running SCCP firmware
 
 This driver is named `chan_sccp2.so`. It is a separate implementation from the
 older `chan_sccp.so` and Asterisk's `chan_skinny.so`. Do not load two SCCP
@@ -48,10 +62,10 @@ phone-side requirements.
 Open the [releases page](https://github.com/coral/sccp-rs/releases), select the
 latest release, and download one of these assets:
 
-| Installed Asterisk | Release asset |
-| --- | --- |
-| Asterisk 22.x | `chan_sccp2-asterisk-22-linux-x86_64.so` |
-| Asterisk 23.x | `chan_sccp2-asterisk-23-linux-x86_64.so` |
+| Installed Asterisk | `uname -m` | Release asset |
+| --- | --- | --- |
+| Asterisk 22 or newer | `x86_64` | `chan_sccp2-asterisk-22plus-linux-x86_64.so` |
+| Asterisk 22 or newer | `aarch64` | `chan_sccp2-asterisk-22plus-linux-aarch64.so` |
 
 Each release also contains `SHA256SUMS`. Download it beside the module and
 verify the download before installing it:
@@ -59,18 +73,19 @@ verify the download before installing it:
 ```console
 $ cd /tmp
 $ sha256sum --check --ignore-missing SHA256SUMS
-chan_sccp2-asterisk-22-linux-x86_64.so: OK
+chan_sccp2-asterisk-22plus-linux-x86_64.so: OK
 ```
 
 The output must name your downloaded `.so` and end in `OK`. A missing filename,
 `FAILED`, or a checksum warning is not a successful verification.
 
 The same files can be downloaded from the command line. This example is for
-Asterisk 22; change `22` to `23` in both occurrences for Asterisk 23:
+x86-64. Change `linux-x86_64` to `linux-aarch64` on a 64-bit Raspberry Pi or
+other ARM64 system:
 
 ```sh
 cd /tmp
-curl -fLO https://github.com/coral/sccp-rs/releases/latest/download/chan_sccp2-asterisk-22-linux-x86_64.so
+curl -fLO https://github.com/coral/sccp-rs/releases/latest/download/chan_sccp2-asterisk-22plus-linux-x86_64.so
 curl -fLO https://github.com/coral/sccp-rs/releases/latest/download/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 ```
@@ -95,6 +110,7 @@ Common module directories include:
 
 - `/usr/lib64/asterisk/modules`
 - `/usr/lib/x86_64-linux-gnu/asterisk/modules`
+- `/usr/lib/aarch64-linux-gnu/asterisk/modules`
 - `/usr/lib/asterisk/modules`
 
 The rest of this guide uses `/etc/asterisk` as the configuration directory and
@@ -107,13 +123,13 @@ Install the release asset under the exact name `chan_sccp2.so`:
 
 ```sh
 sudo install -o root -g root -m 0644 \
-  /tmp/chan_sccp2-asterisk-22-linux-x86_64.so \
+  /tmp/chan_sccp2-asterisk-22plus-linux-x86_64.so \
   /usr/lib64/asterisk/modules/chan_sccp2.so
 ```
 
-Use the Asterisk 23 filename if that is the build you downloaded. The long
-release filename is useful while downloading, but Asterisk should see the
-installed file as `chan_sccp2.so`.
+Use the filename matching your CPU architecture. The long release filename is
+useful while downloading, but Asterisk should see the installed file as
+`chan_sccp2.so`.
 
 ## 4. Create `sccp.conf`
 
@@ -433,7 +449,8 @@ the existing module until the new download and checksum have been verified.
 
 1. Download the new `.so` and `SHA256SUMS` into a temporary directory.
 2. Verify the checksum.
-3. Confirm that the asset still matches the installed Asterisk major.
+3. Confirm that the asset's ABI baseline is no newer than the installed
+   Asterisk major and that its CPU architecture matches.
 4. Back up the installed `chan_sccp2.so` and `sccp.conf`.
 5. During a maintenance window, make sure `sccp show channels` is empty and
    unload the module.
@@ -472,9 +489,10 @@ separately decided that the phones no longer need them.
 
 Check these in order:
 
-1. `asterisk -V` reports Asterisk 22.x or 23.x.
-2. The release filename has the same Asterisk major.
-3. `uname -m` reports `x86_64`.
+1. `asterisk -V` reports Asterisk 22 or newer.
+2. The release filename identifies the `asterisk-22plus` ABI generation.
+3. `uname -m` reports `x86_64` for a `linux-x86_64` asset or `aarch64` for a
+   `linux-aarch64` asset.
 4. `ldd chan_sccp2.so` contains no `not found` entries.
 5. Asterisk can read both `chan_sccp2.so` and `sccp.conf`.
 6. `sccp.conf` contains at least one device, one assigned line, a nonzero
