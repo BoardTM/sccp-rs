@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - master
+    tags:
+      - "v*.*.*"
     paths:
       - "asterisk-module/**"
       - "sccp-protocol/**"
@@ -182,7 +184,7 @@ jobs:
           retention-days: 1
 
   release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs:
       - realtime
       - config-checker
@@ -194,6 +196,21 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate release tag
+        run: |
+          manifest_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "asterisk-module") | .version')
+          expected_tag="v${manifest_version}"
+          if [ "$GITHUB_REF_NAME" != "$expected_tag" ]; then
+            printf 'release tag %s does not match asterisk-module version %s\n' \
+              "$GITHUB_REF_NAME" "$manifest_version" >&2
+            exit 1
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           pattern: chan_sccp2-asterisk-*
@@ -204,11 +221,12 @@ jobs:
         working-directory: dist
         run: sha256sum *.so > SHA256SUMS
 
-      - name: Publish modules for this commit
+      - name: Publish versioned module release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          release_tag="build-${GITHUB_SHA}"
+          release_tag="$GITHUB_REF_NAME"
+          release_version="${release_tag#v}"
           if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             printf 'Release %s already exists; nothing to publish\n' "$release_tag"
             exit 0
@@ -219,6 +237,8 @@ jobs:
             dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "chan_sccp2 modules ${GITHUB_SHA}" \
-            --notes "Automated Linux x86_64 and ARM64/aarch64 modules for the Asterisk 22+ ABI generation. Built against Asterisk 22.7.0 and compatibility-tested with Asterisk 22 and 23." \
+            --verify-tag \
+            --title "chan_sccp2 v${release_version}" \
+            --notes "Precompiled Linux x86_64 and ARM64/aarch64 modules for the Asterisk 22+ ABI generation. Built against Asterisk 22.7.0 and compatibility-tested with Asterisk 22 and 23." \
+            --generate-notes \
             --latest

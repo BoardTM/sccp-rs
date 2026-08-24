@@ -751,6 +751,20 @@ fn release_artifacts_are_named_for_the_oldest_compatible_abi_baseline() {
     assert!(release.contains("if: matrix.publish"));
     assert!(compatibility.contains("runner: ubuntu-24.04-arm"));
 
+    assert!(release.contains("tags:\n      - \"v*.*.*\""));
+    assert!(release.contains("startsWith(github.ref, 'refs/tags/v')"));
+    assert!(release.contains("release_tag=\"$GITHUB_REF_NAME\""));
+    assert!(release.contains("expected_tag=\"v${manifest_version}\""));
+    assert!(release.contains("--verify-tag"));
+    assert!(!release.contains("release_tag=\"build-${GITHUB_SHA}\""));
+
+    let manifest = fs::read_to_string(crate_root().join("Cargo.toml")).unwrap();
+    assert!(manifest.contains(&format!("version = \"{}\"", env!("CARGO_PKG_VERSION"))));
+    assert!(manifest.contains("[package.metadata.release]"));
+    assert!(manifest.contains("allow-branch = [\"master\"]"));
+    assert!(manifest.contains("tag-name = \"v{{version}}\""));
+    assert!(manifest.contains("publish = false"));
+
     let build = fs::read_to_string(crate_root().join("build.rs")).unwrap();
     assert!(build.contains("\"x86_64\" | \"aarch64\""));
 }

@@ -1,6 +1,6 @@
 [package]
 name = "asterisk-module"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Rust SCCP channel driver for Asterisk 22 and newer"
@@ -8,6 +8,13 @@ publish = false
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[package.metadata.release]
+allow-branch = ["master"]
+publish = false
+tag-name = "v{{version}}"
+tag-message = "chan_sccp2 v{{version}}"
+pre-release-commit-message = "release chan_sccp2 v{{version}}"
 
 [lints]
 workspace = true

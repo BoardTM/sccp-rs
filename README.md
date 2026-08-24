@@ -47,6 +47,12 @@ Many Asterisk modules depend heavily on Asterisk internals and compile-time feat
 
 The remaining boundary is Asterisk's C ABI. Release modules deliberately opt out of Asterisk's exact build-option checksum and instead verify that the running major is at least their ABI baseline. If a future Asterisk major breaks this ABI generation, releases will add a new baseline artifact at that point. Release files are architecture-specific and require a glibc-based Linux system. If you happen to use another platform, compiling this is easy thanks to the tooling in Rust.
 
+### Releasing the Asterisk module
+
+```sh
+cargo release --package asterisk-module patch --execute
+```
+
 ## SCCP<->SIP app
 
 in progress
