@@ -9,7 +9,7 @@
 ; devicetable = sccp_devices
 ; linetable = sccp_lines
 ; `bind = 0.0.0.0:2000` is the equivalent compact clear-listener form.
-bindaddr = 0.0.0.0
+bind_address = 0.0.0.0
 port = 2000
 ; Addresses placed in media and server responses. At least one family must be
 ; reachable by the phones. Use `none` to clear one family explicitly.
@@ -56,27 +56,30 @@ secondary_keepalive = 30
 ; signaling_server = 1, Asterisk SCCP, 192.0.2.10, 2000, 2443
 ; signaling_server = 2, Asterisk SCCP Backup, 192.0.2.20, 2000, 2443
 ; Seconds to wait for the first digit and between subsequent digits.
-firstdigittimeout = 10
-digittimeout = 5
-; Use `interdigit_timeout_ms = 1250` instead of `digittimeout` when sub-second
+first_digit_timeout = 10
+digit_timeout = 5
+; Use `interdigit_timeout_ms = 1250` instead of `digit_timeout` when sub-second
 ; precision is required; configuring both forms is rejected.
-digittimeoutchar = #
-recorddigittimeoutchar = no
+digit_timeout_char = #
+record_digit_timeout_char = no
 simulate_enbloc = yes
+; `yes` seeds digit collection with the speed-dial number and waits for more
+; digits; `no` routes it immediately.
+speed_dial_await_further_digits = no
 ; Unsafe unless the dialplan and downstream provider both accept overlap DTMF.
-allowoverlap = no
+allow_overlap = no
 ; Disabled by default. When enabled, hanging up an eligible ringing or
 ; connected consultation leg completes its already-started transfer.
 transfer_on_hangup = no
 ; Select the oldest or last-added answerable call.
-callanswerorder = OldestFirst
+call_answer_order = OldestFirst
 ; Ordinary inbound calls use this typed station ring pattern. Call-waiting
 ; presentations are silent single rings unless this is Urgent.
-ringtype = Outside
+ring_type = Outside
 ; A numeric zero disables the initial and repeated call-waiting tone.
-callwaitingtone = CallWaiting
+call_waiting_tone = CallWaiting
 ; Seconds between repeated tones; zero keeps the initial tone only.
-callwaitinginterval = 0
+call_waiting_interval = 0
 ; Registration-token policy used when a phone asks whether it should move
 ; back from another configured call-control server. `fallback` accepts yes,
 ; no, odd, or even.
@@ -89,24 +92,24 @@ regcontext = sccp-registrations&branch-registrations
 autoanswer_ring_time = 1
 autoanswer_tone = Zip
 ; A numeric zero disables the brief passive remote-hangup notification.
-remotehangup_tone = Zip
+remote_hangup_tone = Zip
 ; Unknown devices may register only when this guest hotline is enabled.
 hotline_enabled = no
 hotline_extension = 111
 hotline_context = from-sccp
 hotline_label = Guest hotline
-directrtp = no
-earlyrtp = yes
+direct_media = no
+early_media = yes
 ; Handset audio-processing defaults. Lines may override either setting.
 echocancel = yes
 silencesuppression = no
 ; Asterisk per-channel jitter buffer. Forced mode also suppresses direct RTP.
-jbenable = no
-jbforce = no
-jblog = no
-jbmaxsize = 200
-jbresyncthreshold = 1000
-jbimpl = fixed
+jb_enable = no
+jb_force = no
+jb_log = no
+jb_max_size = 200
+jb_resync_threshold = 1000
+jb_implementation = fixed
 ; With no codec directives, each registered phone advertises its mapped audio
 ; formats and Asterisk chooses the best direct or translated path. Use
 ; disallow/allow only when an administrator needs to restrict that set.
@@ -168,12 +171,12 @@ privacy_feature = yes
 privacy = no
 ; Open the phone's Placed Calls application for Redial instead of immediately
 ; dialing the last number, and show ringing notification for hinted lines.
-useRedialMenu = no
-allowRinginNotification = no
+use_redial_menu = no
+allow_ringin_notification = no
 ; Message-waiting lamp mode: off, on, wink, flash, or blink. `mwioncall`
 ; controls whether MWI remains visible during a call.
-mwilamp = on
-mwioncall = no
+mwi_lamp = on
+mwi_on_call = no
 park = yes
 conf_allow = yes
 conf_music_on_hold_class = default
@@ -183,10 +186,10 @@ conf_mute_on_entry = no
 conf_show_conflist = yes
 meetme = yes
 meetmeopts = Mac
-allowoverlap = no
-force_dtmfmode = auto
-directrtp = no
-earlyrtp = yes
+allow_overlap = no
+force_dtmf_mode = auto
+direct_media = no
+early_media = yes
 ; Device codec restrictions remain accepted for compatibility. Omitted policy
 ; leaves this template phone-driven.
 
@@ -208,8 +211,8 @@ parkinglot = default
 meetme = yes
 meetmenum = 700
 meetmeopts = Mac
-adhocNumber =
-videomode = auto
+adhoc_number =
+video_mode = auto
 echocancel = yes
 silencesuppression = no
 ; Optional example restriction:
@@ -248,7 +251,7 @@ label = Reception
 callerid = "Reception" <1001>
 accountcode = reception
 ; Maximum concurrent logical inbound PBX calls on this line.
-incominglimit = 6
+incoming_limit = 6
 ; Mobility PINs contain one to seven digits. `regexten` entries are separated
 ; with `&`; an optional `@context` selects a context for just that entry.
 pin = 1234

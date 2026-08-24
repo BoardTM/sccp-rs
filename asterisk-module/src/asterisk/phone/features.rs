@@ -460,6 +460,34 @@ pub(super) async fn replace_and_commit_forwarding_entry(
     true
 }
 
+pub(super) async fn replace_forwarding_entry(
+    access: &Access,
+    device_id: &DeviceId,
+    call_id: CallId,
+    digits: &str,
+) -> bool {
+    let result = {
+        let mut entries = access.shared.forwarding_entries.lock_unpoisoned();
+        let Some(entry) = entries.for_call(call_id).cloned() else {
+            return false;
+        };
+        if &entry.device_id != device_id {
+            return true;
+        }
+        entries.replace_digits(device_id, entry.id, digits, Instant::now())
+    };
+    if result.is_err() {
+        display_voicemail_prompt(
+            access,
+            device_id.clone(),
+            Some(call_id),
+            "Invalid forwarding destination",
+        )
+        .await;
+    }
+    true
+}
+
 pub(super) async fn commit_forwarding_entry(
     access: &Access,
     device_id: &DeviceId,

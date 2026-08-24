@@ -495,8 +495,8 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
             "dynamic speed-dial status",
             ProtocolVersion::V22,
             id::SPEED_DIAL_STAT_DYNAMIC,
-            68,
-            ServerMessage::SpeedDialStatusDynamic {
+            20,
+            ServerMessage::SpeedDialStatus {
                 instance: 2,
                 number: "2001".into(),
                 display_name: "Reception".into(),

@@ -58,18 +58,6 @@ impl<'a> SectionValues<'a> {
         Ok(())
     }
 
-    pub(super) fn unknown(&self, entry: &RawValue, scope: &str, normalized: &str) -> ConfigError {
-        let value = if self.sensitive(entry) {
-            "<redacted>".to_owned()
-        } else {
-            format!("{:?}", entry.value)
-        };
-        ConfigError::InvalidValue {
-            key: entry.diagnostic_key(),
-            value: format!("{value}; expected a recognized {scope} option, not {normalized}"),
-        }
-    }
-
     fn diagnostic_value<'b>(&self, entry: &'b RawValue) -> &'b str {
         if self.sensitive(entry) {
             "<redacted>"
@@ -83,7 +71,7 @@ impl<'a> SectionValues<'a> {
     }
 }
 
-fn sensitive_option_name(name: &str) -> bool {
+pub(super) fn sensitive_option_name(name: &str) -> bool {
     matches!(
         normalize_name(name).as_str(),
         "secret"
@@ -94,6 +82,7 @@ fn sensitive_option_name(name: &str) -> bool {
             | "key"
             | "accountcode"
             | "mobilitypin"
+            | "pin"
             | "setvar"
             | "forwardall"
             | "forwardbusy"
@@ -147,12 +136,7 @@ mod tests {
             Err(ConfigError::InvalidValue { .. })
         ));
 
-        let secret = section(&[("Secret", "never-print-this")]);
-        let error = SectionValues::new(&secret).unknown(&secret.values[0], "general", "secret");
-        assert!(matches!(
-            error,
-            ConfigError::InvalidValue { value, .. }
-                if value.contains("<redacted>") && !value.contains("never-print-this")
-        ));
+        assert!(sensitive_option_name("Secret"));
+        assert!(sensitive_option_name("p-in"));
     }
 }

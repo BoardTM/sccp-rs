@@ -385,6 +385,8 @@ fn station_global_policy_changed(previous: &ModuleConfig, next: &ModuleConfig) -
     previous.general.timing_policy().interdigit_timeout
         != next.general.timing_policy().interdigit_timeout
         || previous.general.simulate_enbloc != next.general.simulate_enbloc
+        || previous.general.speed_dial_await_further_digits
+            != next.general.speed_dial_await_further_digits
         || previous.general.codecs != next.general.codecs
         || previous.general.conference_dialing != next.general.conference_dialing
         || previous.general.auto_answer != next.general.auto_answer
@@ -676,6 +678,20 @@ mod tests {
             "jbenable = yes\njbforce = yes\njbmaxsize = 320\njbimpl = adaptive",
             "",
         );
+
+        assert_eq!(
+            ReloadPlan::build(&previous, &next).changed,
+            [
+                DeviceId::new("SEP001122334455").unwrap(),
+                DeviceId::new("SEP112233445566").unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn speed_dial_further_digit_policy_change_reconnects_existing_devices() {
+        let previous = two_devices("SpeedDialAwaitFurtherDigits = no", "");
+        let next = two_devices("SpeedDialAwaitFurtherDigits = yes", "");
 
         assert_eq!(
             ReloadPlan::build(&previous, &next).changed,

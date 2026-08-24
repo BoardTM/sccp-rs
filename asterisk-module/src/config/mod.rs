@@ -44,6 +44,7 @@ pub mod realtime;
 #[cfg(any(test, feature = "asterisk-22", feature = "asterisk-23"))]
 pub mod reload;
 mod section_values;
+mod serde_section;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -60,6 +61,7 @@ use sccp_protocol::{
     SignalingServerRoute, SilenceSuppression, SoftKey, SoftKeyProfile as StationSoftKeyProfile,
     SpeedDialDefinition, StationTransportRequirement, StationUiPolicy, Tone,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::call::forwarding::ForwardingDestination;
@@ -74,6 +76,7 @@ use crate::media::encryption::{
 };
 use crate::media::formats::{pbx_audio_format, unsupported_audio_reason};
 use section_values::SectionValues;
+use serde_section::{deserialize_entries, deserialize_section, serialized_key};
 
 pub const DEFAULT_SOFT_KEY_PROFILE: &str = "default";
 pub const MAX_SOFT_KEYS_PER_MODE: usize = 16;
@@ -194,6 +197,8 @@ pub struct GeneralConfig {
     pub interdigit_timeout_ms: u64,
     pub dial_terminator: DialTerminatorConfig,
     pub simulate_enbloc: bool,
+    /// Service policy for speed-dial digit collection.
+    pub speed_dial_await_further_digits: bool,
     pub allow_overlap: bool,
     /// Complete an eligible in-flight consultation when its handset leg goes
     /// on-hook. The value is captured when the transfer begins.
@@ -319,6 +324,7 @@ impl Default for GeneralConfig {
             interdigit_timeout_ms: 5_000,
             dial_terminator: DialTerminatorConfig::default(),
             simulate_enbloc: true,
+            speed_dial_await_further_digits: false,
             allow_overlap: false,
             transfer_on_hangup: false,
             call_answer_order: CallAnswerOrder::default(),
@@ -1244,6 +1250,372 @@ struct RawValue {
     section: String,
 }
 
+/// Serde is the authoritative spelling table for general options. Aliases are
+/// accepted production inputs; serialization always yields the canonical
+/// Asterisk-style spelling used by examples and diagnostics.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GeneralOption {
+    #[serde(rename = "dateformat")]
+    DateFormat,
+    #[serde(rename = "tzoffset")]
+    TimezoneOffset,
+    #[serde(alias = "clearbind")]
+    Bind,
+    #[serde(alias = "bindaddr", alias = "clearbindaddr")]
+    BindAddress,
+    #[serde(alias = "clearport")]
+    Port,
+    AdvertisedAddress,
+    #[serde(alias = "advertisedaddressipv4")]
+    AdvertisedIpv4,
+    #[serde(alias = "advertisedaddressipv6")]
+    AdvertisedIpv6,
+    #[serde(alias = "securebind")]
+    TlsBind,
+    #[serde(alias = "secbindaddr", alias = "tlsbindaddr")]
+    TlsBindAddress,
+    #[serde(alias = "secport", alias = "tlsport")]
+    TlsPort,
+    #[serde(alias = "certfile", alias = "tlscombinedpem")]
+    TlsCombinedPem,
+    #[serde(alias = "tlscertificatefile")]
+    TlsCertificate,
+    #[serde(alias = "tlsprivatekeyfile")]
+    TlsPrivateKey,
+    #[serde(alias = "tlscafile")]
+    TlsTrustStore,
+    Deny,
+    Permit,
+    #[serde(rename = "localnet")]
+    LocalNetwork,
+    #[serde(rename = "externip", alias = "externaladdress")]
+    ExternalAddress,
+    #[serde(rename = "externhost", alias = "externalhost")]
+    ExternalHost,
+    #[serde(rename = "externrefresh", alias = "externalrefresh")]
+    ExternalRefresh,
+    Nat,
+    #[serde(rename = "sccp_tos", alias = "signalingtos")]
+    SignalingTos,
+    #[serde(
+        rename = "sccp_dscp",
+        alias = "sccpdscp",
+        alias = "signalingdscp",
+        alias = "signaling_dscp"
+    )]
+    SignalingDscp,
+    #[serde(rename = "sccp_cos", alias = "signalingcos", alias = "signaling_cos")]
+    SignalingCos,
+    #[serde(alias = "audiotos")]
+    AudioTos,
+    #[serde(alias = "audiodscp")]
+    AudioDscp,
+    #[serde(alias = "audiocos")]
+    AudioCos,
+    #[serde(alias = "videotos")]
+    VideoTos,
+    #[serde(alias = "videodscp")]
+    VideoDscp,
+    #[serde(alias = "videocos")]
+    VideoCos,
+    #[serde(alias = "trustphoneip")]
+    TrustPhoneIp,
+    #[serde(alias = "servername")]
+    ServerName,
+    Language,
+    #[serde(rename = "accountcode")]
+    AccountCode,
+    Keepalive,
+    SecondaryKeepalive,
+    SignalingServer,
+    #[serde(alias = "firstdigittimeout")]
+    FirstDigitTimeout,
+    InterdigitTimeoutMs,
+    #[serde(alias = "digittimeout")]
+    DigitTimeout,
+    #[serde(alias = "digittimeoutchar")]
+    DigitTimeoutChar,
+    #[serde(alias = "recorddigittimeoutchar")]
+    RecordDigitTimeoutChar,
+    SimulateEnbloc,
+    #[serde(alias = "speeddialawaitfurtherdigits")]
+    SpeedDialAwaitFurtherDigits,
+    #[serde(alias = "allowoverlap")]
+    AllowOverlap,
+    TransferOnHangup,
+    #[serde(alias = "callanswerorder")]
+    CallAnswerOrder,
+    #[serde(alias = "ringtype")]
+    RingType,
+    #[serde(alias = "callwaitingtone")]
+    CallWaitingTone,
+    #[serde(alias = "callwaitinginterval")]
+    CallWaitingInterval,
+    Fallback,
+    BackoffTime,
+    ServerPriority,
+    Allow,
+    Disallow,
+    #[serde(rename = "meetme")]
+    ConferenceEnabled,
+    #[serde(rename = "meetmeopts")]
+    ConferenceOptions,
+    #[serde(alias = "autoanswerringtime")]
+    AutoanswerRingTime,
+    #[serde(alias = "autoanswertone")]
+    AutoanswerTone,
+    #[serde(alias = "remotehangup_tone")]
+    RemoteHangupTone,
+    #[serde(alias = "hotlineenabled")]
+    HotlineEnabled,
+    #[serde(alias = "hotlineextension")]
+    HotlineExtension,
+    #[serde(alias = "hotlinecontext")]
+    HotlineContext,
+    #[serde(alias = "hotlinelabel")]
+    HotlineLabel,
+    #[serde(rename = "direct_media", alias = "directrtp")]
+    DirectMedia,
+    #[serde(rename = "early_media", alias = "earlyrtp")]
+    EarlyMedia,
+    #[serde(alias = "audioencryption")]
+    AudioEncryption,
+    #[serde(rename = "echocancel")]
+    EchoCancel,
+    #[serde(rename = "silencesuppression")]
+    SilenceSuppression,
+    #[serde(alias = "jbenable")]
+    JbEnable,
+    #[serde(alias = "jbforce")]
+    JbForce,
+    #[serde(alias = "jblog")]
+    JbLog,
+    #[serde(alias = "jbmaxsize")]
+    JbMaxSize,
+    #[serde(alias = "jbresyncthreshold")]
+    JbResyncThreshold,
+    #[serde(alias = "jbimpl")]
+    JbImplementation,
+    #[serde(rename = "regcontext")]
+    RegistrationContext,
+    #[serde(alias = "devicetable")]
+    DeviceTable,
+    #[serde(alias = "linetable")]
+    LineTable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LineOption {
+    Type,
+    Label,
+    Context,
+    #[serde(rename = "callerid")]
+    CallerId,
+    #[serde(alias = "incominglimit")]
+    IncomingLimit,
+    Language,
+    #[serde(rename = "accountcode")]
+    AccountCode,
+    #[serde(rename = "setvar")]
+    SetVariable,
+    Mailbox,
+    #[serde(alias = "vmnum", alias = "voicemailnumber")]
+    VoicemailNumber,
+    #[serde(
+        alias = "trnsfvm",
+        alias = "voicemailtransfer",
+        alias = "transfertovoicemail"
+    )]
+    VoicemailTransfer,
+    #[serde(alias = "callgroup")]
+    CallGroup,
+    #[serde(alias = "pickupgroup")]
+    PickupGroup,
+    #[serde(alias = "namedcallgroup")]
+    NamedCallGroup,
+    #[serde(alias = "namedpickupgroup")]
+    NamedPickupGroup,
+    #[serde(alias = "directedpickup")]
+    DirectedPickup,
+    #[serde(alias = "directedpickupcontext")]
+    DirectedPickupContext,
+    #[serde(alias = "pickupmodeanswer", alias = "directedpickupmodeanswer")]
+    PickupModeAnswer,
+    #[serde(rename = "parkinglot")]
+    ParkingLot,
+    #[serde(rename = "meetme")]
+    ConferenceEnabled,
+    #[serde(rename = "meetmenum")]
+    ConferenceNumber,
+    #[serde(rename = "meetmeopts")]
+    ConferenceOptions,
+    #[serde(alias = "adhocnumber")]
+    AdhocNumber,
+    InitialDialtoneTone,
+    SecondaryDialtoneDigits,
+    SecondaryDialtoneTone,
+    Pin,
+    #[serde(rename = "regexten")]
+    RegistrationExtension,
+    Allow,
+    Disallow,
+    #[serde(alias = "videomode")]
+    VideoMode,
+    #[serde(alias = "audioencryption")]
+    AudioEncryption,
+    #[serde(rename = "echocancel")]
+    EchoCancel,
+    #[serde(rename = "silencesuppression")]
+    SilenceSuppression,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeviceOption {
+    Type,
+    Description,
+    #[serde(alias = "softkeyprofile")]
+    SoftkeyProfile,
+    #[serde(
+        rename = "cfwdall",
+        alias = "forwardallenabled",
+        alias = "forward_all_enabled"
+    )]
+    ForwardAllEnabled,
+    #[serde(
+        rename = "cfwdbusy",
+        alias = "forwardbusyenabled",
+        alias = "forward_busy_enabled"
+    )]
+    ForwardBusyEnabled,
+    #[serde(
+        rename = "cfwdnoanswer",
+        alias = "forwardnoanswerenabled",
+        alias = "forward_no_answer_enabled"
+    )]
+    ForwardNoAnswerEnabled,
+    #[serde(
+        rename = "forward_no_answer_timeout",
+        alias = "cfwdnoanswertimeout",
+        alias = "forwardnoanswertimeout"
+    )]
+    ForwardNoAnswerTimeout,
+    ForwardAll,
+    ForwardBusy,
+    ForwardNoAnswer,
+    #[serde(alias = "dndfeature")]
+    DndFeature,
+    Dnd,
+    #[serde(
+        rename = "privacy_feature",
+        alias = "private",
+        alias = "privacyfeature"
+    )]
+    PrivacyFeature,
+    Privacy,
+    #[serde(alias = "featuredefault")]
+    FeatureDefault,
+    #[serde(rename = "setvar")]
+    SetVariable,
+    Park,
+    #[serde(rename = "conf_allow", alias = "confallow", alias = "conference_allow")]
+    ConferenceAllow,
+    #[serde(
+        rename = "conf_music_on_hold_class",
+        alias = "confmusiconholdclass",
+        alias = "conference_music_on_hold_class"
+    )]
+    ConferenceMusicOnHoldClass,
+    #[serde(
+        rename = "conf_play_general_announce",
+        alias = "confplaygeneralannounce",
+        alias = "conference_play_general_announce"
+    )]
+    ConferencePlayGeneralAnnounce,
+    #[serde(
+        rename = "conf_play_part_announce",
+        alias = "confplaypartannounce",
+        alias = "conference_play_participant_announce"
+    )]
+    ConferencePlayParticipantAnnounce,
+    #[serde(
+        rename = "conf_mute_on_entry",
+        alias = "confmuteonentry",
+        alias = "conference_mute_on_entry"
+    )]
+    ConferenceMuteOnEntry,
+    #[serde(
+        rename = "conf_show_conflist",
+        alias = "confshowconflist",
+        alias = "conference_show_list"
+    )]
+    ConferenceShowList,
+    #[serde(rename = "meetme")]
+    ConferenceDialingEnabled,
+    #[serde(rename = "meetmeopts")]
+    ConferenceOptions,
+    #[serde(alias = "useredialmenu")]
+    UseRedialMenu,
+    #[serde(alias = "allowringinnotification")]
+    AllowRinginNotification,
+    #[serde(alias = "mwilamp")]
+    MwiLamp,
+    #[serde(alias = "mwioncall")]
+    MwiOnCall,
+    #[serde(alias = "phonecodepage")]
+    PhoneCodePage,
+    #[serde(alias = "allowoverlap")]
+    AllowOverlap,
+    #[serde(alias = "forcedtmfmode", alias = "force_dtmfmode")]
+    ForceDtmfMode,
+    #[serde(rename = "direct_media", alias = "directrtp")]
+    DirectMedia,
+    #[serde(rename = "early_media", alias = "earlyrtp")]
+    EarlyMedia,
+    #[serde(alias = "audioencryption")]
+    AudioEncryption,
+    Deny,
+    Permit,
+    #[serde(alias = "permithost")]
+    PermitHost,
+    Nat,
+    #[serde(alias = "transportrequirement", alias = "transport_requirement")]
+    Transport,
+    #[serde(rename = "sccp_tos", alias = "signalingtos")]
+    SignalingTos,
+    #[serde(
+        rename = "sccp_dscp",
+        alias = "sccpdscp",
+        alias = "signalingdscp",
+        alias = "signaling_dscp"
+    )]
+    SignalingDscp,
+    #[serde(rename = "sccp_cos", alias = "signalingcos", alias = "signaling_cos")]
+    SignalingCos,
+    #[serde(alias = "audiotos")]
+    AudioTos,
+    #[serde(alias = "audiodscp")]
+    AudioDscp,
+    #[serde(alias = "audiocos")]
+    AudioCos,
+    #[serde(alias = "videotos")]
+    VideoTos,
+    #[serde(alias = "videodscp")]
+    VideoDscp,
+    #[serde(alias = "videocos")]
+    VideoCos,
+    #[serde(alias = "trustphoneip")]
+    TrustPhoneIp,
+    #[serde(alias = "dtmfmode")]
+    ObsoleteDtmfMode,
+    Allow,
+    Disallow,
+    Line,
+    Button,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfigOverlayKind {
     Device,
@@ -1318,9 +1690,232 @@ struct ParsedLine {
     features: LineFeatureConfig,
 }
 
+/// Values collected while one line section is decoded. Keeping the unresolved
+/// values together makes the parse/resolve boundary explicit: Serde owns key
+/// selection, this draft owns typed values and presence, and the final resolver
+/// applies general inheritance and cross-field validation.
+#[derive(Default)]
+struct LineSectionDraft<'a> {
+    incoming_limit: Option<u32>,
+    mailbox: Option<Option<String>>,
+    voicemail_number: Option<Option<VoicemailDestination>>,
+    voicemail_transfer: Option<Option<VoicemailDestination>>,
+    call_groups: Option<BTreeSet<u8>>,
+    pickup_groups: Option<BTreeSet<u8>>,
+    named_call_groups: Option<BTreeSet<String>>,
+    named_pickup_groups: Option<BTreeSet<String>>,
+    directed_pickup: Option<bool>,
+    directed_pickup_context: Option<Option<String>>,
+    pickup_mode_answer: Option<bool>,
+    parking_lot: Option<Option<String>>,
+    conference_enabled: Option<bool>,
+    conference_destination: Option<Option<String>>,
+    conference_options: Option<String>,
+    hotline_destination: Option<Option<HotlineDestination>>,
+    initial_dialtone_tone: Option<Tone>,
+    secondary_dialtone_digits: Option<Option<String>>,
+    secondary_dialtone_tone: Option<Tone>,
+    mobility_pin: Option<Option<MobilityPin>>,
+    registration_extensions: Option<Option<Vec<RegistrationExtension>>>,
+    video_mode: Option<VideoMode>,
+    audio_encryption: Option<MediaEncryptionPolicy>,
+    echo_cancellation: Option<bool>,
+    silence_suppression: Option<bool>,
+    language: Option<String>,
+    account_code: Option<Option<String>>,
+    channel_variables: Vec<ChannelVariable>,
+    codec_settings: Vec<(bool, &'a str)>,
+}
+
+#[derive(Default)]
+struct QosPolicyPatch {
+    signaling_dscp: Option<Dscp>,
+    signaling_cos: Option<Cos>,
+    audio_dscp: Option<Dscp>,
+    audio_cos: Option<Cos>,
+    video_dscp: Option<Dscp>,
+    video_cos: Option<Cos>,
+}
+
+impl QosPolicyPatch {
+    fn resolve(self, mut base: QosPolicy) -> QosPolicy {
+        base.signaling.dscp = self.signaling_dscp.unwrap_or(base.signaling.dscp);
+        base.signaling.cos = self.signaling_cos.unwrap_or(base.signaling.cos);
+        base.audio.dscp = self.audio_dscp.unwrap_or(base.audio.dscp);
+        base.audio.cos = self.audio_cos.unwrap_or(base.audio.cos);
+        base.video.dscp = self.video_dscp.unwrap_or(base.video.dscp);
+        base.video.cos = self.video_cos.unwrap_or(base.video.cos);
+        base
+    }
+}
+
+/// Unresolved values for one device section. Optional collections preserve the
+/// difference between inheritance (`None`) and an explicitly cleared list
+/// (`Some(Vec::new())`).
+#[derive(Default)]
+struct DeviceSectionDraft<'a> {
+    buttons: Vec<ButtonDefinition>,
+    feature_arguments: HashMap<u32, String>,
+    instances: ButtonInstances,
+    soft_key_profile: Option<String>,
+    forward_all_enabled: Option<bool>,
+    forward_busy_enabled: Option<bool>,
+    forward_no_answer_enabled: Option<bool>,
+    forward_no_answer_timeout: Option<u32>,
+    forward_all: Option<Option<ForwardingDestination>>,
+    forward_busy: Option<Option<ForwardingDestination>>,
+    forward_no_answer: Option<Option<ForwardingDestination>>,
+    dnd_enabled: Option<bool>,
+    dnd: Option<DndMode>,
+    privacy_enabled: Option<bool>,
+    privacy: Option<bool>,
+    parking_enabled: Option<bool>,
+    conference_allowed: Option<bool>,
+    conference_music_on_hold_class: Option<Option<String>>,
+    conference_play_general_announcements: Option<bool>,
+    conference_play_participant_announcements: Option<bool>,
+    conference_mute_on_entry: Option<bool>,
+    conference_show_list: Option<bool>,
+    conference_dialing_enabled: Option<bool>,
+    conference_application_options: Option<String>,
+    use_redial_menu: Option<bool>,
+    allow_ringing_notification: Option<bool>,
+    mwi_lamp_mode: Option<LampMode>,
+    mwi_on_call: Option<bool>,
+    legacy_code_page: Option<LegacyCodePage>,
+    allow_overlap: Option<bool>,
+    dtmf_mode: Option<DtmfMode>,
+    direct_media: Option<bool>,
+    early_media: Option<bool>,
+    audio_encryption: Option<MediaEncryptionPolicy>,
+    codec_settings: Vec<(bool, &'a str)>,
+    acl_rules: Option<Vec<AclRule>>,
+    permitted_hosts: Option<Vec<String>>,
+    nat: Option<NatMode>,
+    qos: QosPolicyPatch,
+    transport: Option<TransportRequirement>,
+    configured_feature_defaults: Vec<(u32, bool)>,
+    channel_variables: Vec<ChannelVariable>,
+}
+
+/// Unresolved general-section values. Optional fields retain whether the user
+/// actually supplied them; inherited structures are represented as patches.
+#[derive(Default)]
+struct GeneralSectionDraft<'a> {
+    call_answer_order: Option<CallAnswerOrder>,
+    timezone_offset_minutes: Option<i16>,
+    date_template: Option<DateTemplate>,
+    ring_type: Option<RingerMode>,
+    call_waiting_tone: Option<Option<Tone>>,
+    call_waiting_interval: Option<u32>,
+    first_digit_timeout: Option<u64>,
+    interdigit_timeout: Option<u64>,
+    dial_terminator: Option<char>,
+    record_dial_terminator: Option<bool>,
+    simulate_enbloc: Option<bool>,
+    speed_dial_await_further_digits: Option<bool>,
+    allow_overlap: Option<bool>,
+    transfer_on_hangup: Option<bool>,
+    fallback_decision: Option<FallbackDecision>,
+    fallback_backoff: Option<u32>,
+    fallback_server_priority: Option<u8>,
+    conference_enabled: Option<bool>,
+    conference_options: Option<String>,
+    auto_answer_ring_time: Option<u32>,
+    auto_answer_tone: Option<Tone>,
+    remote_hangup_tone: Option<Option<Tone>>,
+    hotline_enabled: Option<bool>,
+    hotline_extension: Option<Option<HotlineDestination>>,
+    hotline_context: Option<String>,
+    hotline_label: Option<String>,
+    direct_media: Option<bool>,
+    early_media: Option<bool>,
+    audio_encryption: Option<MediaEncryptionPolicy>,
+    echo_cancellation: Option<bool>,
+    silence_suppression: Option<bool>,
+    jitter_enabled: Option<bool>,
+    jitter_forced: Option<bool>,
+    jitter_log_frames: Option<bool>,
+    jitter_max_size_ms: Option<u32>,
+    jitter_resync_threshold_ms: Option<u32>,
+    jitter_implementation: Option<JitterBufferImplementation>,
+    registration_contexts: Option<Vec<String>>,
+    codec_settings: Vec<(bool, &'a str)>,
+    clear_bind: Option<SocketAddr>,
+    clear_address: Option<IpAddr>,
+    clear_port: Option<u16>,
+    tls_bind: Option<SocketAddr>,
+    tls_address: Option<IpAddr>,
+    tls_port: Option<u16>,
+    combined_pem: Option<PathBuf>,
+    tls_certificate: Option<PathBuf>,
+    tls_private_key: Option<PathBuf>,
+    tls_trust_store: Option<PathBuf>,
+    acl_rules: Option<Vec<AclRule>>,
+    local_networks: Option<Vec<IpNetwork>>,
+    external_address: Option<Option<IpAddr>>,
+    external_hostname: Option<Option<String>>,
+    external_refresh: Option<u32>,
+    nat: Option<NatMode>,
+    advertised_ipv4: Option<Option<Ipv4Addr>>,
+    advertised_ipv6: Option<Option<Ipv6Addr>>,
+    advertised_alias_seen: bool,
+    qos: QosPolicyPatch,
+    device_table: Option<String>,
+    line_table: Option<String>,
+    language: Option<String>,
+    account_code: Option<Option<String>>,
+}
+
 impl ModuleConfig {
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
         Self::from_raw_sections(parse_sections(input)?)
+    }
+
+    /// Validate that every option in a source file uses the Serde schema's
+    /// canonical spelling. Runtime parsing remains case-insensitive and may
+    /// accept explicitly declared compatibility aliases.
+    pub fn check_canonical(input: &str) -> Result<(), ConfigError> {
+        Self::parse(input)?;
+        let sections = parse_sections(input)?;
+        for section in &sections {
+            let kind = source_section_kind(section, &sections)?;
+            check_canonical_section(section, &kind)?;
+        }
+        Ok(())
+    }
+
+    /// Render a validated, deterministic configuration using canonical option
+    /// names. Templates are resolved and the source is never modified.
+    pub fn to_canonical_string(input: &str) -> Result<String, ConfigError> {
+        Self::parse(input)?;
+        let mut sections = resolve_inheritance(parse_sections(input)?)?;
+        sections.sort_by(|left, right| {
+            canonical_section_rank(left)
+                .cmp(&canonical_section_rank(right))
+                .then_with(|| {
+                    left.name
+                        .to_ascii_lowercase()
+                        .cmp(&right.name.to_ascii_lowercase())
+                })
+        });
+
+        let mut output = String::new();
+        for (index, section) in sections.iter().enumerate() {
+            if index != 0 {
+                output.push('\n');
+            }
+            output.push('[');
+            output.push_str(&section.name);
+            output.push_str("]\n");
+            for entry in canonical_section_entries(section)? {
+                output.push_str(&entry.key);
+                output.push_str(" = ");
+                output.push_str(&canonical_value(&entry.value));
+                output.push('\n');
+            }
+        }
+        Ok(output)
     }
 
     pub(crate) fn parse_with_overlays(
@@ -1948,6 +2543,7 @@ impl ModuleConfig {
                         RedialMode::PlacedCallsMenu
                     ),
                     hinted_ringing_notification: device.call_ui.hinted_ringing_notification,
+                    speed_dial_await_further_digits: self.general.speed_dial_await_further_digits,
                     mwi_lamp_mode: device.call_ui.mwi_lamp_mode,
                     mwi_on_call: device.call_ui.mwi_on_call,
                     legacy_code_page: device.call_ui.legacy_code_page,
@@ -1956,6 +2552,158 @@ impl ModuleConfig {
             .collect();
         definitions.sort_by(|left, right| left.id.cmp(&right.id));
         definitions
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalEntry<'a> {
+    key: String,
+    value: &'a str,
+}
+
+fn canonical_section_kind(section: &RawSection) -> Result<&str, ConfigError> {
+    if section.name.eq_ignore_ascii_case("general") {
+        return Ok("general");
+    }
+    value(section, "type").ok_or_else(|| ConfigError::MissingSectionType(section.name.clone()))
+}
+
+fn canonical_section_rank(section: &RawSection) -> u8 {
+    match canonical_section_kind(section)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "general" => 0,
+        "softkey_profile" => 1,
+        "device" => 2,
+        "line" => 3,
+        _ => 4,
+    }
+}
+
+fn canonical_section_entries(section: &RawSection) -> Result<Vec<CanonicalEntry<'_>>, ConfigError> {
+    fn typed<'a, K>(section: &'a RawSection) -> Result<Vec<CanonicalEntry<'a>>, ConfigError>
+    where
+        K: serde::de::DeserializeOwned + Serialize,
+    {
+        deserialize_entries::<K>(section)?
+            .into_iter()
+            .map(|entry| {
+                Ok(CanonicalEntry {
+                    key: serialized_key(&entry.key)?,
+                    value: entry.value(),
+                })
+            })
+            .collect()
+    }
+
+    match canonical_section_kind(section)?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "general" => typed::<GeneralOption>(section),
+        "device" => typed::<DeviceOption>(section),
+        "line" => typed::<LineOption>(section),
+        "softkey_profile" => {
+            let _: SoftKeyProfileSection = deserialize_section(section)?;
+            Ok(section
+                .values
+                .iter()
+                .map(|entry| CanonicalEntry {
+                    key: entry.key.to_ascii_lowercase(),
+                    value: entry.value.as_str(),
+                })
+                .collect())
+        }
+        kind => Err(ConfigError::UnknownSectionType {
+            section: section.name.clone(),
+            kind: kind.to_owned(),
+        }),
+    }
+}
+
+fn source_section_kind(
+    section: &RawSection,
+    sections: &[RawSection],
+) -> Result<String, ConfigError> {
+    if section.name.eq_ignore_ascii_case("general") {
+        return Ok("general".into());
+    }
+    if let Some(kind) = value(section, "type") {
+        return Ok(kind.to_ascii_lowercase());
+    }
+    for parent in &section.parents {
+        let parent = sections
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(parent))
+            .ok_or_else(|| ConfigError::MissingTemplate {
+                section: section.name.clone(),
+                parent: parent.clone(),
+            })?;
+        if let Ok(kind) = source_section_kind(parent, sections) {
+            return Ok(kind);
+        }
+    }
+    Err(ConfigError::MissingSectionType(section.name.clone()))
+}
+
+fn check_canonical_section(section: &RawSection, kind: &str) -> Result<(), ConfigError> {
+    let canonical_entries = match kind {
+        "general" => canonical_typed_entries::<GeneralOption>(section)?,
+        "device" => canonical_typed_entries::<DeviceOption>(section)?,
+        "line" => canonical_typed_entries::<LineOption>(section)?,
+        "softkey_profile" => {
+            let _: SoftKeyProfileSection = deserialize_section(section)?;
+            section
+                .values
+                .iter()
+                .map(|entry| CanonicalEntry {
+                    key: entry.key.to_ascii_lowercase(),
+                    value: entry.value.as_str(),
+                })
+                .collect()
+        }
+        other => {
+            return Err(ConfigError::UnknownSectionType {
+                section: section.name.clone(),
+                kind: other.to_owned(),
+            });
+        }
+    };
+    for (entry, canonical) in section.values.iter().zip(canonical_entries) {
+        if entry.key != canonical.key {
+            return Err(invalid_option(
+                &entry.diagnostic_key(),
+                &entry.value,
+                &format!("canonical option name {}", canonical.key),
+                section_values::sensitive_option_name(&entry.key),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_typed_entries<K>(section: &RawSection) -> Result<Vec<CanonicalEntry<'_>>, ConfigError>
+where
+    K: serde::de::DeserializeOwned + Serialize,
+{
+    deserialize_entries::<K>(section)?
+        .into_iter()
+        .map(|entry| {
+            Ok(CanonicalEntry {
+                key: serialized_key(&entry.key)?,
+                value: entry.value(),
+            })
+        })
+        .collect()
+}
+
+fn canonical_value(value: &str) -> String {
+    if value.trim() != value || value.contains(';') || value.starts_with('#') {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_owned()
     }
 }
 
@@ -2169,6 +2917,27 @@ fn template_option_identity(kind: TemplateKind, key: &str) -> String {
     }
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "snake_case")]
+struct SoftKeyProfileSection {
+    #[serde(rename = "type")]
+    section_type: Option<String>,
+    on_hook: Option<String>,
+    connected: Option<String>,
+    on_hold: Option<String>,
+    ring_in: Option<String>,
+    off_hook: Option<String>,
+    connected_transfer: Option<String>,
+    digits_following: Option<String>,
+    connected_conference: Option<String>,
+    ring_out: Option<String>,
+    off_hook_feature: Option<String>,
+    in_use_hint: Option<String>,
+    on_hook_stealable: Option<String>,
+    hold_conference: Option<String>,
+    empty: Option<String>,
+}
+
 fn parse_soft_key_profile(section: &RawSection) -> Result<SoftKeyProfile, ConfigError> {
     let name = canonical_profile_name(&section.name);
     if name.is_empty() {
@@ -2177,36 +2946,42 @@ fn parse_soft_key_profile(section: &RawSection) -> Result<SoftKeyProfile, Config
             value: section.name.clone(),
         });
     }
+    let decoded: SoftKeyProfileSection = deserialize_section(section)?;
+    if decoded
+        .section_type
+        .as_deref()
+        .is_none_or(|kind| !kind.eq_ignore_ascii_case("softkey_profile"))
+    {
+        return Err(ConfigError::InvalidValue {
+            key: section.diagnostic_key("type"),
+            value: format!(
+                "{:?}; expected one type = softkey_profile",
+                decoded.section_type.as_deref().unwrap_or("")
+            ),
+        });
+    }
+
     let mut profile = SoftKeyProfile::empty(name);
-    let mut seen_modes = HashSet::new();
-    let mut seen_type = false;
-
-    for entry in &section.values {
-        let key = &entry.key;
-        let raw = &entry.value;
-        let diagnostic = entry.diagnostic_key();
-        if key == "type" {
-            if seen_type || !raw.eq_ignore_ascii_case("softkey_profile") {
-                return Err(ConfigError::InvalidValue {
-                    key: diagnostic,
-                    value: format!("{raw:?}; expected one type = softkey_profile"),
-                });
-            }
-            seen_type = true;
+    for (mode, raw) in [
+        (KeyMode::OnHook, decoded.on_hook),
+        (KeyMode::Connected, decoded.connected),
+        (KeyMode::OnHold, decoded.on_hold),
+        (KeyMode::RingIn, decoded.ring_in),
+        (KeyMode::OffHook, decoded.off_hook),
+        (KeyMode::ConnectedTransfer, decoded.connected_transfer),
+        (KeyMode::DigitsFollowing, decoded.digits_following),
+        (KeyMode::ConnectedConference, decoded.connected_conference),
+        (KeyMode::RingOut, decoded.ring_out),
+        (KeyMode::OffHookFeature, decoded.off_hook_feature),
+        (KeyMode::InUseHint, decoded.in_use_hint),
+        (KeyMode::OnHookStealable, decoded.on_hook_stealable),
+        (KeyMode::HoldConference, decoded.hold_conference),
+        (KeyMode::Empty, decoded.empty),
+    ] {
+        let Some(raw) = raw else {
             continue;
-        }
-
-        let mode = parse_key_mode(key).ok_or_else(|| ConfigError::InvalidValue {
-            key: diagnostic.clone(),
-            value: format!("{raw:?}; expected a recognized soft-key mode"),
-        })?;
-        if !seen_modes.insert(mode) {
-            return Err(ConfigError::InvalidValue {
-                key: diagnostic,
-                value: format!("{raw:?}; expected one setting for each soft-key mode"),
-            });
-        }
-
+        };
+        let diagnostic = section.diagnostic_key(key_mode_option(mode));
         let mut actions = Vec::new();
         let mut seen_actions = HashSet::new();
         if !raw.trim().is_empty() {
@@ -2239,24 +3014,24 @@ fn parse_soft_key_profile(section: &RawSection) -> Result<SoftKeyProfile, Config
     Ok(profile)
 }
 
-fn parse_key_mode(raw: &str) -> Option<KeyMode> {
-    Some(match normalize_name(raw).as_str() {
-        "onhook" => KeyMode::OnHook,
-        "connected" => KeyMode::Connected,
-        "onhold" => KeyMode::OnHold,
-        "ringin" => KeyMode::RingIn,
-        "offhook" => KeyMode::OffHook,
-        "connectedtransfer" => KeyMode::ConnectedTransfer,
-        "digitsfollowing" => KeyMode::DigitsFollowing,
-        "connectedconference" => KeyMode::ConnectedConference,
-        "ringout" => KeyMode::RingOut,
-        "offhookfeature" => KeyMode::OffHookFeature,
-        "inusehint" => KeyMode::InUseHint,
-        "onhookstealable" => KeyMode::OnHookStealable,
-        "holdconference" => KeyMode::HoldConference,
-        "empty" => KeyMode::Empty,
-        _ => return None,
-    })
+fn key_mode_option(mode: KeyMode) -> &'static str {
+    match mode {
+        KeyMode::OnHook => "on_hook",
+        KeyMode::Connected => "connected",
+        KeyMode::OnHold => "on_hold",
+        KeyMode::RingIn => "ring_in",
+        KeyMode::OffHook => "off_hook",
+        KeyMode::ConnectedTransfer => "connected_transfer",
+        KeyMode::DigitsFollowing => "digits_following",
+        KeyMode::ConnectedConference => "connected_conference",
+        KeyMode::RingOut => "ring_out",
+        KeyMode::OffHookFeature => "off_hook_feature",
+        KeyMode::InUseHint => "in_use_hint",
+        KeyMode::OnHookStealable => "on_hook_stealable",
+        KeyMode::HoldConference => "hold_conference",
+        KeyMode::Empty => "empty",
+        KeyMode::Unknown(_) => "unknown",
+    }
 }
 
 fn parse_soft_key(raw: &str) -> Option<SoftKey> {
@@ -2302,53 +3077,17 @@ fn canonical_profile_name(raw: &str) -> String {
 }
 
 fn parse_line(section: &RawSection, general: &GeneralConfig) -> Result<ParsedLine, ConfigError> {
-    let mut incoming_limit = None;
-    let mut mailbox = None;
-    let mut voicemail_number = None;
-    let mut voicemail_transfer = None;
-    let mut call_groups = None;
-    let mut pickup_groups = None;
-    let mut named_call_groups = None;
-    let mut named_pickup_groups = None;
-    let mut directed_pickup = None;
-    let mut directed_pickup_context = None;
-    let mut pickup_mode_answer = None;
-    let mut parking_lot = None;
-    let mut conference_enabled = None;
-    let mut conference_destination = None;
-    let mut conference_options = None;
-    let mut hotline_destination = None;
-    let mut initial_dialtone_tone = None;
-    let mut secondary_dialtone_digits = None;
-    let mut secondary_dialtone_tone = None;
-    let mut mobility_pin = None;
-    let mut registration_extensions = None;
-    let mut video_mode = None;
-    let mut audio_encryption = None;
-    let mut echo_cancellation = None;
-    let mut silence_suppression = None;
-    let mut language = None;
-    let mut account_code = None;
-    let mut channel_variables = Vec::new();
-    let mut codec_settings = Vec::new();
+    let mut draft = LineSectionDraft::default();
 
-    for entry in &section.values {
-        let key = &entry.key;
-        let raw = &entry.value;
-        let diagnostic = entry.diagnostic_key();
-        match normalize_name(key).as_str() {
-            "type" | "label" | "context" | "callerid" => {}
-            "incominglimit" => {
-                if !key.eq_ignore_ascii_case("incominglimit") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact line option name incominglimit",
-                        false,
-                    ));
-                }
+    for entry in deserialize_entries::<LineOption>(section)? {
+        let key = &entry.source.key;
+        let raw = &entry.source.value;
+        let diagnostic = entry.source.diagnostic_key();
+        match entry.key {
+            LineOption::Type | LineOption::Label | LineOption::Context | LineOption::CallerId => {}
+            LineOption::IncomingLimit => {
                 set_once(
-                    &mut incoming_limit,
+                    &mut draft.incoming_limit,
                     section,
                     key,
                     raw,
@@ -2361,247 +3100,203 @@ fn parse_line(section: &RawSection, general: &GeneralConfig) -> Result<ParsedLin
                         })?,
                 )?;
             }
-            "language" => set_once(
-                &mut language,
+            LineOption::Language => set_once(
+                &mut draft.language,
                 section,
                 key,
                 raw,
                 parse_metadata_required(&diagnostic, raw, MAX_LANGUAGE_BYTES, false)?,
             )?,
-            "accountcode" => set_once(
-                &mut account_code,
+            LineOption::AccountCode => set_once(
+                &mut draft.account_code,
                 section,
                 key,
                 "<redacted>",
                 parse_metadata_optional(&diagnostic, raw, MAX_ACCOUNT_CODE_BYTES, true)?,
             )?,
-            "setvar" => push_channel_variable(&mut channel_variables, &diagnostic, raw)?,
-            "mailbox" => set_once(
-                &mut mailbox,
+            LineOption::SetVariable => {
+                push_channel_variable(&mut draft.channel_variables, &diagnostic, raw)?
+            }
+            LineOption::Mailbox => set_once(
+                &mut draft.mailbox,
                 section,
                 key,
                 raw,
                 parse_mailbox(&diagnostic, raw)?,
             )?,
-            "vmnum" | "voicemailnumber" => set_once(
-                &mut voicemail_number,
+            LineOption::VoicemailNumber => set_once(
+                &mut draft.voicemail_number,
                 section,
                 key,
                 "<redacted>",
                 parse_optional_voicemail_destination(&diagnostic, raw)?,
             )?,
-            "trnsfvm" | "voicemailtransfer" | "transfertovoicemail" => set_once(
-                &mut voicemail_transfer,
+            LineOption::VoicemailTransfer => set_once(
+                &mut draft.voicemail_transfer,
                 section,
                 key,
                 "<redacted>",
                 parse_optional_voicemail_destination(&diagnostic, raw)?,
             )?,
-            "callgroup" => set_once(
-                &mut call_groups,
+            LineOption::CallGroup => set_once(
+                &mut draft.call_groups,
                 section,
                 key,
                 raw,
                 parse_numeric_groups(&diagnostic, raw)?,
             )?,
-            "pickupgroup" => set_once(
-                &mut pickup_groups,
+            LineOption::PickupGroup => set_once(
+                &mut draft.pickup_groups,
                 section,
                 key,
                 raw,
                 parse_numeric_groups(&diagnostic, raw)?,
             )?,
-            "namedcallgroup" => set_once(
-                &mut named_call_groups,
+            LineOption::NamedCallGroup => set_once(
+                &mut draft.named_call_groups,
                 section,
                 key,
                 raw,
                 parse_named_groups(&diagnostic, raw)?,
             )?,
-            "namedpickupgroup" => set_once(
-                &mut named_pickup_groups,
+            LineOption::NamedPickupGroup => set_once(
+                &mut draft.named_pickup_groups,
                 section,
                 key,
                 raw,
                 parse_named_groups(&diagnostic, raw)?,
             )?,
-            "directedpickup" => set_once(
-                &mut directed_pickup,
+            LineOption::DirectedPickup => set_once(
+                &mut draft.directed_pickup,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "directedpickupcontext" => set_once(
-                &mut directed_pickup_context,
+            LineOption::DirectedPickupContext => set_once(
+                &mut draft.directed_pickup_context,
                 section,
                 key,
                 raw,
                 parse_optional_setting(&diagnostic, raw)?,
             )?,
-            "pickupmodeanswer" | "directedpickupmodeanswer" => set_once(
-                &mut pickup_mode_answer,
+            LineOption::PickupModeAnswer => set_once(
+                &mut draft.pickup_mode_answer,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "parkinglot" => set_once(
-                &mut parking_lot,
+            LineOption::ParkingLot => set_once(
+                &mut draft.parking_lot,
                 section,
                 key,
                 raw,
                 parse_empty_optional_setting(&diagnostic, raw)?,
             )?,
-            "meetme" => set_once(
-                &mut conference_enabled,
+            LineOption::ConferenceEnabled => set_once(
+                &mut draft.conference_enabled,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "meetmenum" => set_once(
-                &mut conference_destination,
+            LineOption::ConferenceNumber => set_once(
+                &mut draft.conference_destination,
                 section,
                 key,
                 raw,
                 parse_empty_optional_setting(&diagnostic, raw)?,
             )?,
-            "meetmeopts" => set_once(
-                &mut conference_options,
+            LineOption::ConferenceOptions => set_once(
+                &mut draft.conference_options,
                 section,
                 key,
                 raw,
                 parse_application_options(&diagnostic, raw)?,
             )?,
-            "adhocnumber" => set_once(
-                &mut hotline_destination,
+            LineOption::AdhocNumber => set_once(
+                &mut draft.hotline_destination,
                 section,
                 key,
                 "<redacted>",
                 parse_optional_hotline_destination(&diagnostic, raw)?,
             )?,
-            "initialdialtonetone" => {
-                if !key.eq_ignore_ascii_case("initial_dialtone_tone") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact line option name initial_dialtone_tone",
-                        false,
-                    ));
-                }
+            LineOption::InitialDialtoneTone => {
                 set_once(
-                    &mut initial_dialtone_tone,
+                    &mut draft.initial_dialtone_tone,
                     section,
                     key,
                     raw,
                     parse_tone(&diagnostic, raw)?,
                 )?;
             }
-            "secondarydialtonedigits" => {
-                if !key.eq_ignore_ascii_case("secondary_dialtone_digits") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact line option name secondary_dialtone_digits",
-                        false,
-                    ));
-                }
+            LineOption::SecondaryDialtoneDigits => {
                 set_once(
-                    &mut secondary_dialtone_digits,
+                    &mut draft.secondary_dialtone_digits,
                     section,
                     key,
                     raw,
                     parse_secondary_dialtone_digits(&diagnostic, raw)?,
                 )?;
             }
-            "secondarydialtonetone" => {
-                if !key.eq_ignore_ascii_case("secondary_dialtone_tone") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact line option name secondary_dialtone_tone",
-                        false,
-                    ));
-                }
+            LineOption::SecondaryDialtoneTone => {
                 set_once(
-                    &mut secondary_dialtone_tone,
+                    &mut draft.secondary_dialtone_tone,
                     section,
                     key,
                     raw,
                     parse_tone(&diagnostic, raw)?,
                 )?;
             }
-            "pin" => {
-                if key != "pin" {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact line option name pin",
-                        true,
-                    ));
-                }
+            LineOption::Pin => {
                 let pin = parse_mobility_pin(&diagnostic, raw)?;
-                set_once(&mut mobility_pin, section, key, "<redacted>", pin)?;
+                set_once(&mut draft.mobility_pin, section, key, "<redacted>", pin)?;
             }
-            "regexten" => {
-                if key != "regexten" {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact line option name regexten",
-                        false,
-                    ));
-                }
+            LineOption::RegistrationExtension => {
                 set_once(
-                    &mut registration_extensions,
+                    &mut draft.registration_extensions,
                     section,
                     key,
                     raw,
                     parse_registration_extensions(&diagnostic, raw)?,
                 )?;
             }
-            "allow" => codec_settings.push((true, raw.as_str())),
-            "disallow" => codec_settings.push((false, raw.as_str())),
-            "videomode" => set_once(
-                &mut video_mode,
+            LineOption::Allow => draft.codec_settings.push((true, raw.as_str())),
+            LineOption::Disallow => draft.codec_settings.push((false, raw.as_str())),
+            LineOption::VideoMode => set_once(
+                &mut draft.video_mode,
                 section,
                 key,
                 raw,
                 parse_video_mode(&diagnostic, raw)?,
             )?,
-            "audioencryption" => set_once(
-                &mut audio_encryption,
+            LineOption::AudioEncryption => set_once(
+                &mut draft.audio_encryption,
                 section,
                 key,
                 raw,
                 parse_media_encryption_policy(&diagnostic, raw)?,
             )?,
-            "echocancel" => set_once(
-                &mut echo_cancellation,
+            LineOption::EchoCancel => set_once(
+                &mut draft.echo_cancellation,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "silencesuppression" => set_once(
-                &mut silence_suppression,
+            LineOption::SilenceSuppression => set_once(
+                &mut draft.silence_suppression,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            _ => {
-                return Err(ConfigError::InvalidValue {
-                    key: diagnostic,
-                    value: format!("{raw:?}; expected a recognized line option"),
-                });
-            }
         }
     }
 
     let number = section.name.clone();
-    let registration_extensions = registration_extensions.flatten();
+    let registration_extensions = draft.registration_extensions.take().flatten();
     if registration_extensions.is_some() && general.registration.contexts.is_empty() {
         return Err(invalid_option(
             section.diagnostic_key("regexten"),
@@ -2623,27 +3318,27 @@ fn parse_line(section: &RawSection, general: &GeneralConfig) -> Result<ParsedLin
             context: None,
         }]
     });
-    let conference_destination = conference_destination.unwrap_or(None);
-    if conference_enabled == Some(false)
-        && (conference_destination.is_some() || conference_options.is_some())
+    let conference_destination = draft.conference_destination.take().unwrap_or(None);
+    if draft.conference_enabled == Some(false)
+        && (conference_destination.is_some() || draft.conference_options.is_some())
     {
         return Err(ConfigError::InvalidValue {
             key: format!("{}.meetme", section.name),
             value: "disabled with conference destination or options".into(),
         });
     }
-    if conference_enabled == Some(true) && conference_destination.is_none() {
+    if draft.conference_enabled == Some(true) && conference_destination.is_none() {
         return Err(ConfigError::InvalidValue {
             key: format!("{}.meetmenum", section.name),
             value: "conference dialing is enabled without a destination".into(),
         });
     }
-    let codecs = if codec_settings.is_empty() {
+    let codecs = if draft.codec_settings.is_empty() {
         general.codecs.clone()
     } else {
         apply_codec_settings(
             Vec::new(),
-            &codec_settings,
+            &draft.codec_settings,
             &format!("{}.codecs", section.name),
         )?
     };
@@ -2660,55 +3355,59 @@ fn parse_line(section: &RawSection, general: &GeneralConfig) -> Result<ParsedLin
             )?,
             caller_name,
             caller_number,
-            mailbox: mailbox.unwrap_or(None),
-            language: language.unwrap_or_else(|| general.language.clone()),
-            account_code: account_code.unwrap_or_else(|| general.account_code.clone()),
-            channel_variables,
+            mailbox: draft.mailbox.unwrap_or(None),
+            language: draft.language.unwrap_or_else(|| general.language.clone()),
+            account_code: draft
+                .account_code
+                .unwrap_or_else(|| general.account_code.clone()),
+            channel_variables: draft.channel_variables,
         },
         features: LineFeatureConfig {
-            incoming_limit: incoming_limit.unwrap_or(6),
+            incoming_limit: draft.incoming_limit.unwrap_or(6),
             voicemail: VoicemailDefaults {
-                number: voicemail_number.unwrap_or(None),
-                transfer_destination: voicemail_transfer.unwrap_or(None),
+                number: draft.voicemail_number.unwrap_or(None),
+                transfer_destination: draft.voicemail_transfer.unwrap_or(None),
             },
             pickup: PickupConfig {
-                call_groups: call_groups.unwrap_or_default(),
-                pickup_groups: pickup_groups.unwrap_or_default(),
-                named_call_groups: named_call_groups.unwrap_or_default(),
-                named_pickup_groups: named_pickup_groups.unwrap_or_default(),
-                directed: directed_pickup.unwrap_or(true),
-                directed_context: directed_pickup_context.unwrap_or(None),
-                answer_directed: pickup_mode_answer.unwrap_or(true),
+                call_groups: draft.call_groups.unwrap_or_default(),
+                pickup_groups: draft.pickup_groups.unwrap_or_default(),
+                named_call_groups: draft.named_call_groups.unwrap_or_default(),
+                named_pickup_groups: draft.named_pickup_groups.unwrap_or_default(),
+                directed: draft.directed_pickup.unwrap_or(true),
+                directed_context: draft.directed_pickup_context.unwrap_or(None),
+                answer_directed: draft.pickup_mode_answer.unwrap_or(true),
             },
             parking: LineParkingConfig {
-                lot: parking_lot.unwrap_or(None),
+                lot: draft.parking_lot.unwrap_or(None),
             },
             conference: LineConferenceConfig {
-                enabled: conference_enabled,
+                enabled: draft.conference_enabled,
                 destination: conference_destination,
-                application_options: conference_options,
+                application_options: draft.conference_options,
             },
             hotline: LineHotlineConfig {
-                destination: hotline_destination.unwrap_or(None),
+                destination: draft.hotline_destination.unwrap_or(None),
             },
             dial_tones: LineDialToneConfig {
-                initial: initial_dialtone_tone.unwrap_or(Tone::InsideDial),
-                secondary_prefix: secondary_dialtone_digits.unwrap_or(None),
-                secondary: secondary_dialtone_tone.unwrap_or(Tone::OutsideDial),
+                initial: draft.initial_dialtone_tone.unwrap_or(Tone::InsideDial),
+                secondary_prefix: draft.secondary_dialtone_digits.unwrap_or(None),
+                secondary: draft.secondary_dialtone_tone.unwrap_or(Tone::OutsideDial),
             },
             mobility: LineMobilityConfig {
-                pin: mobility_pin.flatten(),
+                pin: draft.mobility_pin.flatten(),
             },
             registration: LineRegistrationConfig {
                 extensions: registration_extensions,
             },
             media: LineMediaConfig {
                 codecs,
-                audio_encryption: audio_encryption
+                audio_encryption: draft
+                    .audio_encryption
                     .unwrap_or_else(|| general.audio_encryption.clone()),
-                video_mode: video_mode.unwrap_or(VideoMode::Auto),
+                video_mode: draft.video_mode.unwrap_or(VideoMode::Auto),
                 audio_processing: AudioProcessingPolicy {
-                    echo_cancellation: echo_cancellation
+                    echo_cancellation: draft
+                        .echo_cancellation
                         .map(|enabled| {
                             if enabled {
                                 EchoCancellation::On
@@ -2717,7 +3416,8 @@ fn parse_line(section: &RawSection, general: &GeneralConfig) -> Result<ParsedLin
                             }
                         })
                         .unwrap_or(general.audio_processing.echo_cancellation),
-                    silence_suppression: silence_suppression
+                    silence_suppression: draft
+                        .silence_suppression
                         .map(|enabled| {
                             if enabled {
                                 SilenceSuppression::On
@@ -2740,60 +3440,17 @@ fn parse_device(
 ) -> Result<DeviceConfig, ConfigError> {
     let id = DeviceId::new(&section.name)
         .map_err(|_| ConfigError::InvalidDevice(section.name.clone()))?;
-    let mut buttons = Vec::new();
-    let mut feature_arguments = HashMap::new();
-    let mut instances = ButtonInstances::default();
-    let mut soft_key_profile = None;
-    let mut forward_all_enabled = None;
-    let mut forward_busy_enabled = None;
-    let mut forward_no_answer_enabled = None;
-    let mut forward_no_answer_timeout = None;
-    let mut forward_all = None;
-    let mut forward_busy = None;
-    let mut forward_no_answer = None;
-    let mut dnd_enabled = None;
-    let mut dnd = None;
-    let mut privacy_enabled = None;
-    let mut privacy = None;
-    let mut parking_enabled = None;
-    let mut conference_allowed = None;
-    let mut conference_music_on_hold_class = None;
-    let mut conference_play_general_announcements = None;
-    let mut conference_play_participant_announcements = None;
-    let mut conference_mute_on_entry = None;
-    let mut conference_show_list = None;
-    let mut conference_dialing_enabled = None;
-    let mut conference_application_options = None;
-    let mut use_redial_menu = None;
-    let mut allow_ringing_notification = None;
-    let mut mwi_lamp_mode = None;
-    let mut mwi_on_call = None;
-    let mut legacy_code_page = None;
-    let mut allow_overlap = None;
-    let mut dtmf_mode = None;
-    let mut direct_media = None;
-    let mut early_media = None;
-    let mut audio_encryption = None;
-    let mut codec_settings = Vec::new();
-    let mut acl_rules = Vec::new();
-    let mut acl_configured = false;
-    let mut permitted_hosts = Vec::new();
-    let mut permitted_hosts_configured = false;
-    let mut nat = None;
-    let mut qos = general.qos;
-    let mut transport = None;
-    let mut configured_feature_defaults = Vec::new();
-    let mut channel_variables = Vec::new();
+    let mut draft = DeviceSectionDraft::default();
     let mut section_values = SectionValues::new(section);
 
-    for entry in &section.values {
-        let key = &entry.key;
-        let raw = &entry.value;
-        let diagnostic = entry.diagnostic_key();
-        let parsed = match normalize_name(key).as_str() {
-            "type" | "description" => continue,
-            "softkeyprofile" => {
-                if soft_key_profile.is_some() {
+    for entry in deserialize_entries::<DeviceOption>(section)? {
+        let key = &entry.source.key;
+        let raw = &entry.source.value;
+        let diagnostic = entry.source.diagnostic_key();
+        let parsed = match entry.key {
+            DeviceOption::Type | DeviceOption::Description => continue,
+            DeviceOption::SoftkeyProfile => {
+                if draft.soft_key_profile.is_some() {
                     return Err(invalid_option(
                         &diagnostic,
                         raw,
@@ -2816,12 +3473,12 @@ fn parse_device(
                         profile: raw.clone(),
                     });
                 }
-                soft_key_profile = Some(name);
+                draft.soft_key_profile = Some(name);
                 continue;
             }
-            "cfwdall" | "forwardallenabled" => {
+            DeviceOption::ForwardAllEnabled => {
                 set_once(
-                    &mut forward_all_enabled,
+                    &mut draft.forward_all_enabled,
                     section,
                     key,
                     raw,
@@ -2829,9 +3486,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "cfwdbusy" | "forwardbusyenabled" => {
+            DeviceOption::ForwardBusyEnabled => {
                 set_once(
-                    &mut forward_busy_enabled,
+                    &mut draft.forward_busy_enabled,
                     section,
                     key,
                     raw,
@@ -2839,9 +3496,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "cfwdnoanswer" | "forwardnoanswerenabled" => {
+            DeviceOption::ForwardNoAnswerEnabled => {
                 set_once(
-                    &mut forward_no_answer_enabled,
+                    &mut draft.forward_no_answer_enabled,
                     section,
                     key,
                     raw,
@@ -2849,7 +3506,7 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "cfwdnoanswertimeout" | "forwardnoanswertimeout" => {
+            DeviceOption::ForwardNoAnswerTimeout => {
                 let timeout = parse::<u32>(&diagnostic, raw)?;
                 if timeout == 0 || timeout > 86_400 {
                     return Err(ConfigError::InvalidValue {
@@ -2857,12 +3514,18 @@ fn parse_device(
                         value: format!("{raw:?}; expected timeout seconds 1..86400"),
                     });
                 }
-                set_once(&mut forward_no_answer_timeout, section, key, raw, timeout)?;
+                set_once(
+                    &mut draft.forward_no_answer_timeout,
+                    section,
+                    key,
+                    raw,
+                    timeout,
+                )?;
                 continue;
             }
-            "forwardall" => {
+            DeviceOption::ForwardAll => {
                 set_once(
-                    &mut forward_all,
+                    &mut draft.forward_all,
                     section,
                     key,
                     raw,
@@ -2870,9 +3533,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "forwardbusy" => {
+            DeviceOption::ForwardBusy => {
                 set_once(
-                    &mut forward_busy,
+                    &mut draft.forward_busy,
                     section,
                     key,
                     raw,
@@ -2880,9 +3543,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "forwardnoanswer" => {
+            DeviceOption::ForwardNoAnswer => {
                 set_once(
-                    &mut forward_no_answer,
+                    &mut draft.forward_no_answer,
                     section,
                     key,
                     raw,
@@ -2890,9 +3553,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "dndfeature" => {
+            DeviceOption::DndFeature => {
                 set_once(
-                    &mut dnd_enabled,
+                    &mut draft.dnd_enabled,
                     section,
                     key,
                     raw,
@@ -2900,9 +3563,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "dnd" => {
+            DeviceOption::Dnd => {
                 set_once(
-                    &mut dnd,
+                    &mut draft.dnd,
                     section,
                     key,
                     raw,
@@ -2910,9 +3573,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "private" | "privacyfeature" => {
+            DeviceOption::PrivacyFeature => {
                 set_once(
-                    &mut privacy_enabled,
+                    &mut draft.privacy_enabled,
                     section,
                     key,
                     raw,
@@ -2920,9 +3583,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "privacy" => {
+            DeviceOption::Privacy => {
                 set_once(
-                    &mut privacy,
+                    &mut draft.privacy,
                     section,
                     key,
                     raw,
@@ -2930,17 +3593,19 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "featuredefault" => {
-                configured_feature_defaults.push(parse_feature_default(&diagnostic, raw)?);
+            DeviceOption::FeatureDefault => {
+                draft
+                    .configured_feature_defaults
+                    .push(parse_feature_default(&diagnostic, raw)?);
                 continue;
             }
-            "setvar" => {
-                push_channel_variable(&mut channel_variables, &diagnostic, raw)?;
+            DeviceOption::SetVariable => {
+                push_channel_variable(&mut draft.channel_variables, &diagnostic, raw)?;
                 continue;
             }
-            "park" => {
+            DeviceOption::Park => {
                 set_once(
-                    &mut parking_enabled,
+                    &mut draft.parking_enabled,
                     section,
                     key,
                     raw,
@@ -2948,9 +3613,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "confallow" => {
+            DeviceOption::ConferenceAllow => {
                 set_once(
-                    &mut conference_allowed,
+                    &mut draft.conference_allowed,
                     section,
                     key,
                     raw,
@@ -2958,9 +3623,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "confmusiconholdclass" => {
+            DeviceOption::ConferenceMusicOnHoldClass => {
                 set_once(
-                    &mut conference_music_on_hold_class,
+                    &mut draft.conference_music_on_hold_class,
                     section,
                     key,
                     raw,
@@ -2968,9 +3633,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "confplaygeneralannounce" => {
+            DeviceOption::ConferencePlayGeneralAnnounce => {
                 set_once(
-                    &mut conference_play_general_announcements,
+                    &mut draft.conference_play_general_announcements,
                     section,
                     key,
                     raw,
@@ -2978,9 +3643,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "confplaypartannounce" => {
+            DeviceOption::ConferencePlayParticipantAnnounce => {
                 set_once(
-                    &mut conference_play_participant_announcements,
+                    &mut draft.conference_play_participant_announcements,
                     section,
                     key,
                     raw,
@@ -2988,9 +3653,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "confmuteonentry" => {
+            DeviceOption::ConferenceMuteOnEntry => {
                 set_once(
-                    &mut conference_mute_on_entry,
+                    &mut draft.conference_mute_on_entry,
                     section,
                     key,
                     raw,
@@ -2998,9 +3663,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "confshowconflist" => {
+            DeviceOption::ConferenceShowList => {
                 set_once(
-                    &mut conference_show_list,
+                    &mut draft.conference_show_list,
                     section,
                     key,
                     raw,
@@ -3008,9 +3673,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "meetme" => {
+            DeviceOption::ConferenceDialingEnabled => {
                 set_once(
-                    &mut conference_dialing_enabled,
+                    &mut draft.conference_dialing_enabled,
                     section,
                     key,
                     raw,
@@ -3018,9 +3683,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "meetmeopts" => {
+            DeviceOption::ConferenceOptions => {
                 set_once(
-                    &mut conference_application_options,
+                    &mut draft.conference_application_options,
                     section,
                     key,
                     raw,
@@ -3028,17 +3693,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "useredialmenu" => {
-                if !key.eq_ignore_ascii_case("useRedialMenu") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact device option name useRedialMenu",
-                        false,
-                    ));
-                }
+            DeviceOption::UseRedialMenu => {
                 set_once(
-                    &mut use_redial_menu,
+                    &mut draft.use_redial_menu,
                     section,
                     key,
                     raw,
@@ -3046,17 +3703,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "allowringinnotification" => {
-                if !key.eq_ignore_ascii_case("allowRinginNotification") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact device option name allowRinginNotification",
-                        false,
-                    ));
-                }
+            DeviceOption::AllowRinginNotification => {
                 set_once(
-                    &mut allow_ringing_notification,
+                    &mut draft.allow_ringing_notification,
                     section,
                     key,
                     raw,
@@ -3064,7 +3713,7 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "mwilamp" => {
+            DeviceOption::MwiLamp => {
                 let mode = match raw.trim().to_ascii_lowercase().as_str() {
                     "off" => LampMode::Off,
                     "on" => LampMode::On,
@@ -3080,12 +3729,12 @@ fn parse_device(
                         ));
                     }
                 };
-                set_once(&mut mwi_lamp_mode, section, key, raw, mode)?;
+                set_once(&mut draft.mwi_lamp_mode, section, key, raw, mode)?;
                 continue;
             }
-            "mwioncall" => {
+            DeviceOption::MwiOnCall => {
                 set_once(
-                    &mut mwi_on_call,
+                    &mut draft.mwi_on_call,
                     section,
                     key,
                     raw,
@@ -3093,7 +3742,7 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "phonecodepage" => {
+            DeviceOption::PhoneCodePage => {
                 let code_page = match normalize_name(raw).as_str() {
                     "iso88591" | "latin1" => LegacyCodePage::Iso8859_1,
                     "ascii" | "usascii" => LegacyCodePage::Ascii,
@@ -3106,20 +3755,12 @@ fn parse_device(
                         ));
                     }
                 };
-                set_once(&mut legacy_code_page, section, key, raw, code_page)?;
+                set_once(&mut draft.legacy_code_page, section, key, raw, code_page)?;
                 continue;
             }
-            "allowoverlap" => {
-                if !key.eq_ignore_ascii_case("allowoverlap") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact device option name allowoverlap",
-                        false,
-                    ));
-                }
+            DeviceOption::AllowOverlap => {
                 set_once(
-                    &mut allow_overlap,
+                    &mut draft.allow_overlap,
                     section,
                     key,
                     raw,
@@ -3127,9 +3768,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "forcedtmfmode" => {
+            DeviceOption::ForceDtmfMode => {
                 set_once(
-                    &mut dtmf_mode,
+                    &mut draft.dtmf_mode,
                     section,
                     key,
                     raw,
@@ -3137,9 +3778,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "directrtp" => {
+            DeviceOption::DirectMedia => {
                 set_once(
-                    &mut direct_media,
+                    &mut draft.direct_media,
                     section,
                     key,
                     raw,
@@ -3147,9 +3788,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "earlyrtp" => {
+            DeviceOption::EarlyMedia => {
                 set_once(
-                    &mut early_media,
+                    &mut draft.early_media,
                     section,
                     key,
                     raw,
@@ -3157,9 +3798,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "audioencryption" => {
+            DeviceOption::AudioEncryption => {
                 set_once(
-                    &mut audio_encryption,
+                    &mut draft.audio_encryption,
                     section,
                     key,
                     raw,
@@ -3167,11 +3808,10 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "deny" | "permit" => {
-                acl_configured = true;
+            DeviceOption::Deny | DeviceOption::Permit => {
                 apply_acl_entry(
-                    &mut acl_rules,
-                    if normalize_name(key) == "permit" {
+                    draft.acl_rules.get_or_insert_default(),
+                    if matches!(entry.key, DeviceOption::Permit) {
                         AclAction::Permit
                     } else {
                         AclAction::Deny
@@ -3181,8 +3821,8 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "permithost" => {
-                permitted_hosts_configured = true;
+            DeviceOption::PermitHost => {
+                let permitted_hosts = draft.permitted_hosts.get_or_insert_default();
                 if raw.trim().is_empty() {
                     permitted_hosts.clear();
                 } else {
@@ -3199,9 +3839,9 @@ fn parse_device(
                 }
                 continue;
             }
-            "nat" => {
+            DeviceOption::Nat => {
                 set_once(
-                    &mut nat,
+                    &mut draft.nat,
                     section,
                     key,
                     raw,
@@ -3209,9 +3849,9 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "transport" | "transportrequirement" => {
+            DeviceOption::Transport => {
                 set_once(
-                    &mut transport,
+                    &mut draft.transport,
                     section,
                     key,
                     raw,
@@ -3219,56 +3859,56 @@ fn parse_device(
                 )?;
                 continue;
             }
-            "sccptos" | "signalingtos" => {
-                section_values.claim_alias("signaling_dscp", entry)?;
-                qos.signaling.dscp = parse_tos_as_dscp(&diagnostic, raw)?;
+            DeviceOption::SignalingTos => {
+                section_values.claim_alias("signaling_dscp", entry.source)?;
+                draft.qos.signaling_dscp = Some(parse_tos_as_dscp(&diagnostic, raw)?);
                 continue;
             }
-            "sccpdscp" | "signalingdscp" => {
-                section_values.claim_alias("signaling_dscp", entry)?;
-                qos.signaling.dscp = parse_dscp(&diagnostic, raw)?;
+            DeviceOption::SignalingDscp => {
+                section_values.claim_alias("signaling_dscp", entry.source)?;
+                draft.qos.signaling_dscp = Some(parse_dscp(&diagnostic, raw)?);
                 continue;
             }
-            "sccpcos" | "signalingcos" => {
-                section_values.claim_alias("signaling_cos", entry)?;
-                qos.signaling.cos = parse_cos(&diagnostic, raw)?;
+            DeviceOption::SignalingCos => {
+                section_values.claim_alias("signaling_cos", entry.source)?;
+                draft.qos.signaling_cos = Some(parse_cos(&diagnostic, raw)?);
                 continue;
             }
-            "audiotos" => {
-                section_values.claim_alias("audio_dscp", entry)?;
-                qos.audio.dscp = parse_tos_as_dscp(&diagnostic, raw)?;
+            DeviceOption::AudioTos => {
+                section_values.claim_alias("audio_dscp", entry.source)?;
+                draft.qos.audio_dscp = Some(parse_tos_as_dscp(&diagnostic, raw)?);
                 continue;
             }
-            "audiodscp" => {
-                section_values.claim_alias("audio_dscp", entry)?;
-                qos.audio.dscp = parse_dscp(&diagnostic, raw)?;
+            DeviceOption::AudioDscp => {
+                section_values.claim_alias("audio_dscp", entry.source)?;
+                draft.qos.audio_dscp = Some(parse_dscp(&diagnostic, raw)?);
                 continue;
             }
-            "audiocos" => {
-                section_values.claim_alias("audio_cos", entry)?;
-                qos.audio.cos = parse_cos(&diagnostic, raw)?;
+            DeviceOption::AudioCos => {
+                section_values.claim_alias("audio_cos", entry.source)?;
+                draft.qos.audio_cos = Some(parse_cos(&diagnostic, raw)?);
                 continue;
             }
-            "videotos" => {
-                section_values.claim_alias("video_dscp", entry)?;
-                qos.video.dscp = parse_tos_as_dscp(&diagnostic, raw)?;
+            DeviceOption::VideoTos => {
+                section_values.claim_alias("video_dscp", entry.source)?;
+                draft.qos.video_dscp = Some(parse_tos_as_dscp(&diagnostic, raw)?);
                 continue;
             }
-            "videodscp" => {
-                section_values.claim_alias("video_dscp", entry)?;
-                qos.video.dscp = parse_dscp(&diagnostic, raw)?;
+            DeviceOption::VideoDscp => {
+                section_values.claim_alias("video_dscp", entry.source)?;
+                draft.qos.video_dscp = Some(parse_dscp(&diagnostic, raw)?);
                 continue;
             }
-            "videocos" => {
-                section_values.claim_alias("video_cos", entry)?;
-                qos.video.cos = parse_cos(&diagnostic, raw)?;
+            DeviceOption::VideoCos => {
+                section_values.claim_alias("video_cos", entry.source)?;
+                draft.qos.video_cos = Some(parse_cos(&diagnostic, raw)?);
                 continue;
             }
-            "trustphoneip" | "dtmfmode" => {
+            DeviceOption::TrustPhoneIp | DeviceOption::ObsoleteDtmfMode => {
                 return Err(invalid_option(
                     &diagnostic,
                     raw,
-                    if normalize_name(key) == "trustphoneip" {
+                    if matches!(entry.key, DeviceOption::TrustPhoneIp) {
                         "remove obsolete trustphoneip; peer addresses are always authoritative"
                     } else {
                         "remove obsolete dtmfmode and use force_dtmfmode"
@@ -3276,33 +3916,30 @@ fn parse_device(
                     false,
                 ));
             }
-            "allow" => {
-                codec_settings.push((true, raw.as_str()));
+            DeviceOption::Allow => {
+                draft.codec_settings.push((true, raw.as_str()));
                 continue;
             }
-            "disallow" => {
-                codec_settings.push((false, raw.as_str()));
+            DeviceOption::Disallow => {
+                draft.codec_settings.push((false, raw.as_str()));
                 continue;
             }
-            "line" => parse_line_button(raw, &id, lines, &mut instances)?,
-            "button" => parse_button(raw, &id, lines, &mut instances)?,
-            _ => {
-                return Err(section_values.unknown(entry, "device", normalize_name(key).as_str()));
-            }
+            DeviceOption::Line => parse_line_button(raw, &id, lines, &mut draft.instances)?,
+            DeviceOption::Button => parse_button(raw, &id, lines, &mut draft.instances)?,
         };
         if let Some((instance, argument)) = parsed.feature_argument {
-            feature_arguments.insert(instance, argument);
+            draft.feature_arguments.insert(instance, argument);
         }
-        buttons.push(parsed.definition);
+        draft.buttons.push(parsed.definition);
     }
 
-    for feature in buttons.iter().filter_map(|button| match button {
+    for feature in draft.buttons.iter().filter_map(|button| match button {
         ButtonDefinition::Feature(feature) if feature.feature == ButtonType::DoNotDisturb => {
             Some(feature)
         }
         _ => None,
     }) {
-        let Some(argument) = feature_arguments.get_mut(&feature.instance) else {
+        let Some(argument) = draft.feature_arguments.get_mut(&feature.instance) else {
             continue;
         };
         let mode = parse_dnd_button_mode(
@@ -3315,7 +3952,8 @@ fn parse_device(
             .to_owned();
     }
 
-    let line_names: Vec<_> = buttons
+    let line_names: Vec<_> = draft
+        .buttons
         .iter()
         .filter_map(|button| match button {
             ButtonDefinition::Line(line) => Some(line.number.clone()),
@@ -3329,14 +3967,15 @@ fn parse_device(
     let description = value(section, "description")
         .unwrap_or(id.as_str())
         .to_owned();
-    let resolved_soft_key_profile =
-        soft_key_profile.unwrap_or_else(|| DEFAULT_SOFT_KEY_PROFILE.to_owned());
+    let resolved_soft_key_profile = draft
+        .soft_key_profile
+        .unwrap_or_else(|| DEFAULT_SOFT_KEY_PROFILE.to_owned());
     DeviceDefinition {
         id: id.clone(),
         description: description.clone(),
         transport: StationTransportRequirement::Either,
         signaling_qos: None,
-        buttons: buttons.clone(),
+        buttons: draft.buttons.clone(),
         soft_keys: soft_key_profiles
             .get(&resolved_soft_key_profile)
             .expect("device soft-key profile was validated during parsing")
@@ -3350,24 +3989,25 @@ fn parse_device(
     })?;
 
     let mut feature_defaults = DeviceFeatureDefaults::default();
-    feature_defaults.forwarding.all_enabled = forward_all_enabled.unwrap_or(true);
-    feature_defaults.forwarding.busy_enabled = forward_busy_enabled.unwrap_or(true);
-    feature_defaults.forwarding.no_answer_enabled = forward_no_answer_enabled.unwrap_or(true);
-    feature_defaults.forwarding.no_answer_timeout_seconds = forward_no_answer_timeout.unwrap_or(30);
-    feature_defaults.forwarding.all = forward_all.unwrap_or(None);
-    feature_defaults.forwarding.busy = forward_busy.unwrap_or(None);
-    feature_defaults.forwarding.no_answer = forward_no_answer.unwrap_or(None);
-    feature_defaults.dnd_enabled = dnd_enabled.unwrap_or(true);
-    feature_defaults.dnd = dnd.unwrap_or(DndMode::Off);
-    feature_defaults.privacy_enabled = privacy_enabled.unwrap_or(true);
-    feature_defaults.privacy = privacy.unwrap_or(false);
-    for feature in buttons.iter().filter_map(|button| match button {
+    feature_defaults.forwarding.all_enabled = draft.forward_all_enabled.unwrap_or(true);
+    feature_defaults.forwarding.busy_enabled = draft.forward_busy_enabled.unwrap_or(true);
+    feature_defaults.forwarding.no_answer_enabled = draft.forward_no_answer_enabled.unwrap_or(true);
+    feature_defaults.forwarding.no_answer_timeout_seconds =
+        draft.forward_no_answer_timeout.unwrap_or(30);
+    feature_defaults.forwarding.all = draft.forward_all.unwrap_or(None);
+    feature_defaults.forwarding.busy = draft.forward_busy.unwrap_or(None);
+    feature_defaults.forwarding.no_answer = draft.forward_no_answer.unwrap_or(None);
+    feature_defaults.dnd_enabled = draft.dnd_enabled.unwrap_or(true);
+    feature_defaults.dnd = draft.dnd.unwrap_or(DndMode::Off);
+    feature_defaults.privacy_enabled = draft.privacy_enabled.unwrap_or(true);
+    feature_defaults.privacy = draft.privacy.unwrap_or(false);
+    for feature in draft.buttons.iter().filter_map(|button| match button {
         ButtonDefinition::Feature(feature) => Some(feature),
         _ => None,
     }) {
         feature_defaults.buttons.insert(feature.instance, false);
     }
-    for (instance, enabled) in configured_feature_defaults {
+    for (instance, enabled) in draft.configured_feature_defaults {
         let Some(value) = feature_defaults.buttons.get_mut(&instance) else {
             return Err(ConfigError::InvalidValue {
                 key: format!("{}.feature_default", section.name),
@@ -3378,10 +4018,10 @@ fn parse_device(
     }
 
     let mut parking = DeviceParkingConfig {
-        enabled: parking_enabled.unwrap_or(true),
+        enabled: draft.parking_enabled.unwrap_or(true),
         feature_buttons: HashMap::new(),
     };
-    for feature in buttons.iter().filter_map(|button| match button {
+    for feature in draft.buttons.iter().filter_map(|button| match button {
         ButtonDefinition::Feature(feature) if feature.feature == ButtonType::ParkingLot => {
             Some(feature)
         }
@@ -3389,53 +4029,64 @@ fn parse_device(
     }) {
         let button = parse_parking_lot_button(
             &format!("{}.button.feature.{}", section.name, feature.instance),
-            feature_arguments.get(&feature.instance).map(String::as_str),
+            draft
+                .feature_arguments
+                .get(&feature.instance)
+                .map(String::as_str),
         )?;
         parking.feature_buttons.insert(feature.instance, button);
     }
 
     let conference = DeviceConferenceConfig {
-        allowed: conference_allowed.unwrap_or(true),
-        music_on_hold_class: conference_music_on_hold_class
+        allowed: draft.conference_allowed.unwrap_or(true),
+        music_on_hold_class: draft
+            .conference_music_on_hold_class
             .unwrap_or_else(|| Some("default".into())),
-        play_general_announcements: conference_play_general_announcements.unwrap_or(true),
-        play_participant_announcements: conference_play_participant_announcements.unwrap_or(true),
-        mute_on_entry: conference_mute_on_entry.unwrap_or(false),
-        show_conference_list: conference_show_list.unwrap_or(true),
+        play_general_announcements: draft.conference_play_general_announcements.unwrap_or(true),
+        play_participant_announcements: draft
+            .conference_play_participant_announcements
+            .unwrap_or(true),
+        mute_on_entry: draft.conference_mute_on_entry.unwrap_or(false),
+        show_conference_list: draft.conference_show_list.unwrap_or(true),
         dialing: ConferenceDialingConfig {
-            enabled: conference_dialing_enabled.unwrap_or(general.conference_dialing.enabled),
-            application_options: conference_application_options
+            enabled: draft
+                .conference_dialing_enabled
+                .unwrap_or(general.conference_dialing.enabled),
+            application_options: draft
+                .conference_application_options
                 .unwrap_or_else(|| general.conference_dialing.application_options.clone()),
         },
     };
     let call_ui = DeviceCallUiConfig {
-        redial_mode: if use_redial_menu.unwrap_or(false) {
+        redial_mode: if draft.use_redial_menu.unwrap_or(false) {
             RedialMode::PlacedCallsMenu
         } else {
             RedialMode::LastNumber
         },
-        hinted_ringing_notification: allow_ringing_notification.unwrap_or(false),
-        mwi_lamp_mode: mwi_lamp_mode.unwrap_or(LampMode::On),
-        mwi_on_call: mwi_on_call.unwrap_or(false),
-        legacy_code_page: legacy_code_page.unwrap_or(LegacyCodePage::Iso8859_1),
+        hinted_ringing_notification: draft.allow_ringing_notification.unwrap_or(false),
+        mwi_lamp_mode: draft.mwi_lamp_mode.unwrap_or(LampMode::On),
+        mwi_on_call: draft.mwi_on_call.unwrap_or(false),
+        legacy_code_page: draft.legacy_code_page.unwrap_or(LegacyCodePage::Iso8859_1),
     };
-    let codecs = if codec_settings.is_empty() {
+    let codecs = if draft.codec_settings.is_empty() {
         general.codecs.clone()
     } else {
         apply_codec_settings(
             Vec::new(),
-            &codec_settings,
+            &draft.codec_settings,
             &format!("{}.codecs", section.name),
         )?
     };
     let media = DeviceMediaConfig {
         codecs,
-        audio_encryption: audio_encryption.unwrap_or_else(|| general.audio_encryption.clone()),
-        dtmf_mode: dtmf_mode.unwrap_or(DtmfMode::Auto),
-        direct_media: direct_media.unwrap_or(general.direct_media),
-        early_media: early_media.unwrap_or(general.early_media),
+        audio_encryption: draft
+            .audio_encryption
+            .unwrap_or_else(|| general.audio_encryption.clone()),
+        dtmf_mode: draft.dtmf_mode.unwrap_or(DtmfMode::Auto),
+        direct_media: draft.direct_media.unwrap_or(general.direct_media),
+        early_media: draft.early_media.unwrap_or(general.early_media),
     };
-    let transport = transport.unwrap_or_default();
+    let transport = draft.transport.unwrap_or_default();
     if transport == TransportRequirement::Tls && general.listeners.tls.is_none() {
         return Err(invalid_option(
             section.diagnostic_key("transport"),
@@ -3445,18 +4096,13 @@ fn parse_device(
         ));
     }
     let network = DeviceNetworkPolicy {
-        acl: if acl_configured {
-            AccessControlList { rules: acl_rules }
-        } else {
-            general.network.acl.clone()
-        },
-        permitted_hosts: if permitted_hosts_configured {
-            permitted_hosts
-        } else {
-            Vec::new()
-        },
-        nat: nat.unwrap_or(general.network.nat),
-        qos,
+        acl: draft.acl_rules.map_or_else(
+            || general.network.acl.clone(),
+            |rules| AccessControlList { rules },
+        ),
+        permitted_hosts: draft.permitted_hosts.unwrap_or_default(),
+        nat: draft.nat.unwrap_or(general.network.nat),
+        qos: draft.qos.resolve(general.qos),
         transport,
     };
 
@@ -3464,15 +4110,15 @@ fn parse_device(
         id,
         description,
         lines: line_names,
-        buttons,
-        feature_arguments,
-        channel_variables,
+        buttons: draft.buttons,
+        feature_arguments: draft.feature_arguments,
+        channel_variables: draft.channel_variables,
         soft_key_profile: resolved_soft_key_profile,
         feature_defaults,
         parking,
         conference,
         call_ui,
-        allow_overlap: allow_overlap.unwrap_or(general.allow_overlap),
+        allow_overlap: draft.allow_overlap.unwrap_or(general.allow_overlap),
         media,
         network,
     })
@@ -3776,10 +4422,7 @@ fn parse_sections(input: &str) -> Result<Vec<RawSection>, ConfigError> {
     let mut names = HashSet::new();
     for (index, raw_line) in input.lines().enumerate() {
         let line_number = index + 1;
-        let line = raw_line
-            .split_once(';')
-            .map_or(raw_line, |(before, _)| before)
-            .trim();
+        let line = strip_inline_comment(raw_line).trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -3868,8 +4511,8 @@ fn parse_sections(input: &str) -> Result<Vec<RawSection>, ConfigError> {
             });
         };
         section.values.push(RawValue {
-            key: key.trim().to_ascii_lowercase(),
-            value: unquote(value.trim()).to_owned(),
+            key: key.trim().to_owned(),
+            value: unquote(value.trim()),
             line: line_number,
             section: section.name.clone(),
         });
@@ -4248,85 +4891,22 @@ fn parse_hostname(key: &str, raw: &str) -> Result<String, ConfigError> {
 }
 
 fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(), ConfigError> {
-    let mut call_answer_order = None;
-    let mut timezone_offset_minutes = None;
-    let mut date_template = None;
-    let mut ring_type = None;
-    let mut call_waiting_tone = None;
-    let mut call_waiting_interval = None;
-    let mut first_digit_timeout = None;
-    let mut interdigit_timeout = None;
-    let mut dial_terminator = None;
-    let mut record_dial_terminator = None;
-    let mut simulate_enbloc = None;
-    let mut allow_overlap = None;
-    let mut transfer_on_hangup = None;
-    let mut fallback_decision = None;
-    let mut fallback_backoff = None;
-    let mut fallback_server_priority = None;
-    let mut conference_enabled = None;
-    let mut conference_options = None;
-    let mut auto_answer_ring_time = None;
-    let mut auto_answer_tone = None;
-    let mut remote_hangup_tone = None;
-    let mut hotline_enabled = None;
-    let mut hotline_extension = None;
-    let mut hotline_context = None;
-    let mut hotline_label = None;
-    let mut direct_media = None;
-    let mut early_media = None;
-    let mut audio_encryption = None;
-    let mut echo_cancellation = None;
-    let mut silence_suppression = None;
-    let mut jitter_enabled = None;
-    let mut jitter_forced = None;
-    let mut jitter_log_frames = None;
-    let mut jitter_max_size_ms = None;
-    let mut jitter_resync_threshold_ms = None;
-    let mut jitter_implementation = None;
-    let mut registration_contexts = None;
-    let mut codec_settings = Vec::new();
-    let mut clear_bind = None;
-    let mut clear_address = None;
-    let mut clear_port = None;
-    let mut tls_bind = None;
-    let mut tls_address = None;
-    let mut tls_port = None;
-    let mut combined_pem = None;
-    let mut tls_certificate = None;
-    let mut tls_private_key = None;
-    let mut tls_trust_store = None;
-    let mut acl_rules = Vec::new();
-    let mut acl_configured = false;
-    let mut local_networks = Vec::new();
-    let mut local_networks_configured = false;
-    let mut external_address = None;
-    let mut external_hostname = None;
-    let mut external_refresh = None;
-    let mut nat = None;
-    let mut advertised_ipv4 = None;
-    let mut advertised_ipv6 = None;
-    let mut advertised_alias_seen = false;
-    let mut qos = config.qos;
-    let mut device_table = None;
-    let mut line_table = None;
-    let mut language = None;
-    let mut account_code = None;
+    let mut draft = GeneralSectionDraft::default();
     let mut section_values = SectionValues::new(section);
-    for entry in &section.values {
-        let key = &entry.key;
-        let raw = &entry.value;
-        let diagnostic = entry.diagnostic_key();
-        match normalize_name(key).as_str() {
-            "dateformat" => set_once(
-                &mut date_template,
+    for entry in deserialize_entries::<GeneralOption>(section)? {
+        let key = &entry.source.key;
+        let raw = &entry.source.value;
+        let diagnostic = entry.source.diagnostic_key();
+        match entry.key {
+            GeneralOption::DateFormat => set_once(
+                &mut draft.date_template,
                 section,
                 key,
                 raw,
                 DateTemplate::new(raw.trim())
                     .map_err(|error| invalid_option(&diagnostic, raw, &error.to_string(), false))?,
             )?,
-            "tzoffset" => {
+            GeneralOption::TimezoneOffset => {
                 let hours = raw
                     .trim()
                     .parse::<i16>()
@@ -4335,9 +4915,15 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                     .ok_or_else(|| {
                         invalid_option(&diagnostic, raw, "UTC offset -14..14 hours", false)
                     })?;
-                set_once(&mut timezone_offset_minutes, section, key, raw, hours * 60)?;
+                set_once(
+                    &mut draft.timezone_offset_minutes,
+                    section,
+                    key,
+                    raw,
+                    hours * 60,
+                )?;
             }
-            "bind" | "clearbind" => {
+            GeneralOption::Bind => {
                 let address = parse::<SocketAddr>(&diagnostic, raw).map_err(|_| {
                     invalid_option(
                         &diagnostic,
@@ -4354,24 +4940,27 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         false,
                     ));
                 }
-                set_once(&mut clear_bind, section, key, raw, address)?;
+                set_once(&mut draft.clear_bind, section, key, raw, address)?;
             }
-            "bindaddr" | "clearbindaddr" => {
+            GeneralOption::BindAddress => {
                 let address = parse::<IpAddr>(&diagnostic, raw).map_err(|_| {
                     invalid_option(&diagnostic, raw, "an IPv4 or IPv6 address", false)
                 })?;
-                set_once(&mut clear_address, section, key, raw, address)?;
+                set_once(&mut draft.clear_address, section, key, raw, address)?;
             }
-            "port" | "clearport" => {
+            GeneralOption::Port => {
                 let port = parse::<u16>(&diagnostic, raw)
                     .map_err(|_| invalid_option(&diagnostic, raw, "TCP port 1..65535", false))?;
                 if port == 0 {
                     return Err(invalid_option(&diagnostic, raw, "TCP port 1..65535", false));
                 }
-                set_once(&mut clear_port, section, key, raw, port)?;
+                set_once(&mut draft.clear_port, section, key, raw, port)?;
             }
-            "advertisedaddress" => {
-                if advertised_alias_seen || advertised_ipv4.is_some() || advertised_ipv6.is_some() {
+            GeneralOption::AdvertisedAddress => {
+                if draft.advertised_alias_seen
+                    || draft.advertised_ipv4.is_some()
+                    || draft.advertised_ipv6.is_some()
+                {
                     return Err(invalid_option(
                         &diagnostic,
                         raw,
@@ -4379,7 +4968,7 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         false,
                     ));
                 }
-                advertised_alias_seen = true;
+                draft.advertised_alias_seen = true;
                 let address: IpAddr = parse(&diagnostic, raw).map_err(|_| {
                     invalid_option(
                         &diagnostic,
@@ -4398,17 +4987,17 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                 }
                 match address {
                     IpAddr::V4(address) => {
-                        advertised_ipv4 = Some(Some(address));
-                        advertised_ipv6 = Some(None);
+                        draft.advertised_ipv4 = Some(Some(address));
+                        draft.advertised_ipv6 = Some(None);
                     }
                     IpAddr::V6(address) => {
-                        advertised_ipv4 = Some(None);
-                        advertised_ipv6 = Some(Some(address));
+                        draft.advertised_ipv4 = Some(None);
+                        draft.advertised_ipv6 = Some(Some(address));
                     }
                 }
             }
-            "advertisedipv4" | "advertisedaddressipv4" => {
-                if advertised_alias_seen || advertised_ipv4.is_some() {
+            GeneralOption::AdvertisedIpv4 => {
+                if draft.advertised_alias_seen || draft.advertised_ipv4.is_some() {
                     return Err(invalid_option(
                         &diagnostic,
                         raw,
@@ -4417,25 +5006,26 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                     ));
                 }
                 let value = raw.trim();
-                advertised_ipv4 = Some(if value.is_empty() || value.eq_ignore_ascii_case("none") {
-                    None
-                } else {
-                    let address: Ipv4Addr = parse(&diagnostic, value).map_err(|_| {
-                        invalid_option(&diagnostic, raw, "an IPv4 address or none", false)
-                    })?;
-                    if address.is_unspecified() {
-                        return Err(invalid_option(
-                            &diagnostic,
-                            raw,
-                            "a non-unspecified IPv4 address or none",
-                            false,
-                        ));
-                    }
-                    Some(address)
-                });
+                draft.advertised_ipv4 =
+                    Some(if value.is_empty() || value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        let address: Ipv4Addr = parse(&diagnostic, value).map_err(|_| {
+                            invalid_option(&diagnostic, raw, "an IPv4 address or none", false)
+                        })?;
+                        if address.is_unspecified() {
+                            return Err(invalid_option(
+                                &diagnostic,
+                                raw,
+                                "a non-unspecified IPv4 address or none",
+                                false,
+                            ));
+                        }
+                        Some(address)
+                    });
             }
-            "advertisedipv6" | "advertisedaddressipv6" => {
-                if advertised_alias_seen || advertised_ipv6.is_some() {
+            GeneralOption::AdvertisedIpv6 => {
+                if draft.advertised_alias_seen || draft.advertised_ipv6.is_some() {
                     return Err(invalid_option(
                         &diagnostic,
                         raw,
@@ -4444,24 +5034,25 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                     ));
                 }
                 let value = raw.trim();
-                advertised_ipv6 = Some(if value.is_empty() || value.eq_ignore_ascii_case("none") {
-                    None
-                } else {
-                    let address: Ipv6Addr = parse(&diagnostic, value).map_err(|_| {
-                        invalid_option(&diagnostic, raw, "an IPv6 address or none", false)
-                    })?;
-                    if address.is_unspecified() {
-                        return Err(invalid_option(
-                            &diagnostic,
-                            raw,
-                            "a non-unspecified IPv6 address or none",
-                            false,
-                        ));
-                    }
-                    Some(address)
-                });
+                draft.advertised_ipv6 =
+                    Some(if value.is_empty() || value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        let address: Ipv6Addr = parse(&diagnostic, value).map_err(|_| {
+                            invalid_option(&diagnostic, raw, "an IPv6 address or none", false)
+                        })?;
+                        if address.is_unspecified() {
+                            return Err(invalid_option(
+                                &diagnostic,
+                                raw,
+                                "a non-unspecified IPv6 address or none",
+                                false,
+                            ));
+                        }
+                        Some(address)
+                    });
             }
-            "tlsbind" | "securebind" => {
+            GeneralOption::TlsBind => {
                 let address = parse::<SocketAddr>(&diagnostic, raw).map_err(|_| {
                     invalid_option(
                         &diagnostic,
@@ -4478,43 +5069,42 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         false,
                     ));
                 }
-                set_once(&mut tls_bind, section, key, raw, address)?;
+                set_once(&mut draft.tls_bind, section, key, raw, address)?;
             }
-            "secbindaddr" | "tlsbindaddr" => {
+            GeneralOption::TlsBindAddress => {
                 let address = parse::<IpAddr>(&diagnostic, raw).map_err(|_| {
                     invalid_option(&diagnostic, raw, "an IPv4 or IPv6 TLS bind address", false)
                 })?;
-                set_once(&mut tls_address, section, key, raw, address)?;
+                set_once(&mut draft.tls_address, section, key, raw, address)?;
             }
-            "secport" | "tlsport" => {
+            GeneralOption::TlsPort => {
                 let port = parse::<u16>(&diagnostic, raw)
                     .map_err(|_| invalid_option(&diagnostic, raw, "TLS port 1..65535", false))?;
                 if port == 0 {
                     return Err(invalid_option(&diagnostic, raw, "TLS port 1..65535", false));
                 }
-                set_once(&mut tls_port, section, key, raw, port)?;
+                set_once(&mut draft.tls_port, section, key, raw, port)?;
             }
-            "certfile" | "tlscombinedpem" => {
+            GeneralOption::TlsCombinedPem => {
                 let path = parse_path(&diagnostic, raw, true)?;
-                set_once(&mut combined_pem, section, key, "<redacted>", path)?;
+                set_once(&mut draft.combined_pem, section, key, "<redacted>", path)?;
             }
-            "tlscertificate" | "tlscertificatefile" => {
+            GeneralOption::TlsCertificate => {
                 let path = parse_path(&diagnostic, raw, false)?;
-                set_once(&mut tls_certificate, section, key, raw, path)?;
+                set_once(&mut draft.tls_certificate, section, key, raw, path)?;
             }
-            "tlsprivatekey" | "tlsprivatekeyfile" => {
+            GeneralOption::TlsPrivateKey => {
                 let path = parse_path(&diagnostic, raw, true)?;
-                set_once(&mut tls_private_key, section, key, "<redacted>", path)?;
+                set_once(&mut draft.tls_private_key, section, key, "<redacted>", path)?;
             }
-            "tlstruststore" | "tlscafile" => {
+            GeneralOption::TlsTrustStore => {
                 let path = parse_path(&diagnostic, raw, true)?;
-                set_once(&mut tls_trust_store, section, key, "<redacted>", path)?;
+                set_once(&mut draft.tls_trust_store, section, key, "<redacted>", path)?;
             }
-            "deny" | "permit" => {
-                acl_configured = true;
+            GeneralOption::Deny | GeneralOption::Permit => {
                 apply_acl_entry(
-                    &mut acl_rules,
-                    if normalize_name(key) == "permit" {
+                    draft.acl_rules.get_or_insert_default(),
+                    if matches!(entry.key, GeneralOption::Permit) {
                         AclAction::Permit
                     } else {
                         AclAction::Deny
@@ -4523,15 +5113,15 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                     raw,
                 )?;
             }
-            "localnet" => {
-                local_networks_configured = true;
+            GeneralOption::LocalNetwork => {
+                let local_networks = draft.local_networks.get_or_insert_default();
                 if raw.trim().is_empty() {
                     local_networks.clear();
                 } else {
                     local_networks.extend(parse_ip_networks(&diagnostic, raw)?);
                 }
             }
-            "externip" | "externaladdress" => {
+            GeneralOption::ExternalAddress => {
                 let value = raw.trim();
                 let address = if value.is_empty() || value.eq_ignore_ascii_case("none") {
                     None
@@ -4549,18 +5139,18 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                     }
                     Some(address)
                 };
-                set_once(&mut external_address, section, key, raw, address)?;
+                set_once(&mut draft.external_address, section, key, raw, address)?;
             }
-            "externhost" | "externalhost" => {
+            GeneralOption::ExternalHost => {
                 let value = raw.trim();
                 let hostname = if value.is_empty() || value.eq_ignore_ascii_case("none") {
                     None
                 } else {
                     Some(parse_hostname(&diagnostic, value)?)
                 };
-                set_once(&mut external_hostname, section, key, raw, hostname)?;
+                set_once(&mut draft.external_hostname, section, key, raw, hostname)?;
             }
-            "externrefresh" | "externalrefresh" => {
+            GeneralOption::ExternalRefresh => {
                 let refresh = parse::<u32>(&diagnostic, raw).map_err(|_| {
                     invalid_option(
                         &diagnostic,
@@ -4577,49 +5167,49 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         false,
                     ));
                 }
-                set_once(&mut external_refresh, section, key, raw, refresh)?;
+                set_once(&mut draft.external_refresh, section, key, raw, refresh)?;
             }
-            "nat" => {
+            GeneralOption::Nat => {
                 let mode = parse_nat_mode(&diagnostic, raw)?;
-                set_once(&mut nat, section, key, raw, mode)?;
+                set_once(&mut draft.nat, section, key, raw, mode)?;
             }
-            "sccptos" | "signalingtos" => {
-                section_values.claim_alias("signaling_dscp", entry)?;
-                qos.signaling.dscp = parse_tos_as_dscp(&diagnostic, raw)?;
+            GeneralOption::SignalingTos => {
+                section_values.claim_alias("signaling_dscp", entry.source)?;
+                draft.qos.signaling_dscp = Some(parse_tos_as_dscp(&diagnostic, raw)?);
             }
-            "sccpdscp" | "signalingdscp" => {
-                section_values.claim_alias("signaling_dscp", entry)?;
-                qos.signaling.dscp = parse_dscp(&diagnostic, raw)?;
+            GeneralOption::SignalingDscp => {
+                section_values.claim_alias("signaling_dscp", entry.source)?;
+                draft.qos.signaling_dscp = Some(parse_dscp(&diagnostic, raw)?);
             }
-            "sccpcos" | "signalingcos" => {
-                section_values.claim_alias("signaling_cos", entry)?;
-                qos.signaling.cos = parse_cos(&diagnostic, raw)?;
+            GeneralOption::SignalingCos => {
+                section_values.claim_alias("signaling_cos", entry.source)?;
+                draft.qos.signaling_cos = Some(parse_cos(&diagnostic, raw)?);
             }
-            "audiotos" => {
-                section_values.claim_alias("audio_dscp", entry)?;
-                qos.audio.dscp = parse_tos_as_dscp(&diagnostic, raw)?;
+            GeneralOption::AudioTos => {
+                section_values.claim_alias("audio_dscp", entry.source)?;
+                draft.qos.audio_dscp = Some(parse_tos_as_dscp(&diagnostic, raw)?);
             }
-            "audiodscp" => {
-                section_values.claim_alias("audio_dscp", entry)?;
-                qos.audio.dscp = parse_dscp(&diagnostic, raw)?;
+            GeneralOption::AudioDscp => {
+                section_values.claim_alias("audio_dscp", entry.source)?;
+                draft.qos.audio_dscp = Some(parse_dscp(&diagnostic, raw)?);
             }
-            "audiocos" => {
-                section_values.claim_alias("audio_cos", entry)?;
-                qos.audio.cos = parse_cos(&diagnostic, raw)?;
+            GeneralOption::AudioCos => {
+                section_values.claim_alias("audio_cos", entry.source)?;
+                draft.qos.audio_cos = Some(parse_cos(&diagnostic, raw)?);
             }
-            "videotos" => {
-                section_values.claim_alias("video_dscp", entry)?;
-                qos.video.dscp = parse_tos_as_dscp(&diagnostic, raw)?;
+            GeneralOption::VideoTos => {
+                section_values.claim_alias("video_dscp", entry.source)?;
+                draft.qos.video_dscp = Some(parse_tos_as_dscp(&diagnostic, raw)?);
             }
-            "videodscp" => {
-                section_values.claim_alias("video_dscp", entry)?;
-                qos.video.dscp = parse_dscp(&diagnostic, raw)?;
+            GeneralOption::VideoDscp => {
+                section_values.claim_alias("video_dscp", entry.source)?;
+                draft.qos.video_dscp = Some(parse_dscp(&diagnostic, raw)?);
             }
-            "videocos" => {
-                section_values.claim_alias("video_cos", entry)?;
-                qos.video.cos = parse_cos(&diagnostic, raw)?;
+            GeneralOption::VideoCos => {
+                section_values.claim_alias("video_cos", entry.source)?;
+                draft.qos.video_cos = Some(parse_cos(&diagnostic, raw)?);
             }
-            "trustphoneip" => {
+            GeneralOption::TrustPhoneIp => {
                 return Err(invalid_option(
                     &diagnostic,
                     raw,
@@ -4627,55 +5217,31 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                     false,
                 ));
             }
-            "servername" => config.server_name.clone_from(raw),
-            "language" => set_once(
-                &mut language,
+            GeneralOption::ServerName => config.server_name.clone_from(raw),
+            GeneralOption::Language => set_once(
+                &mut draft.language,
                 section,
                 key,
                 raw,
                 parse_metadata_required(&diagnostic, raw, MAX_LANGUAGE_BYTES, false)?,
             )?,
-            "accountcode" => set_once(
-                &mut account_code,
+            GeneralOption::AccountCode => set_once(
+                &mut draft.account_code,
                 section,
                 key,
                 "<redacted>",
                 parse_metadata_optional(&diagnostic, raw, MAX_ACCOUNT_CODE_BYTES, true)?,
             )?,
-            "keepalive" => config.keepalive_seconds = parse(&diagnostic, raw)?,
-            "secondarykeepalive" => {
-                if !key.eq_ignore_ascii_case("secondary_keepalive") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name secondary_keepalive",
-                        false,
-                    ));
-                }
+            GeneralOption::Keepalive => config.keepalive_seconds = parse(&diagnostic, raw)?,
+            GeneralOption::SecondaryKeepalive => {
                 config.secondary_keepalive_seconds = parse(&diagnostic, raw)?;
             }
-            "signalingserver" => {
-                if !key.eq_ignore_ascii_case("signaling_server") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact repeated general option name signaling_server",
-                        false,
-                    ));
-                }
+            GeneralOption::SignalingServer => {
                 config
                     .signaling_servers
                     .push(parse_signaling_server(&diagnostic, raw)?);
             }
-            "firstdigittimeout" => {
-                if !key.eq_ignore_ascii_case("firstdigittimeout") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name firstdigittimeout",
-                        false,
-                    ));
-                }
+            GeneralOption::FirstDigitTimeout => {
                 let seconds = parse::<u64>(&diagnostic, raw).map_err(|_| {
                     invalid_option(
                         &diagnostic,
@@ -4692,17 +5258,15 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         false,
                     ));
                 }
-                set_once(&mut first_digit_timeout, section, key, raw, seconds * 1_000)?;
+                set_once(
+                    &mut draft.first_digit_timeout,
+                    section,
+                    key,
+                    raw,
+                    seconds * 1_000,
+                )?;
             }
-            "interdigittimeoutms" => {
-                if !key.eq_ignore_ascii_case("interdigit_timeout_ms") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name interdigit_timeout_ms",
-                        false,
-                    ));
-                }
+            GeneralOption::InterdigitTimeoutMs => {
                 let milliseconds = parse::<u64>(&diagnostic, raw).map_err(|_| {
                     invalid_option(
                         &diagnostic,
@@ -4719,17 +5283,15 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         false,
                     ));
                 }
-                set_once(&mut interdigit_timeout, section, key, raw, milliseconds)?;
+                set_once(
+                    &mut draft.interdigit_timeout,
+                    section,
+                    key,
+                    raw,
+                    milliseconds,
+                )?;
             }
-            "digittimeout" => {
-                if !key.eq_ignore_ascii_case("digittimeout") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name digittimeout",
-                        false,
-                    ));
-                }
+            GeneralOption::DigitTimeout => {
                 let seconds = parse::<u64>(&diagnostic, raw).map_err(|_| {
                     invalid_option(
                         &diagnostic,
@@ -4746,154 +5308,97 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         false,
                     ));
                 }
-                set_once(&mut interdigit_timeout, section, key, raw, seconds * 1_000)?;
-            }
-            "digittimeoutchar" => {
-                if !key.eq_ignore_ascii_case("digittimeoutchar") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name digittimeoutchar",
-                        false,
-                    ));
-                }
                 set_once(
-                    &mut dial_terminator,
+                    &mut draft.interdigit_timeout,
+                    section,
+                    key,
+                    raw,
+                    seconds * 1_000,
+                )?;
+            }
+            GeneralOption::DigitTimeoutChar => {
+                set_once(
+                    &mut draft.dial_terminator,
                     section,
                     key,
                     raw,
                     parse_dial_terminator(&diagnostic, raw)?,
                 )?;
             }
-            "recorddigittimeoutchar" => {
-                if !key.eq_ignore_ascii_case("recorddigittimeoutchar") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name recorddigittimeoutchar",
-                        false,
-                    ));
-                }
+            GeneralOption::RecordDigitTimeoutChar => {
                 set_once(
-                    &mut record_dial_terminator,
+                    &mut draft.record_dial_terminator,
                     section,
                     key,
                     raw,
                     parse_bool(&diagnostic, raw)?,
                 )?;
             }
-            "simulateenbloc" => {
-                if !key.eq_ignore_ascii_case("simulate_enbloc") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name simulate_enbloc",
-                        false,
-                    ));
-                }
+            GeneralOption::SimulateEnbloc => {
                 set_once(
-                    &mut simulate_enbloc,
+                    &mut draft.simulate_enbloc,
                     section,
                     key,
                     raw,
                     parse_bool(&diagnostic, raw)?,
                 )?;
             }
-            "allowoverlap" => {
-                if !key.eq_ignore_ascii_case("allowoverlap") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name allowoverlap",
-                        false,
-                    ));
-                }
+            GeneralOption::SpeedDialAwaitFurtherDigits => {
                 set_once(
-                    &mut allow_overlap,
+                    &mut draft.speed_dial_await_further_digits,
                     section,
                     key,
                     raw,
                     parse_bool(&diagnostic, raw)?,
                 )?;
             }
-            "transferonhangup" => {
-                if !key.eq_ignore_ascii_case("transfer_on_hangup") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name transfer_on_hangup",
-                        false,
-                    ));
-                }
+            GeneralOption::AllowOverlap => {
                 set_once(
-                    &mut transfer_on_hangup,
+                    &mut draft.allow_overlap,
                     section,
                     key,
                     raw,
                     parse_bool(&diagnostic, raw)?,
                 )?;
             }
-            "callanswerorder" => {
-                if !key.eq_ignore_ascii_case("callanswerorder") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name callanswerorder",
-                        false,
-                    ));
-                }
+            GeneralOption::TransferOnHangup => {
                 set_once(
-                    &mut call_answer_order,
+                    &mut draft.transfer_on_hangup,
+                    section,
+                    key,
+                    raw,
+                    parse_bool(&diagnostic, raw)?,
+                )?;
+            }
+            GeneralOption::CallAnswerOrder => {
+                set_once(
+                    &mut draft.call_answer_order,
                     section,
                     key,
                     raw,
                     parse_call_answer_order(&diagnostic, raw)?,
                 )?;
             }
-            "ringtype" => {
-                if !key.eq_ignore_ascii_case("ringtype") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name ringtype",
-                        false,
-                    ));
-                }
+            GeneralOption::RingType => {
                 set_once(
-                    &mut ring_type,
+                    &mut draft.ring_type,
                     section,
                     key,
                     raw,
                     parse_ringer_mode(&diagnostic, raw)?,
                 )?;
             }
-            "callwaitingtone" => {
-                if !key.eq_ignore_ascii_case("callwaitingtone") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name callwaitingtone",
-                        false,
-                    ));
-                }
+            GeneralOption::CallWaitingTone => {
                 let tone = if raw.trim() == "0" {
                     None
                 } else {
                     Some(parse_tone(&diagnostic, raw)?)
                 };
-                set_once(&mut call_waiting_tone, section, key, raw, tone)?;
+                set_once(&mut draft.call_waiting_tone, section, key, raw, tone)?;
             }
-            "callwaitinginterval" => {
-                if !key.eq_ignore_ascii_case("callwaitinginterval") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name callwaitinginterval",
-                        false,
-                    ));
-                }
+            GeneralOption::CallWaitingInterval => {
                 set_once(
-                    &mut call_waiting_interval,
+                    &mut draft.call_waiting_interval,
                     section,
                     key,
                     raw,
@@ -4911,32 +5416,16 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         })?,
                 )?;
             }
-            "fallback" => {
-                if !key.eq_ignore_ascii_case("fallback") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name fallback",
-                        false,
-                    ));
-                }
+            GeneralOption::Fallback => {
                 set_once(
-                    &mut fallback_decision,
+                    &mut draft.fallback_decision,
                     section,
                     key,
                     raw,
                     parse_fallback_decision(&diagnostic, raw)?,
                 )?;
             }
-            "backofftime" => {
-                if !key.eq_ignore_ascii_case("backoff_time") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name backoff_time",
-                        false,
-                    ));
-                }
+            GeneralOption::BackoffTime => {
                 let seconds = parse::<u32>(&diagnostic, raw).map_err(|_| {
                     invalid_option(
                         &diagnostic,
@@ -4953,17 +5442,9 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         false,
                     ));
                 }
-                set_once(&mut fallback_backoff, section, key, raw, seconds)?;
+                set_once(&mut draft.fallback_backoff, section, key, raw, seconds)?;
             }
-            "serverpriority" => {
-                if !key.eq_ignore_ascii_case("server_priority") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name server_priority",
-                        false,
-                    ));
-                }
+            GeneralOption::ServerPriority => {
                 let priority = parse::<u8>(&diagnostic, raw).map_err(|_| {
                     invalid_option(&diagnostic, raw, "positive fallback-server priority", false)
                 })?;
@@ -4975,274 +5456,264 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                         false,
                     ));
                 }
-                set_once(&mut fallback_server_priority, section, key, raw, priority)?;
+                set_once(
+                    &mut draft.fallback_server_priority,
+                    section,
+                    key,
+                    raw,
+                    priority,
+                )?;
             }
-            "allow" => codec_settings.push((true, raw.as_str())),
-            "disallow" => codec_settings.push((false, raw.as_str())),
-            "meetme" => set_once(
-                &mut conference_enabled,
+            GeneralOption::Allow => draft.codec_settings.push((true, raw.as_str())),
+            GeneralOption::Disallow => draft.codec_settings.push((false, raw.as_str())),
+            GeneralOption::ConferenceEnabled => set_once(
+                &mut draft.conference_enabled,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "meetmeopts" => set_once(
-                &mut conference_options,
+            GeneralOption::ConferenceOptions => set_once(
+                &mut draft.conference_options,
                 section,
                 key,
                 raw,
                 parse_application_options(&diagnostic, raw)?,
             )?,
-            "autoanswerringtime" => set_once(
-                &mut auto_answer_ring_time,
+            GeneralOption::AutoanswerRingTime => set_once(
+                &mut draft.auto_answer_ring_time,
                 section,
                 key,
                 raw,
                 parse::<u32>(&diagnostic, raw)?,
             )?,
-            "autoanswertone" => set_once(
-                &mut auto_answer_tone,
+            GeneralOption::AutoanswerTone => set_once(
+                &mut draft.auto_answer_tone,
                 section,
                 key,
                 raw,
                 parse_tone(&diagnostic, raw)?,
             )?,
-            "remotehanguptone" => {
-                if !key.eq_ignore_ascii_case("remotehangup_tone") {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name remotehangup_tone",
-                        false,
-                    ));
-                }
+            GeneralOption::RemoteHangupTone => {
                 let tone = if raw.trim() == "0" {
                     None
                 } else {
                     Some(parse_tone(&diagnostic, raw)?)
                 };
-                set_once(&mut remote_hangup_tone, section, key, raw, tone)?;
+                set_once(&mut draft.remote_hangup_tone, section, key, raw, tone)?;
             }
-            "hotlineenabled" => set_once(
-                &mut hotline_enabled,
+            GeneralOption::HotlineEnabled => set_once(
+                &mut draft.hotline_enabled,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "hotlineextension" => set_once(
-                &mut hotline_extension,
+            GeneralOption::HotlineExtension => set_once(
+                &mut draft.hotline_extension,
                 section,
                 key,
                 "<redacted>",
                 parse_optional_hotline_destination(&diagnostic, raw)?,
             )?,
-            "hotlinecontext" => set_once(
-                &mut hotline_context,
+            GeneralOption::HotlineContext => set_once(
+                &mut draft.hotline_context,
                 section,
                 key,
                 raw,
                 parse_bounded_setting_allow_empty(&diagnostic, raw, MAX_HOTLINE_FIELD_BYTES)?,
             )?,
-            "hotlinelabel" => set_once(
-                &mut hotline_label,
+            GeneralOption::HotlineLabel => set_once(
+                &mut draft.hotline_label,
                 section,
                 key,
                 raw,
                 parse_bounded_setting_allow_empty(&diagnostic, raw, MAX_HOTLINE_FIELD_BYTES)?,
             )?,
-            "directrtp" => set_once(
-                &mut direct_media,
+            GeneralOption::DirectMedia => set_once(
+                &mut draft.direct_media,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "earlyrtp" => set_once(
-                &mut early_media,
+            GeneralOption::EarlyMedia => set_once(
+                &mut draft.early_media,
                 section,
                 key,
                 raw,
                 parse_early_media(&diagnostic, raw)?,
             )?,
-            "audioencryption" => set_once(
-                &mut audio_encryption,
+            GeneralOption::AudioEncryption => set_once(
+                &mut draft.audio_encryption,
                 section,
                 key,
                 raw,
                 parse_media_encryption_policy(&diagnostic, raw)?,
             )?,
-            "echocancel" => set_once(
-                &mut echo_cancellation,
+            GeneralOption::EchoCancel => set_once(
+                &mut draft.echo_cancellation,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "silencesuppression" => set_once(
-                &mut silence_suppression,
+            GeneralOption::SilenceSuppression => set_once(
+                &mut draft.silence_suppression,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "jbenable" => set_once(
-                &mut jitter_enabled,
+            GeneralOption::JbEnable => set_once(
+                &mut draft.jitter_enabled,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "jbforce" => set_once(
-                &mut jitter_forced,
+            GeneralOption::JbForce => set_once(
+                &mut draft.jitter_forced,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "jblog" => set_once(
-                &mut jitter_log_frames,
+            GeneralOption::JbLog => set_once(
+                &mut draft.jitter_log_frames,
                 section,
                 key,
                 raw,
                 parse_bool(&diagnostic, raw)?,
             )?,
-            "jbmaxsize" => set_once(
-                &mut jitter_max_size_ms,
+            GeneralOption::JbMaxSize => set_once(
+                &mut draft.jitter_max_size_ms,
                 section,
                 key,
                 raw,
                 parse_positive_jitter_millis(&diagnostic, raw)?,
             )?,
-            "jbresyncthreshold" => set_once(
-                &mut jitter_resync_threshold_ms,
+            GeneralOption::JbResyncThreshold => set_once(
+                &mut draft.jitter_resync_threshold_ms,
                 section,
                 key,
                 raw,
                 parse_positive_jitter_millis(&diagnostic, raw)?,
             )?,
-            "jbimpl" => set_once(
-                &mut jitter_implementation,
+            GeneralOption::JbImplementation => set_once(
+                &mut draft.jitter_implementation,
                 section,
                 key,
                 raw,
                 parse_jitter_buffer_implementation(&diagnostic, raw)?,
             )?,
-            "regcontext" => {
-                if key != "regcontext" {
-                    return Err(invalid_option(
-                        &diagnostic,
-                        raw,
-                        "the exact general option name regcontext",
-                        false,
-                    ));
-                }
+            GeneralOption::RegistrationContext => {
                 set_once(
-                    &mut registration_contexts,
+                    &mut draft.registration_contexts,
                     section,
                     key,
                     raw,
                     parse_registration_contexts(&diagnostic, raw)?,
                 )?;
             }
-            "devicetable" => set_once(
-                &mut device_table,
+            GeneralOption::DeviceTable => set_once(
+                &mut draft.device_table,
                 section,
                 key,
                 raw,
                 parse_realtime_family(&diagnostic, raw)?,
             )?,
-            "linetable" => set_once(
-                &mut line_table,
+            GeneralOption::LineTable => set_once(
+                &mut draft.line_table,
                 section,
                 key,
                 raw,
                 parse_realtime_family(&diagnostic, raw)?,
             )?,
-            other => {
-                return Err(section_values.unknown(entry, "general", other));
-            }
         }
     }
-    if let Some(enabled) = conference_enabled {
+    if let Some(enabled) = draft.conference_enabled {
         config.conference_dialing.enabled = enabled;
     }
-    if let Some(order) = call_answer_order {
+    if let Some(order) = draft.call_answer_order {
         config.call_answer_order = order;
     }
-    if let Some(offset) = timezone_offset_minutes {
+    if let Some(offset) = draft.timezone_offset_minutes {
         config.timezone_offset_minutes = offset;
     }
-    if let Some(template) = date_template {
+    if let Some(template) = draft.date_template {
         config.date_template = template;
     }
-    if let Some(mode) = ring_type {
+    if let Some(mode) = draft.ring_type {
         config.ring_type = mode;
     }
-    if let Some(tone) = call_waiting_tone {
+    if let Some(tone) = draft.call_waiting_tone {
         config.call_waiting_tone = tone;
     }
-    if let Some(seconds) = call_waiting_interval {
+    if let Some(seconds) = draft.call_waiting_interval {
         config.call_waiting_interval_seconds = seconds;
     }
-    if let Some(timeout_ms) = first_digit_timeout {
+    if let Some(timeout_ms) = draft.first_digit_timeout {
         config.first_digit_timeout_ms = timeout_ms;
     }
-    if let Some(timeout_ms) = interdigit_timeout {
+    if let Some(timeout_ms) = draft.interdigit_timeout {
         config.interdigit_timeout_ms = timeout_ms;
     }
-    if let Some(character) = dial_terminator {
+    if let Some(character) = draft.dial_terminator {
         config.dial_terminator.character = character;
     }
-    if let Some(record) = record_dial_terminator {
+    if let Some(record) = draft.record_dial_terminator {
         config.dial_terminator.record = record;
     }
-    if let Some(enabled) = simulate_enbloc {
+    if let Some(enabled) = draft.simulate_enbloc {
         config.simulate_enbloc = enabled;
     }
-    if let Some(enabled) = allow_overlap {
+    if let Some(enabled) = draft.speed_dial_await_further_digits {
+        config.speed_dial_await_further_digits = enabled;
+    }
+    if let Some(enabled) = draft.allow_overlap {
         config.allow_overlap = enabled;
     }
-    if let Some(enabled) = transfer_on_hangup {
+    if let Some(enabled) = draft.transfer_on_hangup {
         config.transfer_on_hangup = enabled;
     }
-    if let Some(decision) = fallback_decision {
+    if let Some(decision) = draft.fallback_decision {
         config.fallback_registration.decision = decision;
     }
-    if let Some(seconds) = fallback_backoff {
+    if let Some(seconds) = draft.fallback_backoff {
         config.fallback_registration.backoff_seconds = seconds;
     }
-    if let Some(priority) = fallback_server_priority {
+    if let Some(priority) = draft.fallback_server_priority {
         config.fallback_registration.server_priority = priority;
     }
-    if let Some(options) = conference_options {
+    if let Some(options) = draft.conference_options {
         config.conference_dialing.application_options = options;
     }
-    if let Some(contexts) = registration_contexts {
+    if let Some(contexts) = draft.registration_contexts {
         config.registration.contexts = contexts;
     }
-    if !codec_settings.is_empty() {
-        config.codecs = apply_codec_settings(Vec::new(), &codec_settings, "general.codecs")?;
+    if !draft.codec_settings.is_empty() {
+        config.codecs = apply_codec_settings(Vec::new(), &draft.codec_settings, "general.codecs")?;
     }
-    if let Some(ring_time_seconds) = auto_answer_ring_time {
+    if let Some(ring_time_seconds) = draft.auto_answer_ring_time {
         config.auto_answer.ring_time_seconds = ring_time_seconds;
     }
-    if let Some(tone) = auto_answer_tone {
+    if let Some(tone) = draft.auto_answer_tone {
         config.auto_answer.tone = tone;
     }
-    if let Some(tone) = remote_hangup_tone {
+    if let Some(tone) = draft.remote_hangup_tone {
         config.remote_hangup_tone = tone;
     }
-    if let Some(enabled) = hotline_enabled {
+    if let Some(enabled) = draft.hotline_enabled {
         config.guest_hotline.enabled = enabled;
     }
-    if let Some(extension) = hotline_extension {
+    if let Some(extension) = draft.hotline_extension {
         config.guest_hotline.extension = extension;
     }
-    if let Some(context) = hotline_context {
+    if let Some(context) = draft.hotline_context {
         config.guest_hotline.context = context;
     }
-    if let Some(label) = hotline_label {
+    if let Some(label) = draft.hotline_label {
         config.guest_hotline.label = label;
     }
     if config.guest_hotline.enabled
@@ -5255,7 +5726,7 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
             value: "enabled guest hotline requires extension, context, and label".into(),
         });
     }
-    if clear_bind.is_some() && (clear_address.is_some() || clear_port.is_some()) {
+    if draft.clear_bind.is_some() && (draft.clear_address.is_some() || draft.clear_port.is_some()) {
         return Err(invalid_option(
             section.section_location(),
             "clear listener aliases",
@@ -5263,10 +5734,10 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
             false,
         ));
     }
-    let clear = clear_bind.unwrap_or_else(|| {
+    let clear = draft.clear_bind.unwrap_or_else(|| {
         SocketAddr::new(
-            clear_address.unwrap_or(config.listeners.clear.ip()),
-            clear_port.unwrap_or(config.listeners.clear.port()),
+            draft.clear_address.unwrap_or(config.listeners.clear.ip()),
+            draft.clear_port.unwrap_or(config.listeners.clear.port()),
         )
     });
     if clear.port() == 0 {
@@ -5280,13 +5751,13 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
     config.bind = clear;
     config.listeners.clear = clear;
 
-    if let Some(ipv4) = advertised_ipv4 {
+    if let Some(ipv4) = draft.advertised_ipv4 {
         config.network.advertised.ipv4 = ipv4;
         if let Some(ipv4) = ipv4 {
             config.advertised_address = ipv4;
         }
     }
-    if let Some(ipv6) = advertised_ipv6 {
+    if let Some(ipv6) = draft.advertised_ipv6 {
         config.network.advertised.ipv6 = ipv6;
     }
     if config.network.advertised.ipv4.is_none() && config.network.advertised.ipv6.is_none() {
@@ -5298,16 +5769,16 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
         ));
     }
 
-    if acl_configured {
-        config.network.acl.rules = acl_rules;
+    if let Some(rules) = draft.acl_rules {
+        config.network.acl.rules = rules;
     }
-    if local_networks_configured {
+    if let Some(local_networks) = draft.local_networks {
         config.network.local_networks = local_networks;
     }
-    config.network.nat = nat.unwrap_or(NatMode::Auto);
+    config.network.nat = draft.nat.unwrap_or(NatMode::Auto);
 
-    let external_address = external_address.flatten();
-    let external_hostname = external_hostname.flatten();
+    let external_address = draft.external_address.take().flatten();
+    let external_hostname = draft.external_hostname.take().flatten();
     if external_address.is_some() && external_hostname.is_some() {
         return Err(invalid_option(
             section.section_location(),
@@ -5316,7 +5787,7 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
             false,
         ));
     }
-    if external_refresh.is_some() && external_hostname.is_none() {
+    if draft.external_refresh.is_some() && external_hostname.is_none() {
         return Err(invalid_option(
             section.section_location(),
             "externrefresh without externhost",
@@ -5329,11 +5800,11 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
     } else {
         external_hostname.map(|name| ExternalAddress::Hostname {
             name,
-            refresh_seconds: external_refresh.unwrap_or(60),
+            refresh_seconds: draft.external_refresh.unwrap_or(60),
         })
     };
 
-    if tls_bind.is_some() && (tls_address.is_some() || tls_port.is_some()) {
+    if draft.tls_bind.is_some() && (draft.tls_address.is_some() || draft.tls_port.is_some()) {
         return Err(invalid_option(
             section.section_location(),
             "TLS listener aliases",
@@ -5341,9 +5812,10 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
             false,
         ));
     }
-    let split_credentials_requested =
-        tls_certificate.is_some() || tls_private_key.is_some() || tls_trust_store.is_some();
-    if combined_pem.is_some() && split_credentials_requested {
+    let split_credentials_requested = draft.tls_certificate.is_some()
+        || draft.tls_private_key.is_some()
+        || draft.tls_trust_store.is_some();
+    if draft.combined_pem.is_some() && split_credentials_requested {
         return Err(invalid_option(
             section.section_location(),
             "<redacted TLS credentials>",
@@ -5351,16 +5823,16 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
             true,
         ));
     }
-    let tls_requested = tls_bind.is_some()
-        || tls_address.is_some()
-        || tls_port.is_some()
-        || combined_pem.is_some()
+    let tls_requested = draft.tls_bind.is_some()
+        || draft.tls_address.is_some()
+        || draft.tls_port.is_some()
+        || draft.combined_pem.is_some()
         || split_credentials_requested;
     config.listeners.tls = if tls_requested {
-        let credentials = if let Some(path) = combined_pem {
+        let credentials = if let Some(path) = draft.combined_pem {
             TlsCredentials::CombinedPem(path)
         } else {
-            let certificate = tls_certificate.ok_or_else(|| {
+            let certificate = draft.tls_certificate.ok_or_else(|| {
                 invalid_option(
                     section.section_location(),
                     "<redacted TLS credentials>",
@@ -5368,7 +5840,7 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
                     true,
                 )
             })?;
-            let private_key = tls_private_key.ok_or_else(|| {
+            let private_key = draft.tls_private_key.ok_or_else(|| {
                 invalid_option(
                     section.section_location(),
                     "<redacted TLS credentials>",
@@ -5379,13 +5851,15 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
             TlsCredentials::SplitPem {
                 certificate,
                 private_key,
-                trust_store: tls_trust_store,
+                trust_store: draft.tls_trust_store,
             }
         };
-        let bind = tls_bind.unwrap_or_else(|| {
+        let bind = draft.tls_bind.unwrap_or_else(|| {
             SocketAddr::new(
-                tls_address.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-                tls_port.unwrap_or(2443),
+                draft
+                    .tls_address
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+                draft.tls_port.unwrap_or(2443),
             )
         });
         if bind.port() == 0 {
@@ -5408,37 +5882,37 @@ fn parse_general(config: &mut GeneralConfig, section: &RawSection) -> Result<(),
     } else {
         None
     };
-    config.qos = qos;
-    if let Some(language) = language {
+    config.qos = draft.qos.resolve(config.qos);
+    if let Some(language) = draft.language {
         config.language = language;
     }
-    if let Some(account_code) = account_code {
+    if let Some(account_code) = draft.account_code {
         config.account_code = account_code;
     }
-    config.direct_media = direct_media.unwrap_or(false);
-    config.early_media = early_media.unwrap_or(true);
-    config.audio_encryption = audio_encryption.unwrap_or_default();
+    config.direct_media = draft.direct_media.unwrap_or(false);
+    config.early_media = draft.early_media.unwrap_or(true);
+    config.audio_encryption = draft.audio_encryption.unwrap_or_default();
     config.audio_processing = AudioProcessingPolicy {
-        echo_cancellation: if echo_cancellation.unwrap_or(true) {
+        echo_cancellation: if draft.echo_cancellation.unwrap_or(true) {
             EchoCancellation::On
         } else {
             EchoCancellation::Off
         },
-        silence_suppression: if silence_suppression.unwrap_or(false) {
+        silence_suppression: if draft.silence_suppression.unwrap_or(false) {
             SilenceSuppression::On
         } else {
             SilenceSuppression::Off
         },
     };
     config.jitter_buffer = JitterBufferConfig {
-        enabled: jitter_enabled.unwrap_or(false),
-        forced: jitter_forced.unwrap_or(false),
-        log_frames: jitter_log_frames.unwrap_or(false),
-        max_size_ms: jitter_max_size_ms.unwrap_or(200),
-        resync_threshold_ms: jitter_resync_threshold_ms.unwrap_or(1_000),
-        implementation: jitter_implementation.unwrap_or_default(),
+        enabled: draft.jitter_enabled.unwrap_or(false),
+        forced: draft.jitter_forced.unwrap_or(false),
+        log_frames: draft.jitter_log_frames.unwrap_or(false),
+        max_size_ms: draft.jitter_max_size_ms.unwrap_or(200),
+        resync_threshold_ms: draft.jitter_resync_threshold_ms.unwrap_or(1_000),
+        implementation: draft.jitter_implementation.unwrap_or_default(),
     };
-    config.realtime_tables = match (device_table, line_table) {
+    config.realtime_tables = match (draft.device_table, draft.line_table) {
         (None, None) => None,
         (Some(device_family), Some(line_family)) if device_family != line_family => {
             Some(RealtimeTableConfig {
@@ -6545,15 +7019,52 @@ fn value<'a>(section: &'a RawSection, key: &str) -> Option<&'a str> {
         .values
         .iter()
         .rev()
-        .find(|value| value.key == key)
+        .find(|value| value.key.eq_ignore_ascii_case(key))
         .map(|value| value.value.as_str())
 }
 
-fn unquote(value: &str) -> &str {
-    value
+fn strip_inline_comment(line: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn unquote(value: &str) -> String {
+    let Some(inner) = value
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
+    else {
+        return value.to_owned();
+    };
+    let mut output = String::with_capacity(inner.len());
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            output.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some(escaped @ ('\\' | '"')) => output.push(escaped),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
 }
 
 #[cfg(test)]
@@ -6946,9 +7457,7 @@ mod tests {
         assert_eq!(disabled.general.call_waiting_tone, None);
 
         for setting in [
-            "ring_type = Urgent",
             "ringtype = emergency",
-            "callwaiting_tone = CallWaiting",
             "callwaitingtone = unknown",
             "callwaitinginterval = -1",
             "callwaitinginterval = 86401",
@@ -6959,11 +7468,7 @@ mod tests {
             );
             assert!(ModuleConfig::parse(&input).is_err(), "accepted {setting}");
         }
-        for setting in [
-            "incoming_limit = 2",
-            "incominglimit = -1",
-            "incominglimit = 256",
-        ] {
+        for setting in ["incominglimit = -1", "incominglimit = 256"] {
             let input = CONFIG.replace(
                 "mailbox = 1001@default",
                 &format!("mailbox = 1001@default\n        {setting}"),
@@ -7031,7 +7536,6 @@ mod tests {
             "firstdigittimeout = 0",
             "firstdigittimeout = 86401",
             "firstdigittimeout = -1",
-            "first_digit_timeout = 10",
             "firstdigittimeout = 10\n        firstdigittimeout = 11",
         ] {
             let input = CONFIG.replace(
@@ -7076,7 +7580,6 @@ mod tests {
             "interdigit_timeout_ms = 249",
             "interdigit_timeout_ms = 86400001",
             "interdigittimeout = 5",
-            "digit_timeout = 5",
             "digittimeout = 5\n        interdigit_timeout_ms = 1500",
             "digittimeout = 5\n        digittimeout = 6",
         ] {
@@ -7130,8 +7633,6 @@ mod tests {
             "digittimeoutchar = 12",
             "digittimeoutchar = E",
             "digittimeoutchar = +",
-            "digit_timeout_char = #",
-            "record_digit_timeout_char = yes",
             "recorddigittimeoutchar = perhaps",
             "digittimeoutchar = #\n        digittimeoutchar = *",
             "recorddigittimeoutchar = yes\n        recorddigittimeoutchar = no",
@@ -7182,6 +7683,48 @@ mod tests {
     }
 
     #[test]
+    fn speed_dial_further_digit_policy_is_explicit_and_disabled_by_default() {
+        let defaults = ModuleConfig::parse(CONFIG).unwrap();
+        assert!(!defaults.general.speed_dial_await_further_digits);
+        assert!(
+            defaults
+                .device_definitions()
+                .iter()
+                .all(|device| !device.ui.speed_dial_await_further_digits)
+        );
+
+        let enabled = ModuleConfig::parse(&CONFIG.replace(
+            "advertised_address = 192.0.2.10",
+            "advertised_address = 192.0.2.10\n        SpeedDialAwaitFurtherDigits = yes",
+        ))
+        .unwrap();
+        assert!(enabled.general.speed_dial_await_further_digits);
+        assert!(
+            enabled
+                .device_definitions()
+                .iter()
+                .all(|device| device.ui.speed_dial_await_further_digits)
+        );
+
+        for settings in [
+            "SpeedDialAwaitFurtherDigits = perhaps",
+            "SpeedDialAwaitFurtherDigits = yes\n        SpeedDialAwaitFurtherDigits = no",
+        ] {
+            let input = CONFIG.replace(
+                "advertised_address = 192.0.2.10",
+                &format!("advertised_address = 192.0.2.10\n        {settings}"),
+            );
+            assert!(
+                matches!(
+                    ModuleConfig::parse(&input),
+                    Err(ConfigError::InvalidValue { .. })
+                ),
+                "accepted invalid speed-dial further-digit policy: {settings}"
+            );
+        }
+    }
+
+    #[test]
     fn overlap_dialing_is_explicit_disabled_by_default_and_device_overridable() {
         let device_id = DeviceId::new("SEP001122334455").unwrap();
         let defaults = ModuleConfig::parse(CONFIG).unwrap();
@@ -7211,7 +7754,6 @@ mod tests {
         assert!(!overridden.devices[&device_id].allow_overlap);
 
         for settings in [
-            "allow_overlap = yes",
             "allowoverlap = perhaps",
             "allowoverlap = yes\n        allowoverlap = no",
         ] {
@@ -7456,8 +7998,6 @@ mod tests {
     #[test]
     fn call_ui_options_reject_invented_names_values_and_wrong_scopes() {
         for setting in [
-            "use_redial_menu = yes",
-            "allow_ringin_notification = yes",
             "redialmenu = yes",
             "ringing_notification = yes",
             "useRedialMenu = placedcalls",
@@ -7480,18 +8020,18 @@ mod tests {
         let error = ModuleConfig::parse(&wrong_general_scope)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("[general].useredialmenu"), "{error}");
+        assert!(error.contains("[general].useRedialMenu"), "{error}");
         assert!(error.contains("expected"), "{error}");
 
         let invented_general_name = CONFIG.replace(
             "advertised_address = 192.0.2.10",
-            "advertised_address = 192.0.2.10\n        call_answer_order = LastFirst",
+            "advertised_address = 192.0.2.10\n        answer_call_order = LastFirst",
         );
         let error = ModuleConfig::parse(&invented_general_name)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("[general].call_answer_order"), "{error}");
-        assert!(error.contains("exact general option name"), "{error}");
+        assert!(error.contains("[general].answer_call_order"), "{error}");
+        assert!(error.contains("unknown variant"), "{error}");
     }
 
     #[test]
@@ -7503,7 +8043,7 @@ mod tests {
         let error = ModuleConfig::parse(&duplicate_general)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("[general].callanswerorder"), "{error}");
+        assert!(error.contains("[general].CALLANSWERORDER"), "{error}");
         assert!(error.contains("duplicates"), "{error}");
 
         for setting in [
@@ -7713,10 +8253,7 @@ mod tests {
         );
         let text = ModuleConfig::parse(&general_alias).unwrap_err().to_string();
         assert!(text.contains("[general].reg_context"), "{text}");
-        assert!(
-            text.contains("exact general option name regcontext"),
-            "{text}"
-        );
+        assert!(text.contains("unknown variant"), "{text}");
 
         let extension_alias = CONFIG.replace(
             "mailbox = 1001@default",
@@ -7726,7 +8263,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(text.contains("[1001].reg_exten"), "{text}");
-        assert!(text.contains("exact line option name regexten"), "{text}");
+        assert!(text.contains("unknown variant"), "{text}");
 
         let pin_alias = CONFIG.replace(
             "mailbox = 1001@default",
@@ -7734,7 +8271,9 @@ mod tests {
         );
         let text = ModuleConfig::parse(&pin_alias).unwrap_err().to_string();
         assert!(text.contains("[1001].p-in"), "{text}");
-        assert!(text.contains("exact line option name pin"), "{text}");
+        assert!(text.contains("unknown variant"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(!text.contains("7654321"), "{text}");
         assert!(text.contains("<redacted>"), "{text}");
         assert!(!text.contains("7654321"), "{text}");
     }
@@ -8157,8 +8696,8 @@ mod tests {
                 "peer addresses are always authoritative",
             ),
             ("device", "dtmfmode = rfc2833", "use force_dtmfmode"),
-            ("line", "permit = 192.0.2.0/24", "recognized line option"),
-            ("line", "audio_dscp = EF", "recognized line option"),
+            ("line", "permit = 192.0.2.0/24", "unknown variant"),
+            ("line", "audio_dscp = EF", "unknown variant"),
         ] {
             let input = match scope {
                 "general" => CONFIG.replace(
@@ -9262,7 +9801,7 @@ mod tests {
         assert!(matches!(
             ModuleConfig::parse(&input),
             Err(ConfigError::InvalidValue { key, value })
-                if key.contains("[1001].adhocnumber") && value.contains("expected")
+                if key.contains("[1001].adhocNumber") && value.contains("expected")
         ));
     }
 
@@ -10066,5 +10605,41 @@ mod tests {
             assert!(error.contains("line "), "{settings} produced {error}");
             assert!(error.contains("expected"), "{settings} produced {error}");
         }
+    }
+
+    #[test]
+    fn canonical_schema_is_strict_while_runtime_matching_follows_asterisk_casing() {
+        let mixed = CONFIG
+            .replace("advertised_address =", "AdVeRtIsEd_AdDrEsS =")
+            .replace("type = device", "TyPe = device")
+            .replace("type = line", "TYPE = line");
+        ModuleConfig::parse(&mixed).unwrap();
+        let error = ModuleConfig::check_canonical(&mixed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("canonical option name advertised_address"),
+            "{error}"
+        );
+
+        let punctuation = CONFIG.replace(
+            "advertised_address = 192.0.2.10",
+            "advertised_address = 192.0.2.10\n        direct-media = yes",
+        );
+        let error = ModuleConfig::parse(&punctuation).unwrap_err().to_string();
+        assert!(error.contains("unknown variant `direct-media`"), "{error}");
+    }
+
+    #[test]
+    fn canonical_serialization_is_deterministic_semantic_and_quote_safe() {
+        let source = CONFIG.replace("description = Reception", "description = \"Desk; west\"");
+        let expected = ModuleConfig::parse(&source).unwrap();
+        let first = ModuleConfig::to_canonical_string(&source).unwrap();
+        let second = ModuleConfig::to_canonical_string(&first).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(ModuleConfig::parse(&first).unwrap(), expected);
+        assert!(first.contains("description = \"Desk; west\""));
+        ModuleConfig::check_canonical(&first).unwrap();
     }
 }

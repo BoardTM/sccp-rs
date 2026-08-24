@@ -138,6 +138,45 @@ fn is_current_session(current: Option<SessionGeneration>, incoming: SessionGener
     current == Some(incoming)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpeedDialCollectionAction {
+    Ignore,
+    Wait,
+    Dial,
+    Transfer,
+}
+
+fn collect_speed_dial(
+    state: BridgeCallState,
+    digits: &mut String,
+    digit_deadline: &mut Option<Instant>,
+    mut number: String,
+    await_further_digits: bool,
+    deadline: Instant,
+) -> SpeedDialCollectionAction {
+    if !matches!(
+        state,
+        BridgeCallState::Collecting | BridgeCallState::TransferCollecting
+    ) {
+        return SpeedDialCollectionAction::Ignore;
+    }
+    let terminated = await_further_digits && number.ends_with('#');
+    if terminated {
+        number.pop();
+    }
+    *digits = number;
+    if await_further_digits && !terminated {
+        *digit_deadline = Some(deadline);
+        return SpeedDialCollectionAction::Wait;
+    }
+    *digit_deadline = None;
+    if state == BridgeCallState::TransferCollecting {
+        SpeedDialCollectionAction::Transfer
+    } else {
+        SpeedDialCollectionAction::Dial
+    }
+}
+
 struct BridgeCall {
     device: DeviceId,
     line_instance: u32,
@@ -293,6 +332,21 @@ impl Coordinator {
                     call.digit_deadline = None;
                 }
                 self.dial(call_id).await;
+            }
+            DeviceEventKind::SpeedDial {
+                call_id,
+                line_instance,
+                number,
+                await_further_digits,
+            } => {
+                self.phone_speed_dial(
+                    device_id,
+                    call_id,
+                    line_instance.get(),
+                    number,
+                    await_further_digits,
+                )
+                .await;
             }
             DeviceEventKind::SoftKey {
                 call_id, soft_key, ..
@@ -597,6 +651,39 @@ impl Coordinator {
             self.complete_blind_transfer(call_id).await;
         } else {
             self.dial(call_id).await;
+        }
+    }
+
+    async fn phone_speed_dial(
+        &mut self,
+        device: DeviceId,
+        call_id: CallId,
+        line_instance: u32,
+        number: String,
+        await_further_digits: bool,
+    ) {
+        if !self.calls.contains_key(&call_id) {
+            self.begin_outbound(device, call_id, line_instance).await;
+        }
+        let deadline =
+            Instant::now() + Duration::from_millis(self.config.sip.interdigit_timeout_ms);
+        let action =
+            self.calls
+                .get_mut(&call_id)
+                .map_or(SpeedDialCollectionAction::Ignore, |call| {
+                    collect_speed_dial(
+                        call.state,
+                        &mut call.digits,
+                        &mut call.digit_deadline,
+                        number,
+                        await_further_digits,
+                        deadline,
+                    )
+                });
+        match action {
+            SpeedDialCollectionAction::Dial => self.dial(call_id).await,
+            SpeedDialCollectionAction::Transfer => self.complete_blind_transfer(call_id).await,
+            SpeedDialCollectionAction::Ignore | SpeedDialCollectionAction::Wait => {}
         }
     }
 
@@ -1830,6 +1917,74 @@ fn ipv4(address: SocketAddr) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_dial_collection_waits_or_commits_at_the_configured_boundary() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut digits = String::new();
+        let mut digit_deadline = None;
+
+        assert_eq!(
+            collect_speed_dial(
+                BridgeCallState::Collecting,
+                &mut digits,
+                &mut digit_deadline,
+                "300".into(),
+                true,
+                deadline,
+            ),
+            SpeedDialCollectionAction::Wait
+        );
+        assert_eq!(digits, "300");
+        assert_eq!(digit_deadline, Some(deadline));
+
+        assert_eq!(
+            collect_speed_dial(
+                BridgeCallState::Collecting,
+                &mut digits,
+                &mut digit_deadline,
+                "3001#".into(),
+                true,
+                deadline,
+            ),
+            SpeedDialCollectionAction::Dial
+        );
+        assert_eq!(digits, "3001");
+        assert_eq!(digit_deadline, None);
+
+        assert_eq!(
+            collect_speed_dial(
+                BridgeCallState::TransferCollecting,
+                &mut digits,
+                &mut digit_deadline,
+                "2001".into(),
+                false,
+                deadline,
+            ),
+            SpeedDialCollectionAction::Transfer
+        );
+    }
+
+    #[test]
+    fn speed_dial_collection_does_not_mutate_an_established_call() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut digits = "unchanged".to_owned();
+        let mut digit_deadline = None;
+
+        assert_eq!(
+            collect_speed_dial(
+                BridgeCallState::Connected,
+                &mut digits,
+                &mut digit_deadline,
+                "2001".into(),
+                false,
+                deadline,
+            ),
+            SpeedDialCollectionAction::Ignore
+        );
+        assert_eq!(digits, "unchanged");
+        assert_eq!(digit_deadline, None);
+    }
 
     #[test]
     fn session_events_require_the_current_registration_generation() {

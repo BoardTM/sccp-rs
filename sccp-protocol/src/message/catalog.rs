@@ -1032,7 +1032,13 @@ const fn primary_response(id: MessageId) -> ResponseExpectation {
                 minimum_protocol: 9,
             },
         },
-        SpeedDialStatusRequest => ResponseExpectation::Message(SpeedDialStatus),
+        SpeedDialStatusRequest => ResponseExpectation::SessionSelected {
+            before: SpeedDialStatus,
+            from: SpeedDialStatusDynamic,
+            selector: SessionResponseSelector::DynamicMessagesOrProtocol {
+                minimum_protocol: 9,
+            },
+        },
         ServiceUrlStatusRequest => ResponseExpectation::SessionSelected {
             before: ServiceUrlStatus,
             from: ServiceUrlStatusDynamic,
@@ -1721,6 +1727,11 @@ mod tests {
                 MessageId::ServiceUrlStatus,
                 MessageId::ServiceUrlStatusDynamic,
             ),
+            (
+                MessageId::SpeedDialStatusRequest,
+                MessageId::SpeedDialStatus,
+                MessageId::SpeedDialStatusDynamic,
+            ),
         ] {
             assert_eq!(
                 request.contract().unwrap().response,
@@ -1741,13 +1752,6 @@ mod tests {
                 from: MessageId::FeatureStatusDynamic,
                 selector: SessionResponseSelector::DynamicMessages,
             }
-        );
-        assert_eq!(
-            MessageId::SpeedDialStatusRequest
-                .contract()
-                .unwrap()
-                .response,
-            ResponseExpectation::Message(MessageId::SpeedDialStatus)
         );
     }
 }

@@ -3120,6 +3120,59 @@ impl Controller {
         self.finish_digits(call_id)
     }
 
+    /// Applies a configured speed-dial destination to an outbound digit
+    /// collector. Immediate mode follows the ordinary en-bloc path. Awaiting
+    /// mode seeds the collector without triggering overlap routing and uses
+    /// the normal interdigit deadline for any manually appended digits.
+    pub fn speed_dial(
+        &mut self,
+        call_id: CallId,
+        number: String,
+        await_further_digits: bool,
+        now: Instant,
+    ) -> Vec<DriverEffect> {
+        if !await_further_digits {
+            return self.enbloc(call_id, number);
+        }
+        let Some((pbx_id, state)) = self
+            .appearance_for_call(call_id)
+            .map(|appearance| (appearance.pbx_id, appearance.state))
+        else {
+            return Vec::new();
+        };
+        if !matches!(state, CallState::Collecting | CallState::TransferCollecting) {
+            return Vec::new();
+        }
+        let Some(mut digits) = number
+            .chars()
+            .map(|character| match character {
+                '0'..='9' | '*' | '#' | 'A'..='D' => Some(character),
+                'a'..='d' => Some(character.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Option<String>>()
+        else {
+            return Vec::new();
+        };
+        let terminated = digits.ends_with(self.dial_terminator);
+        if terminated {
+            digits.pop();
+        }
+        let Some(call) = self.call_registry.pbx.get_mut(&pbx_id) else {
+            return Vec::new();
+        };
+        call.digits = digits;
+        call.last_digit_at = Some(now);
+        call.simulated_enbloc_eligible = false;
+        call.digit_deadline = Some(now + self.interdigit);
+        if terminated {
+            self.finish_digits(call_id)
+        } else {
+            debug_assert!(self.invariant_error().is_none());
+            Vec::new()
+        }
+    }
+
     pub fn expire_digits(&mut self, now: Instant) -> Vec<DriverEffect> {
         let expired: Vec<_> = self
             .call_registry
@@ -10557,6 +10610,54 @@ mod tests {
         let actions = controller.digit(CallId(7), Digit::Pound, now);
         assert_outbound_route(&actions, "12");
         assert_eq!(controller.pbx_call(PbxCallId(1)).unwrap().digits, "12");
+    }
+
+    #[test]
+    fn speed_dial_immediate_and_awaiting_modes_have_distinct_commit_boundaries() {
+        let now = Instant::now();
+
+        let mut immediate = Controller::new(Duration::from_secs(5));
+        immediate.begin_phone_call(CallId(7), binding(), Codec::Pcmu, now);
+        assert_outbound_route(
+            &immediate.speed_dial(CallId(7), "2001".into(), false, now),
+            "2001",
+        );
+
+        let mut awaiting = Controller::new(Duration::from_secs(5));
+        awaiting.begin_phone_call(CallId(8), binding(), Codec::Pcmu, now);
+        assert!(
+            awaiting
+                .speed_dial(CallId(8), "300".into(), true, now)
+                .is_empty()
+        );
+        let call = awaiting.pbx_call(PbxCallId(1)).unwrap();
+        assert_eq!(call.digits, "300");
+        assert_eq!(call.digit_deadline, Some(now + Duration::from_secs(5)));
+        assert!(!call.simulated_enbloc_eligible);
+
+        assert!(
+            awaiting
+                .digit(CallId(8), Digit::Number(1), now + Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(awaiting.pbx_call(PbxCallId(1)).unwrap().digits, "3001");
+        assert_outbound_route(
+            &awaiting.expire_digits(now + Duration::from_secs(7)),
+            "3001",
+        );
+    }
+
+    #[test]
+    fn awaiting_speed_dial_honors_the_configured_terminator() {
+        let now = Instant::now();
+        let mut controller = Controller::new(Duration::from_secs(5));
+        controller.set_dial_terminator('*');
+        controller.begin_phone_call(CallId(7), binding(), Codec::Pcmu, now);
+
+        assert_outbound_route(
+            &controller.speed_dial(CallId(7), "2001*".into(), true, now),
+            "2001",
+        );
     }
 
     #[test]

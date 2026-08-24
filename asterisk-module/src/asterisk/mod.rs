@@ -153,7 +153,7 @@ use crate::call::transfer::{
 };
 use crate::call::voicemail::{VoicemailOperation, VoicemailTarget};
 use crate::config::provider::{
-    ConfigurationProvider, FileConfigurationProvider, HybridConfigurationProvider,
+    ConfigurationProvider, HybridConfigurationProvider, StaticConfigurationSource,
 };
 use crate::config::reload::{MwiSubscriptionChange, ReloadPlan, ReloadSelection};
 use crate::config::{

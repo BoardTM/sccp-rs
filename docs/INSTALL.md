@@ -186,14 +186,29 @@ bind = 0.0.0.0:2000
 advertised_address = 192.168.10.20
 server_name = pbx.example.com
 keepalive = 60
-directrtp = no
+direct_media = no
 ```
 
-Keep `directrtp = no` during initial setup. This keeps RTP anchored through
+Keep `direct_media = no` during initial setup. This keeps RTP anchored through
 Asterisk and makes NAT and firewall problems easier to diagnose. More advanced
 multi-network and NAT installations can use `localnet`, `externip` or
 `externhost`, and related options documented in the more exhaustive
 [`asterisk-module/sccp.conf.example`](../asterisk-module/sccp.conf.example).
+
+The standalone checker accepts the same ordered, repeated-key configuration
+dialect as the module:
+
+```sh
+chan-sccp2-config-checker /etc/asterisk/sccp.conf
+chan-sccp2-config-checker --canonical /etc/asterisk/sccp.conf
+chan-sccp2-config-checker normalize /etc/asterisk/sccp.conf > /tmp/sccp.canonical.conf
+```
+
+Normal validation follows Asterisk's case-insensitive option lookup and accepts
+documented compatibility aliases. `--canonical` additionally requires the
+spelling used by the distributed example. `normalize` writes a deterministic,
+template-expanded configuration to standard output and never overwrites the
+source file.
 
 ### Device section
 
@@ -227,7 +242,7 @@ type = line
 label = 1006
 context = internal
 callerid = "Wbergs Desk" <1006>
-incominglimit = 6
+incoming_limit = 6
 ```
 
 Change the section name, label, and caller ID for the extension you are
@@ -241,7 +256,7 @@ type = line
 label = 1006
 context = from-sccp
 callerid = "Front Desk" <1006>
-incominglimit = 2
+incoming_limit = 2
 ```
 
 The same logical line may be placed on more than one configured device. To get
@@ -537,7 +552,7 @@ asterisk` or in a file such as `/var/log/asterisk/full`.
 
 ### The phone rings but there is no audio or one-way audio
 
-- Keep `directrtp = no` while diagnosing the problem.
+- Keep `direct_media = no` while diagnosing the problem.
 - Confirm `advertised_address` is reachable from the phone.
 - Confirm both directions of Asterisk's RTP UDP range are permitted.
 - Check NAT and port forwarding on every network boundary.

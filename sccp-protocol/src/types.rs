@@ -793,6 +793,9 @@ pub struct StationUiPolicy {
     /// Permit a ringing-only notification in addition to the ordinary BLF
     /// icon/lamp projection. Non-ringing BLF states are always delivered.
     pub hinted_ringing_notification: bool,
+    /// Keep a speed-dial destination in digit collection until the normal
+    /// interdigit timeout or an explicit dial terminator commits it.
+    pub speed_dial_await_further_digits: bool,
     /// Lamp cadence used while the station has waiting voicemail.
     pub mwi_lamp_mode: crate::message::values::LampMode,
     /// Keep MWI visible while any call is active on the station.
@@ -816,6 +819,7 @@ impl Default for StationUiPolicy {
         Self {
             placed_calls_redial_menu: false,
             hinted_ringing_notification: false,
+            speed_dial_await_further_digits: false,
             mwi_lamp_mode: crate::message::values::LampMode::On,
             mwi_on_call: false,
             legacy_code_page: LegacyCodePage::Iso8859_1,

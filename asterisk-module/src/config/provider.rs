@@ -157,6 +157,19 @@ pub trait ConfigurationProvider: Send + Sync {
     }
 }
 
+/// Ordered static configuration input. Production uses Asterisk's native
+/// parser; standalone tools and tests use the filesystem implementation.
+pub trait StaticConfigurationSource: Send + Sync {
+    fn origin(&self) -> ConfigurationOrigin;
+    fn read_source(&self) -> Result<String, ConfigurationProviderError>;
+
+    fn realtime_tables(&self) -> Result<Option<RealtimeTableConfig>, ConfigurationProviderError> {
+        let contents = self.read_source()?;
+        ModuleConfig::realtime_tables_from_source(&contents)
+            .map_err(|source| ConfigurationProviderError::invalid(self.origin(), source))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileConfigurationProvider {
     path: PathBuf,
@@ -172,10 +185,11 @@ impl FileConfigurationProvider {
     }
 
     fn read(&self) -> Result<String, ConfigurationProviderError> {
-        fs::read_to_string(&self.path).map_err(|source| ConfigurationProviderError::Read {
-            path: self.path.clone(),
-            source,
-        })
+        read_with_includes(&self.path, &mut Vec::new())
+    }
+
+    pub fn source(&self) -> Result<String, ConfigurationProviderError> {
+        self.read()
     }
 
     /// Reads only the general provider-selection surface. Full file or hybrid
@@ -183,13 +197,98 @@ impl FileConfigurationProvider {
     pub fn realtime_tables(
         &self,
     ) -> Result<Option<RealtimeTableConfig>, ConfigurationProviderError> {
-        let contents = self.read()?;
-        ModuleConfig::realtime_tables_from_source(&contents).map_err(|source| {
-            ConfigurationProviderError::invalid(
-                ConfigurationOrigin::File(self.path.clone()),
-                source,
-            )
-        })
+        StaticConfigurationSource::realtime_tables(self)
+    }
+}
+
+fn read_with_includes(
+    path: &Path,
+    stack: &mut Vec<PathBuf>,
+) -> Result<String, ConfigurationProviderError> {
+    if stack.len() >= 32 {
+        return Err(ConfigurationProviderError::unavailable(
+            "file",
+            format!("include nesting exceeds 32 files at {}", path.display()),
+        ));
+    }
+    let identity = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(position) = stack.iter().position(|candidate| candidate == &identity) {
+        let mut cycle: Vec<_> = stack[position..]
+            .iter()
+            .map(|entry| entry.display().to_string())
+            .collect();
+        cycle.push(identity.display().to_string());
+        return Err(ConfigurationProviderError::unavailable(
+            "file",
+            format!("configuration include cycle: {}", cycle.join(" -> ")),
+        ));
+    }
+    let source = fs::read_to_string(path).map_err(|source| ConfigurationProviderError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    stack.push(identity);
+    let mut expanded = String::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let directive = if let Some(argument) = trimmed.strip_prefix("#include") {
+            Some((false, argument))
+        } else {
+            trimmed
+                .strip_prefix("#tryinclude")
+                .map(|argument| (true, argument))
+        };
+        let Some((optional, argument)) = directive else {
+            expanded.push_str(line);
+            expanded.push('\n');
+            continue;
+        };
+        let argument = argument.trim();
+        let include = argument
+            .strip_prefix('"')
+            .and_then(|argument| argument.strip_suffix('"'))
+            .or_else(|| {
+                argument
+                    .strip_prefix('<')
+                    .and_then(|argument| argument.strip_suffix('>'))
+            })
+            .unwrap_or(argument);
+        if include.is_empty() {
+            stack.pop();
+            return Err(ConfigurationProviderError::unavailable(
+                "file",
+                format!("{} contains an empty include directive", path.display()),
+            ));
+        }
+        let include_path = Path::new(include);
+        let include_path = if include_path.is_absolute() {
+            include_path.to_path_buf()
+        } else {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(include_path)
+        };
+        match read_with_includes(&include_path, stack) {
+            Ok(source) => expanded.push_str(&source),
+            Err(ConfigurationProviderError::Read { source, .. })
+                if optional && source.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                stack.pop();
+                return Err(error);
+            }
+        }
+    }
+    stack.pop();
+    Ok(expanded)
+}
+
+impl StaticConfigurationSource for FileConfigurationProvider {
+    fn origin(&self) -> ConfigurationOrigin {
+        ConfigurationOrigin::File(self.path.clone())
+    }
+
+    fn read_source(&self) -> Result<String, ConfigurationProviderError> {
+        self.read()
     }
 }
 
@@ -358,16 +457,19 @@ impl ConfigurationProvider for RealtimeConfigurationProvider {
     }
 }
 
-pub struct HybridConfigurationProvider {
-    file: FileConfigurationProvider,
+pub struct HybridConfigurationProvider<F = FileConfigurationProvider> {
+    file: F,
     source: Arc<dyn RealtimeConfigurationSource>,
     queries: Vec<RealtimeConfigurationQuery>,
     expected_tables: Option<RealtimeTableConfig>,
 }
 
-impl HybridConfigurationProvider {
+impl<F> HybridConfigurationProvider<F>
+where
+    F: StaticConfigurationSource,
+{
     pub fn new(
-        file: FileConfigurationProvider,
+        file: F,
         source: Arc<dyn RealtimeConfigurationSource>,
         queries: Vec<RealtimeConfigurationQuery>,
     ) -> Self {
@@ -380,7 +482,7 @@ impl HybridConfigurationProvider {
     }
 
     pub fn from_tables(
-        file: FileConfigurationProvider,
+        file: F,
         source: Arc<dyn RealtimeConfigurationSource>,
         tables: &RealtimeTableConfig,
     ) -> Self {
@@ -396,7 +498,7 @@ impl HybridConfigurationProvider {
         provider
     }
 
-    pub fn file(&self) -> &FileConfigurationProvider {
+    pub fn file(&self) -> &F {
         &self.file
     }
 
@@ -405,18 +507,18 @@ impl HybridConfigurationProvider {
     }
 }
 
-impl ConfigurationProvider for HybridConfigurationProvider {
+impl<F> ConfigurationProvider for HybridConfigurationProvider<F>
+where
+    F: StaticConfigurationSource,
+{
     fn load(&self) -> Result<ModuleConfig, ConfigurationProviderError> {
         // Every source is read into local values before normalization. No
         // partial row set or invalid candidate is retained by the provider.
-        let contents = self.file.read()?;
+        let contents = self.file.read_source()?;
         if let Some(expected) = &self.expected_tables {
             let selected =
                 ModuleConfig::realtime_tables_from_source(&contents).map_err(|source| {
-                    ConfigurationProviderError::invalid(
-                        ConfigurationOrigin::File(self.file.path.clone()),
-                        source,
-                    )
+                    ConfigurationProviderError::invalid(self.file.origin(), source)
                 })?;
             if selected.as_ref() != Some(expected) {
                 return Err(ConfigurationProviderError::unavailable(
@@ -428,7 +530,7 @@ impl ConfigurationProvider for HybridConfigurationProvider {
         let overlays = load_realtime_overlays(self.source.as_ref(), &self.queries)?;
         ModuleConfig::parse_with_overlays(&contents, &overlays).map_err(|source| {
             ConfigurationProviderError::invalid(
-                ConfigurationOrigin::Named(format!("{} plus realtime", self.file.path.display())),
+                ConfigurationOrigin::Named(format!("{} plus realtime", self.file.origin())),
                 source,
             )
         })
@@ -1212,5 +1314,30 @@ mod tests {
                 if provider == "hybrid" && message.contains("restart")
         ));
         assert_eq!(live.lines["1001"].label, "Reception");
+    }
+
+    #[test]
+    fn standalone_file_source_expands_includes_and_rejects_cycles() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sccp.conf");
+        let stations = directory.path().join("stations.conf");
+        fs::write(
+            &root,
+            "[general]\nadvertised_address = 192.0.2.10\n#include \"stations.conf\"\n#tryinclude \"optional.conf\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &stations,
+            "[SEP001122334455]\ntype = device\nline = 1001\n\n[1001]\ntype = line\nlabel = Included\ncontext = internal\n",
+        )
+        .unwrap();
+
+        let provider = FileConfigurationProvider::new(&root);
+        let config = provider.load().unwrap();
+        assert_eq!(config.lines["1001"].label, "Included");
+
+        fs::write(&stations, "#include \"sccp.conf\"\n").unwrap();
+        let error = provider.load().unwrap_err().to_string();
+        assert!(error.contains("include cycle"), "{error}");
     }
 }

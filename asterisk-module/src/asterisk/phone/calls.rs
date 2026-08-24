@@ -373,6 +373,25 @@ pub async fn handle_phone_event(
                 })
             }
         }
+        PhoneDeviceEventKind::SpeedDial {
+            call_id,
+            number,
+            await_further_digits,
+            ..
+        } => {
+            let forwarding_handled = if await_further_digits {
+                replace_forwarding_entry(access, &device_id, call_id, &number).await
+            } else {
+                replace_and_commit_forwarding_entry(access, &device_id, call_id, &number).await
+            };
+            if forwarding_handled {
+                Vec::new()
+            } else {
+                controller_step(&access.shared.controller, |controller| {
+                    controller.speed_dial(call_id, number, await_further_digits, Instant::now())
+                })
+            }
+        }
         PhoneDeviceEventKind::FeatureButton { instance } => {
             handle_feature_button(access, device_id, instance.get());
             Vec::new()

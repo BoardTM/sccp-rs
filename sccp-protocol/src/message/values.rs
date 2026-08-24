@@ -131,7 +131,7 @@ impl ProtocolVersion {
 
     /// Reports whether dynamic speed-dial status is selected by protocol version.
     pub const fn uses_dynamic_speed_dial_status(self) -> bool {
-        self.0 >= Self::V15.0
+        self.0 >= Self::V9.0
     }
 }
 
@@ -1331,6 +1331,13 @@ impl StationSessionContext {
         self.features.contains(PhoneFeatures::DYNAMIC_MESSAGES)
     }
 
+    /// Reports whether speed-dial status uses the dynamic identifier and
+    /// variable-string payload selected by the registered station session.
+    pub const fn uses_dynamic_speed_dial_status(self) -> bool {
+        self.protocol.uses_dynamic_speed_dial_status()
+            || self.features.contains(PhoneFeatures::DYNAMIC_MESSAGES)
+    }
+
     /// Returns the call-info string layout selected by the negotiated version.
     pub const fn dynamic_call_info_layout(self) -> DynamicCallInfoLayout {
         self.protocol.dynamic_call_info_layout()
@@ -1389,6 +1396,7 @@ bitflags! {
         const DYNAMIC_MESSAGES = 1 << 24;
         const RFC2833 = 1 << 26;
         const INTERNAL_CM_MEDIA = 1 << 28;
+        const MULTIPLE_ACTIVE_CALLS = 1 << 30;
         const ABBREVIATED_DIAL = 1 << 31;
     }
 }
@@ -1510,12 +1518,8 @@ mod tests {
     fn dynamic_station_layout_boundaries_follow_session_negotiation() {
         assert!(!ProtocolVersion::V8.uses_dynamic_general_ui());
         assert!(ProtocolVersion::V9.uses_dynamic_general_ui());
-        assert!(
-            !ProtocolVersion::new(14)
-                .unwrap()
-                .uses_dynamic_speed_dial_status()
-        );
-        assert!(ProtocolVersion::V15.uses_dynamic_speed_dial_status());
+        assert!(!ProtocolVersion::V8.uses_dynamic_speed_dial_status());
+        assert!(ProtocolVersion::V9.uses_dynamic_speed_dial_status());
 
         assert_eq!(
             ProtocolVersion::V15.dynamic_call_info_layout(),
@@ -1541,6 +1545,7 @@ mod tests {
             StationSessionContext::new(ProtocolVersion::V8, PhoneFeatures::DYNAMIC_MESSAGES);
         assert!(negotiated.uses_dynamic_general_ui());
         assert!(negotiated.uses_dynamic_feature_status());
+        assert!(negotiated.uses_dynamic_speed_dial_status());
     }
 
     #[test]
@@ -1600,6 +1605,10 @@ mod tests {
         assert!(advertised.contains(PhoneFeatures::RFC2833));
         assert!(advertised.contains(PhoneFeatures::ABBREVIATED_DIAL));
         assert!(!advertised.contains(PhoneFeatures::INTERNAL_CM_MEDIA));
+        assert!(!advertised.contains(PhoneFeatures::MULTIPLE_ACTIVE_CALLS));
+        assert!(
+            PhoneFeatures::from_bits_retain(1 << 30).contains(PhoneFeatures::MULTIPLE_ACTIVE_CALLS)
+        );
     }
 
     #[test]

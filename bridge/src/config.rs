@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn example_configuration_stays_valid() {
-        AppConfig::parse(include_str!("../../config.example.toml")).unwrap();
+        AppConfig::parse(include_str!("../config.example.toml")).unwrap();
     }
 
     #[test]

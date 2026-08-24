@@ -4504,6 +4504,47 @@ fn encode_dynamic_line_status(
     Ok(payload)
 }
 
+fn encode_dynamic_speed_dial_status(
+    instance: u32,
+    number: &str,
+    display_name: &str,
+    code_page: Option<LegacyCodePage>,
+) -> Result<Vec<u8>, CodecError> {
+    const MESSAGE_ID: u32 = id::SPEED_DIAL_STAT_DYNAMIC;
+    let mut payload = instance.to_le_bytes().to_vec();
+    push_dynamic_text(&mut payload, MESSAGE_ID, "number", number, 23)?;
+    push_dynamic_station_text(
+        &mut payload,
+        MESSAGE_ID,
+        "display name",
+        display_name,
+        39,
+        code_page,
+    )?;
+    pad_dynamic_payload(&mut payload);
+    Ok(payload)
+}
+
+fn decode_dynamic_speed_dial_status(payload: &[u8]) -> Result<ServerMessage, CodecError> {
+    const MESSAGE_ID: u32 = id::SPEED_DIAL_STAT_DYNAMIC;
+    if !payload.len().is_multiple_of(4) {
+        return Err(CodecError::InvalidAlignment {
+            message_id: MESSAGE_ID,
+            actual: payload.len(),
+        });
+    }
+    let mut remaining = payload;
+    let instance = take_dynamic_word(MESSAGE_ID, &mut remaining)?;
+    let number = take_dynamic_text(MESSAGE_ID, &mut remaining, "number", 23)?;
+    let display_name = take_dynamic_text(MESSAGE_ID, &mut remaining, "display name", 39)?;
+    validate_dynamic_padding(MESSAGE_ID, remaining)?;
+    Ok(ServerMessage::SpeedDialStatus {
+        instance,
+        number,
+        display_name,
+    })
+}
+
 fn decode_dynamic_line_status(payload: &[u8]) -> Result<ServerMessage, CodecError> {
     const HEADER_SIZE: usize = 8;
     if payload.len() < HEADER_SIZE {
@@ -5573,14 +5614,7 @@ impl ServerMessage {
                     display_name: value.display_name.text()?,
                 })
             }
-            id::SPEED_DIAL_STAT_DYNAMIC => {
-                let value: WireSpeedDialStatus = decode(frame.message_id, p)?;
-                Ok(Self::SpeedDialStatusDynamic {
-                    instance: value.instance,
-                    number: value.number.text()?,
-                    display_name: value.display_name.text()?,
-                })
-            }
+            id::SPEED_DIAL_STAT_DYNAMIC => decode_dynamic_speed_dial_status(p),
             id::START_MEDIA_FAILURE_DETECTION => {
                 let value: WireMediaFailureDetection = decode(frame.message_id, p)?;
                 Ok(Self::StartMediaFailureDetection(MediaFailureDetection {
@@ -7062,42 +7096,30 @@ impl ServerMessage {
                 number,
                 display_name,
             } => {
-                let message_id = id::SPEED_DIAL_STAT;
-                p = encode(
-                    message_id,
-                    &WireSpeedDialStatus {
-                        instance: *instance,
-                        number: WireFixedText::new(message_id, "number", number)?,
-                        display_name: WireFixedText::new_station(
-                            message_id,
-                            "display name",
-                            display_name,
-                            legacy_code_page,
-                        )?,
-                    },
-                )?;
-                message_id
-            }
-            Self::SpeedDialStatusDynamic {
-                instance,
-                number,
-                display_name,
-            } => {
-                let message_id = id::SPEED_DIAL_STAT_DYNAMIC;
-                p = encode(
-                    message_id,
-                    &WireSpeedDialStatus {
-                        instance: *instance,
-                        number: WireFixedText::new(message_id, "number", number)?,
-                        display_name: WireFixedText::new_station(
-                            message_id,
-                            "display name",
-                            display_name,
-                            legacy_code_page,
-                        )?,
-                    },
-                )?;
-                message_id
+                if session.uses_dynamic_speed_dial_status() {
+                    p = encode_dynamic_speed_dial_status(
+                        *instance,
+                        number,
+                        display_name,
+                        legacy_code_page,
+                    )?;
+                    id::SPEED_DIAL_STAT_DYNAMIC
+                } else {
+                    p = encode(
+                        id::SPEED_DIAL_STAT,
+                        &WireSpeedDialStatus {
+                            instance: *instance,
+                            number: WireFixedText::new(id::SPEED_DIAL_STAT, "number", number)?,
+                            display_name: WireFixedText::new_station(
+                                id::SPEED_DIAL_STAT,
+                                "display name",
+                                display_name,
+                                legacy_code_page,
+                            )?,
+                        },
+                    )?;
+                    id::SPEED_DIAL_STAT
+                }
             }
             Self::DialedNumber {
                 number,
@@ -11199,16 +11221,16 @@ mod tests {
                     number: "2004".into(),
                     display_name: "Warehouse".into(),
                 },
-                ProtocolVersion::new(14).unwrap(),
+                ProtocolVersion::V8,
                 id::SPEED_DIAL_STAT,
             ),
             (
-                ServerMessage::SpeedDialStatusDynamic {
+                ServerMessage::SpeedDialStatus {
                     instance: 4,
                     number: "2004".into(),
                     display_name: "Warehouse".into(),
                 },
-                ProtocolVersion::V15,
+                ProtocolVersion::V9,
                 id::SPEED_DIAL_STAT_DYNAMIC,
             ),
             (
@@ -11304,30 +11326,51 @@ mod tests {
     }
 
     #[test]
-    fn speed_dial_status_forms_encode_explicit_message_identifiers() {
-        let legacy = ServerMessage::SpeedDialStatus {
+    fn speed_dial_status_uses_session_selection_and_variable_wire_layout() {
+        let message = ServerMessage::SpeedDialStatus {
             instance: 4,
             number: "2004".into(),
             display_name: "Warehouse".into(),
         };
-        let dynamic = ServerMessage::SpeedDialStatusDynamic {
-            instance: 4,
-            number: "2004".into(),
-            display_name: "Warehouse".into(),
-        };
-
-        for (message, expected_id) in [
-            (legacy, id::SPEED_DIAL_STAT),
-            (dynamic, id::SPEED_DIAL_STAT_DYNAMIC),
+        for (session, expected_id) in [
+            (
+                StationSessionContext::from(ProtocolVersion::V8),
+                id::SPEED_DIAL_STAT,
+            ),
+            (
+                StationSessionContext::new(ProtocolVersion::V8, PhoneFeatures::DYNAMIC_MESSAGES),
+                id::SPEED_DIAL_STAT_DYNAMIC,
+            ),
+            (
+                StationSessionContext::from(ProtocolVersion::V9),
+                id::SPEED_DIAL_STAT_DYNAMIC,
+            ),
         ] {
-            let bytes = message.encode(ProtocolVersion::V22).unwrap();
+            let bytes = message.encode_for_session(session).unwrap();
             let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
             assert_eq!(frame.message_id, expected_id);
             assert_eq!(
-                ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                ServerMessage::decode(frame, session.protocol).unwrap(),
                 message
             );
         }
+
+        let bytes = ServerMessage::SpeedDialStatus {
+            instance: 2,
+            number: "2001".into(),
+            display_name: "Reception".into(),
+        }
+        .encode(ProtocolVersion::V9)
+        .unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(frame.message_id, id::SPEED_DIAL_STAT_DYNAMIC);
+        assert_eq!(
+            frame.payload,
+            [
+                0x02, 0x00, 0x00, 0x00, b'2', b'0', b'0', b'1', 0x00, b'R', b'e', b'c', b'e', b'p',
+                b't', b'i', b'o', b'n', 0x00, 0x00,
+            ]
+        );
     }
 
     #[test]

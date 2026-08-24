@@ -2,6 +2,7 @@
 
 pub mod bridge;
 pub mod channel;
+pub mod config;
 pub mod dialplan;
 pub mod handles;
 pub mod http;

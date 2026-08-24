@@ -679,6 +679,12 @@ pub enum DeviceEventKind {
         line_instance: LineInstance,
         number: String,
     },
+    SpeedDial {
+        call_id: CallId,
+        line_instance: LineInstance,
+        number: String,
+        await_further_digits: bool,
+    },
     SoftKey {
         /// Active call when the key is call-scoped.
         call_id: Option<CallId>,
@@ -3745,15 +3751,30 @@ async fn handle_client_message(
                     return Ok(());
                 };
 
-                // A speed dial pressed while collecting digits commits the
-                // configured destination into that call.  In every other
-                // state it is a new outbound call; in particular, reusing a
-                // Connected call here would incorrectly send the destination
-                // as in-call DTMF.
+                // Reuse an existing outbound digit-collection call. Creating
+                // a second call beside any other live call is permitted only
+                // when the station advertised feature bit 30.
                 let collecting_call = call_id
                     .and_then(|call_id| state.calls_by_id.get(&call_id))
-                    .filter(|call| call.state == CallState::OffHook)
+                    .filter(|call| matches!(call.state, CallState::OffHook | CallState::Transfer))
                     .cloned();
+                let has_live_call = state
+                    .calls_by_id
+                    .values()
+                    .any(|call| call.state != CallState::OnHook);
+                if collecting_call.is_none()
+                    && has_live_call
+                    && !state
+                        .features
+                        .contains(PhoneFeatures::MULTIPLE_ACTIVE_CALLS)
+                {
+                    debug!(
+                        device_id = %state.device.id,
+                        instance,
+                        "ignoring speed-dial button beside an active call without multiple-active-call support"
+                    );
+                    return Ok(());
+                }
                 let (call, new_call) = collecting_call.map_or_else(
                     || {
                         let line = call_id
@@ -3782,15 +3803,42 @@ async fn handle_client_message(
                         .await
                         .map_err(|_| ServerError::Stopped)?;
                 }
+                if let Some(stored) = state.calls_by_id.get_mut(&call.call_id) {
+                    stored.dialed_number.clone_from(&number);
+                }
+                let await_further_digits = state.device.ui.speed_dial_await_further_digits;
+                if await_further_digits {
+                    state.active_key_mode = KeyMode::DigitsFollowing;
+                    for message in [
+                        ServerMessage::StopTone {
+                            line_instance: call.line_instance,
+                            call_reference: call.wire_reference,
+                        },
+                        ServerMessage::DialedNumber {
+                            number: number.clone(),
+                            line_instance: call.line_instance,
+                            call_reference: call.wire_reference,
+                        },
+                        ServerMessage::SelectSoftKeys {
+                            line_instance: call.line_instance,
+                            call_reference: call.wire_reference,
+                            set: KeyMode::DigitsFollowing,
+                            valid_mask: state.device.soft_keys.valid_mask(KeyMode::DigitsFollowing),
+                        },
+                    ] {
+                        send_station_ui_message(stream, state, &message).await?;
+                    }
+                }
                 context
                     .event_tx
                     .send(Event::device(
                         state.device.id.clone(),
                         state.generation,
-                        DeviceEventKind::EnblocCall {
+                        DeviceEventKind::SpeedDial {
                             call_id: call.call_id,
                             line_instance: LineInstance::new(call.line_instance),
                             number,
+                            await_further_digits,
                         },
                     ))
                     .await
@@ -12856,9 +12904,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // Status requests receive the interoperable legacy identifier. The
-        // dynamic identifier is reserved for explicit dynamic updates.
-        let speed_dial_status_id = id::SPEED_DIAL_STAT;
+        let speed_dial_status_id = id::SPEED_DIAL_STAT_DYNAMIC;
         let frames = read_until_message(&mut phone, &mut decoder, speed_dial_status_id).await;
         let frame = frames
             .into_iter()
@@ -13087,10 +13133,11 @@ mod tests {
             events.recv().await,
             Some(Event::Device(DeviceEvent {
                 device_id: actual_device,
-                event: DeviceEventKind::EnblocCall {
+                event: DeviceEventKind::SpeedDial {
                     call_id: actual_call,
                     line_instance: LineInstance(1),
                     ref number,
+                    await_further_digits: false,
                 },
                 ..
             })) if actual_device == device_id
@@ -13098,8 +13145,8 @@ mod tests {
                 && number == "2001"
         ));
 
-        // Once the call is already collecting digits, another speed dial is
-        // an en-bloc destination for that same exact call, not a second call.
+        // Once the call is already collecting digits, another speed dial
+        // targets that same exact call rather than creating a second call.
         phone
             .write_all(
                 &ClientMessage::Stimulus {
@@ -13117,15 +13164,239 @@ mod tests {
             events.recv().await,
             Some(Event::Device(DeviceEvent {
                 device_id: actual_device,
-                event: DeviceEventKind::EnblocCall {
+                event: DeviceEventKind::SpeedDial {
                     call_id: actual_call,
                     line_instance: LineInstance(1),
                     ref number,
+                    await_further_digits: false,
                 },
                 ..
             })) if actual_device == device_id
                 && actual_call == call_id
                 && number == "2002"
+        ));
+
+        handle
+            .send(Command::new(
+                device_id.clone(),
+                CommandAction::SetCallState {
+                    call_id,
+                    state: CallState::Connected,
+                },
+            ))
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+        phone
+            .write_all(
+                &ClientMessage::Stimulus {
+                    stimulus: Stimulus::SpeedDial,
+                    instance: 1,
+                    call_reference: 0,
+                    status: 0,
+                }
+                .encode(protocol)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .is_err(),
+            "a station without feature bit 30 created a call beside an active call"
+        );
+
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiple_active_call_feature_allows_speed_dial_beside_connected_call() {
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            advertised_address: Ipv4Addr::LOCALHOST,
+            ..ServerConfig::default()
+        };
+        let device = mixed_definition();
+        let device_id = device.id.clone();
+        let (server, handle, mut events) = Server::bind(config, [device]).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(server.run());
+        let mut phone = TcpStream::connect(address).await.unwrap();
+        let mut decoder = FrameDecoder::new();
+        let protocol = ProtocolVersion::V22;
+
+        phone
+            .write_all(&register_bytes_with_features(
+                protocol,
+                PhoneFeatures::MULTIPLE_ACTIVE_CALLS,
+            ))
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::Registered(_),
+                ..
+            }))
+        ));
+
+        phone
+            .write_all(
+                &ClientMessage::Stimulus {
+                    stimulus: Stimulus::SpeedDial,
+                    instance: 1,
+                    call_reference: 0,
+                    status: 0,
+                }
+                .encode(protocol)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+        let first_call = match events.recv().await {
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::OffHook { call_id, .. },
+                ..
+            })) => call_id,
+            other => panic!("unexpected first speed-dial setup event: {other:?}"),
+        };
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::SpeedDial {
+                    call_id,
+                    ref number,
+                    await_further_digits: false,
+                    ..
+                },
+                ..
+            })) if call_id == first_call && number == "2001"
+        ));
+        handle
+            .send(Command::new(
+                device_id.clone(),
+                CommandAction::SetCallState {
+                    call_id: first_call,
+                    state: CallState::Connected,
+                },
+            ))
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+
+        phone
+            .write_all(
+                &ClientMessage::Stimulus {
+                    stimulus: Stimulus::BlfSpeedDial,
+                    instance: 2,
+                    call_reference: 0,
+                    status: 0,
+                }
+                .encode(protocol)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+        let second_call = match events.recv().await {
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::OffHook { call_id, .. },
+                ..
+            })) => call_id,
+            other => panic!("unexpected additional speed-dial setup event: {other:?}"),
+        };
+        assert_ne!(second_call, first_call);
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::SpeedDial {
+                    call_id,
+                    ref number,
+                    await_further_digits: false,
+                    ..
+                },
+                ..
+            })) if call_id == second_call && number == "2002"
+        ));
+
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn speed_dial_await_further_digits_keeps_the_call_in_digit_collection() {
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            advertised_address: Ipv4Addr::LOCALHOST,
+            ..ServerConfig::default()
+        };
+        let mut device = mixed_definition();
+        device.ui.speed_dial_await_further_digits = true;
+        let device_id = device.id.clone();
+        let (server, handle, mut events) = Server::bind(config, [device]).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(server.run());
+        let mut phone = TcpStream::connect(address).await.unwrap();
+        let mut decoder = FrameDecoder::new();
+        let protocol = ProtocolVersion::V22;
+
+        phone.write_all(&register_bytes(protocol)).await.unwrap();
+        read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::Registered(_),
+                ..
+            }))
+        ));
+        phone
+            .write_all(
+                &ClientMessage::Stimulus {
+                    stimulus: Stimulus::SpeedDial,
+                    instance: 1,
+                    call_reference: 0,
+                    status: 0,
+                }
+                .encode(protocol)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let frames = read_until_message(&mut phone, &mut decoder, id::DIALED_NUMBER).await;
+        assert!(frames.iter().any(|frame| {
+            ServerMessage::decode(frame.clone(), protocol).is_ok_and(|message| {
+                matches!(
+                    message,
+                    ServerMessage::DialedNumber {
+                        ref number,
+                        ..
+                    } if number == "2001"
+                )
+            })
+        }));
+        let call_id = match events.recv().await {
+            Some(Event::Device(DeviceEvent {
+                device_id: actual_device,
+                event: DeviceEventKind::OffHook { call_id, .. },
+                ..
+            })) if actual_device == device_id => call_id,
+            other => panic!("unexpected awaiting speed-dial setup event: {other:?}"),
+        };
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::SpeedDial {
+                    call_id: actual_call,
+                    ref number,
+                    await_further_digits: true,
+                    ..
+                },
+                ..
+            })) if actual_call == call_id && number == "2001"
         ));
 
         handle.shutdown().await.unwrap();

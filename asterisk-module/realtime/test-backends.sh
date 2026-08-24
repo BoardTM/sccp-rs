@@ -44,7 +44,8 @@ docker run --detach --rm --name "$postgres_container" \
     --env POSTGRES_PASSWORD=realtime \
     --env POSTGRES_DB=realtime \
     postgres:17-alpine >/dev/null
-until docker exec "$postgres_container" pg_isready --username postgres --dbname realtime >/dev/null 2>&1; do
+until docker exec "$postgres_container" psql \
+    --username postgres --dbname realtime --command 'SELECT 1' >/dev/null 2>&1; do
     sleep 1
 done
 docker exec --interactive "$postgres_container" psql \

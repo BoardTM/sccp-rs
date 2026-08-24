@@ -142,7 +142,7 @@ pub fn start_module() -> Result<(), ModuleLifecycleError> {
     if module.is_some() {
         return Ok(());
     }
-    let file_provider = FileConfigurationProvider::new(config_path());
+    let file_provider = raw::config::AsteriskConfigurationSource::new(config_path());
     let realtime_tables = match file_provider.realtime_tables() {
         Ok(tables) => tables,
         Err(error) => {
