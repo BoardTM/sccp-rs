@@ -21,21 +21,6 @@ There is a separate `.so` for each supported Asterisk major version. Patch
 releases within the same major use the same file: for example, every Asterisk
 22.x installation uses the Asterisk 22 build.
 
-The prebuilt files do not support Asterisk 21 or older, ARM/aarch64 systems,
-32-bit systems, musl-based distributions such as standard Alpine Linux, or
-non-Linux systems.
-
-Check the target system before downloading anything:
-
-```console
-$ asterisk -V
-Asterisk 22.7.0
-$ uname -m
-x86_64
-$ ldd --version | head -n 1
-ldd (GNU libc) ...
-```
-
 If the first command reports Asterisk 22, download the file with `asterisk-22`
 in its name. If it reports Asterisk 23, use the `asterisk-23` file. Do not try
 to load the other build; the module checks the running Asterisk major and will
@@ -47,10 +32,7 @@ You will need:
 
 - A working Asterisk 22 or 23 installation
 - Root or equivalent access to install a module and configuration file
-- A Cisco phone already running SCCP firmware
-- A DHCP/TFTP arrangement that can direct the phone to this Asterisk server
-- TCP connectivity from the phone to the SCCP listening port, normally 2000
-- UDP connectivity for the RTP range configured in Asterisk's `rtp.conf`
+- A Cisco phone already running SCCP firmwared
 
 This driver is named `chan_sccp2.so`. It is a separate implementation from the
 older `chan_sccp.so` and Asterisk's `chan_skinny.so`. Do not load two SCCP
@@ -133,22 +115,6 @@ Use the Asterisk 23 filename if that is the build you downloaded. The long
 release filename is useful while downloading, but Asterisk should see the
 installed file as `chan_sccp2.so`.
 
-On an SELinux-enabled distribution, restore the normal module label after
-copying it:
-
-```sh
-sudo restorecon -v /usr/lib64/asterisk/modules/chan_sccp2.so
-```
-
-Before loading the module, it is also useful to check that the operating system
-can find its runtime libraries:
-
-```sh
-ldd /usr/lib64/asterisk/modules/chan_sccp2.so
-```
-
-No line should end in `not found`.
-
 ## 4. Create `sccp.conf`
 
 The module reads `sccp.conf` from Asterisk's configuration directory. Start
@@ -171,18 +137,6 @@ curl -fL \
 sudo install -o root -g asterisk -m 0640 \
   /tmp/sccp.conf /etc/asterisk/sccp.conf
 ```
-
-Some distributions run Asterisk under a group other than `asterisk`. Match the
-owner, group, mode, and SELinux label of the other files in the same
-configuration directory. For example:
-
-```sh
-ls -lZ /etc/asterisk/asterisk.conf /etc/asterisk/sccp.conf
-sudo restorecon -v /etc/asterisk/sccp.conf
-```
-
-Do not load the sample unchanged. At minimum, review the settings described
-below.
 
 ### General settings
 
