@@ -1032,11 +1032,7 @@ const fn primary_response(id: MessageId) -> ResponseExpectation {
                 minimum_protocol: 9,
             },
         },
-        SpeedDialStatusRequest => ResponseExpectation::VersionSelected {
-            before: SpeedDialStatus,
-            from: SpeedDialStatusDynamic,
-            minimum_protocol: 15,
-        },
+        SpeedDialStatusRequest => ResponseExpectation::Message(SpeedDialStatus),
         ServiceUrlStatusRequest => ResponseExpectation::SessionSelected {
             before: ServiceUrlStatus,
             from: ServiceUrlStatusDynamic,
@@ -1751,11 +1747,7 @@ mod tests {
                 .contract()
                 .unwrap()
                 .response,
-            ResponseExpectation::VersionSelected {
-                before: MessageId::SpeedDialStatus,
-                from: MessageId::SpeedDialStatusDynamic,
-                minimum_protocol: 15,
-            }
+            ResponseExpectation::Message(MessageId::SpeedDialStatus)
         );
     }
 }

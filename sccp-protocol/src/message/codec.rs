@@ -5575,7 +5575,7 @@ impl ServerMessage {
             }
             id::SPEED_DIAL_STAT_DYNAMIC => {
                 let value: WireSpeedDialStatus = decode(frame.message_id, p)?;
-                Ok(Self::SpeedDialStatus {
+                Ok(Self::SpeedDialStatusDynamic {
                     instance: value.instance,
                     number: value.number.text()?,
                     display_name: value.display_name.text()?,
@@ -7062,11 +7062,28 @@ impl ServerMessage {
                 number,
                 display_name,
             } => {
-                let message_id = if protocol.uses_dynamic_speed_dial_status() {
-                    id::SPEED_DIAL_STAT_DYNAMIC
-                } else {
-                    id::SPEED_DIAL_STAT
-                };
+                let message_id = id::SPEED_DIAL_STAT;
+                p = encode(
+                    message_id,
+                    &WireSpeedDialStatus {
+                        instance: *instance,
+                        number: WireFixedText::new(message_id, "number", number)?,
+                        display_name: WireFixedText::new_station(
+                            message_id,
+                            "display name",
+                            display_name,
+                            legacy_code_page,
+                        )?,
+                    },
+                )?;
+                message_id
+            }
+            Self::SpeedDialStatusDynamic {
+                instance,
+                number,
+                display_name,
+            } => {
+                let message_id = id::SPEED_DIAL_STAT_DYNAMIC;
                 p = encode(
                     message_id,
                     &WireSpeedDialStatus {
@@ -11186,7 +11203,7 @@ mod tests {
                 id::SPEED_DIAL_STAT,
             ),
             (
-                ServerMessage::SpeedDialStatus {
+                ServerMessage::SpeedDialStatusDynamic {
                     instance: 4,
                     number: "2004".into(),
                     display_name: "Warehouse".into(),
@@ -11281,6 +11298,33 @@ mod tests {
             assert_eq!(frame.message_id, expected_id);
             assert_eq!(
                 ServerMessage::decode(frame, session.protocol).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn speed_dial_status_forms_encode_explicit_message_identifiers() {
+        let legacy = ServerMessage::SpeedDialStatus {
+            instance: 4,
+            number: "2004".into(),
+            display_name: "Warehouse".into(),
+        };
+        let dynamic = ServerMessage::SpeedDialStatusDynamic {
+            instance: 4,
+            number: "2004".into(),
+            display_name: "Warehouse".into(),
+        };
+
+        for (message, expected_id) in [
+            (legacy, id::SPEED_DIAL_STAT),
+            (dynamic, id::SPEED_DIAL_STAT_DYNAMIC),
+        ] {
+            let bytes = message.encode(ProtocolVersion::V22).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.message_id, expected_id);
+            assert_eq!(
+                ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
                 message
             );
         }

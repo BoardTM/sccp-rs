@@ -2127,6 +2127,14 @@ pub enum ServerMessage {
         number: String,
         display_name: String,
     },
+    /// Explicit dynamic speed-dial update (`0x0149`). Status-request replies
+    /// use [`Self::SpeedDialStatus`] (`0x0091`) as required by station behavior
+    /// and the chan-sccp reference implementation.
+    SpeedDialStatusDynamic {
+        instance: u32,
+        number: String,
+        display_name: String,
+    },
     DialedNumber {
         number: String,
         line_instance: u32,

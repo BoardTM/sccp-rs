@@ -226,7 +226,7 @@ The example line is:
 type = line
 label = 1006
 context = internal
-callerid = "Wberg's Desk" <1006>
+callerid = "Wbergs Desk" <1006>
 incominglimit = 6
 ```
 
