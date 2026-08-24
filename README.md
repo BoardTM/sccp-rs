@@ -12,7 +12,11 @@ Given I was pursing a project that was going to use SCCP phones, I was somewhat 
 
 This project shoots in the same direction as PJSIP by separating the **protocol** and the **asterisk module** into two distinct crates. The protocol crate can easily be reused for other implementations, which is what I'm doing with my small app *(like pjsua)* but I also wanted to validate the implemenation, hence the Asterisk module. It was developed by researching the protocol from [chan_sccp](https://github.com/chan-sccp/chan-sccp) and [mod_skinny](https://github.com/sangoma/freeswitch/tree/master/src/mod/endpoints/mod_skinny), both of which we all owe a tremendous deal for laying the groundwork for making something like this possible.
 
-**AI DISCLAIMER:** I heavily used `gpt-5.6-sol`. This was not a *"make no mistakes, one shot"* ordeal, but rather a very tedious multi-week process with me reviewing protocol implementations and iterating with the model. I'm being as upfront about this as I can, you can spare me the purity testing.
+**But why Rust?** Apart from my short stint with C++ earlier in my career, most of my "compiled" development has been in Go and Rust, for the last 6 years it has been Rust. I've done so much C/C++ interop stuff with Rust that it's the natural choice for me. This is is no way a reflection or comment on language choice, projects like Asterisk has stood the test of time and is written in C. It's more a reflection on myself. I don't think I am big brained enough to produce this in C and I was certainly not smart enough to make `chan_sccp` work for Asterisk 23. Given that Rust can interop with C without much trouble, I wrote the Asterisk module in pure Rust with `bindgen` producing the ABI needed to interop.
+
+## AI DISCLAIMER
+
+I heavily used `gpt-5.6-sol`. This was **NOT** a *"make no mistakes, one shot"* ordeal, but rather a very tedious multi-week process with me reviewing protocol implementations and iterating with the model. I'm being as upfront about this as I can, you can spare me the purity testing.
 
 ## SCCP Protocol (sccp-protocol)
 
@@ -22,7 +26,7 @@ The crate deliberately contains no SIP or PBX policy. It can be used as the phon
 
 ## Asterisk Module
 
-In `asterisk-module` you will find a completely new channel driver called `chan_sccp2`, written in Rust. It targets Asterisk 22 and 23; production builds select one of those major-version ABI lanes and reject a different major at load time. *"But wait? Isn't Asterisk written in C?"* Yes, and Rust has great C interop, so that's what we used.
+In `asterisk-module` you will find a completely new channel driver called `chan_sccp2`, written in Rust. It targets Asterisk 22 and 23; production builds select one of those major-version ABI lanes and reject a different major at load time.
 
 The driver exposes SCCP as a native Asterisk channel and connects the protocol server to Asterisk's dialplan, RTP/media, device state, hints, message waiting, parking, pickup, transfers, conferencing, call forwarding, CLI, AMI, and realtime configuration. It is a new **completely new** implementation built on `sccp-protocol`, not a fork of the old `chan_sccp` module.
 
@@ -46,6 +50,29 @@ The remaining boundary is Asterisk's C ABI. Release modules deliberately opt out
 ## SCCP<->SIP app
 
 in progress
+
+## Feature Coverage
+
+### SCCP Protocol (`sccp-protocol`)
+
+| Area | Implemented | Not implemented / out of scope |
+| --- | --- | --- |
+| Wire protocol | Checked framing and typed codecs for the SCCP/SPCP catalog; unknown payloads are bounded and preserved | Typed codecs for `MediaPortList`, `SetHookFlashDetect`, `Start/StopMediaReception`, `EnunciatorCommand`, and the three `SpcpRegisterToken*` messages |
+| Station sessions | Async TCP server, injected clear/TLS streams, registration, keepalives, token fallback, failover advertisement, and live reconfiguration | Built-in TLS certificate/listener management and network ACLs |
+| Phone UI and services | Lines, buttons, soft keys, lamps, tones, prompts, MWI/BLF, call state, provisioning models, and typed Cisco IP Phone XML | TFTP/HTTP boot server, firmware distribution, and arbitrary proprietary XML schemas |
+| Media signaling | Audio and video channel control, DTMF, multicast, statistics, announcements, conferencing, and QoS/RSVP messages | RTP transport, codecs/transcoding, recording, and conference mixing |
+| Application policy | Typed event/command API for call-control applications | SIP, PBX, dialplan, routing, persistence, and authorization policy |
+
+### Asterisk Module (`chan_sccp2`)
+
+| Area | Supported | Not supported |
+| --- | --- | --- |
+| Platform | Asterisk 22 and 23 on Linux x86-64 | Other Asterisk majors |
+| Signaling and network | SCCP over TCP or TLS, IPv4/IPv6, NAT address selection, DSCP/COS, registration failover, and per-device transport policy | Configured network/hostname ACL admission |
+| Calling features | Inbound/outbound calls, hold, call waiting, auto-answer, shared lines, transfer, forwarding, pickup, park, barge, DND/privacy, voicemail/MWI, BLF/hints, mobility, call completion, recording, and conferencing | Phone firmware/TFTP provisioning and a built-in PBX or SIP stack |
+| Audio media | Native RTP, early media, jitter buffer, direct RTP, DTMF, and mapped G.711/G.722/G.723/G.729/G.726, GSM, iLBC, Siren7, SLIN16, and Opus | Protected/SRTP media and SCCP codecs with no Asterisk format mapping |
+| Video media | Anchored RTP and handset control for H.261, H.263/H.263+, and H.264, including fast-picture updates | Direct video RTP, H.265 stream setup, H.264 SVC/FEC/UC, and encrypted video |
+| Configuration and control | File and realtime config, transactional reloads, device state/hints, CLI, AMI actions/events, dialplan functions/apps, and an HTTP phone directory | The phone-authentication HTTP route (API only; no credential backend is installed) |
 
 ## Developing
 
