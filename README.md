@@ -73,7 +73,7 @@ in progress
 
 | Area | Supported | Not supported |
 | --- | --- | --- |
-| Platform | Asterisk 22+ on Linux x86-64 and ARM64/aarch64; currently tested with 22 and 23 | Asterisk 21 and older, 32-bit ARM, and non-glibc systems |
+| Platform | Asterisk 22+ on Linux x86-64 and ARM64/aarch64; currently tested with 22 and 23 | You're kinda on your own with ARM32 and other stuff LOL |
 | Signaling and network | SCCP over TCP or TLS, IPv4/IPv6, NAT address selection, DSCP/COS, registration failover, and per-device transport policy | Configured network/hostname ACL admission |
 | Calling features | Inbound/outbound calls, hold, call waiting, auto-answer, shared lines, transfer, forwarding, pickup, park, barge, DND/privacy, voicemail/MWI, BLF/hints, mobility, call completion, recording, and conferencing | Phone firmware/TFTP provisioning and a built-in PBX or SIP stack |
 | Audio media | Native RTP, early media, jitter buffer, direct RTP, DTMF, and mapped G.711/G.722/G.723/G.729/G.726, GSM, iLBC, Siren7, SLIN16, and Opus | Protected/SRTP media and SCCP codecs with no Asterisk format mapping |
