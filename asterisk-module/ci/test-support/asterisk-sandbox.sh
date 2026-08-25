@@ -84,9 +84,15 @@ sccp_sandbox_wait_ready() {
 	asterisk_bin=$1
 	SCCP_SANDBOX_READY_FAILURE=
 	SCCP_SANDBOX_EXIT_STATUS=
+	SCCP_SANDBOX_READY_PID=
+	SCCP_SANDBOX_READY_OUTPUT="$SCCP_SANDBOX_ROOT/fully-booted.log"
 	attempt=0
 	while [ "$attempt" -lt 100 ]; do
 		if ! kill -0 "$SCCP_SANDBOX_PID" 2>/dev/null; then
+			if [ -n "$SCCP_SANDBOX_READY_PID" ]; then
+				kill "$SCCP_SANDBOX_READY_PID" 2>/dev/null || true
+				wait "$SCCP_SANDBOX_READY_PID" 2>/dev/null || true
+			fi
 			if wait "$SCCP_SANDBOX_PID"; then
 				SCCP_SANDBOX_EXIT_STATUS=0
 			else
@@ -96,12 +102,28 @@ sccp_sandbox_wait_ready() {
 			SCCP_SANDBOX_READY_FAILURE=exited
 			return 1
 		fi
-		if sccp_sandbox_cli "$asterisk_bin" 'core show uptime' >/dev/null 2>&1; then
-			return 0
+		if [ -z "$SCCP_SANDBOX_READY_PID" ]; then
+			if sccp_sandbox_cli "$asterisk_bin" 'core show uptime' >/dev/null 2>&1; then
+				# The control socket opens before the module loader is ready. Loading a
+				# DSO in that window makes Asterisk treat its constructor as built-in.
+				"$asterisk_bin" -C "$SCCP_SANDBOX_ASTERISK_CONF" \
+					-rx 'core waitfullybooted' >"$SCCP_SANDBOX_READY_OUTPUT" 2>&1 &
+				SCCP_SANDBOX_READY_PID=$!
+			fi
+		elif ! kill -0 "$SCCP_SANDBOX_READY_PID" 2>/dev/null; then
+			if wait "$SCCP_SANDBOX_READY_PID" \
+				&& grep -Fq 'Asterisk has fully booted.' "$SCCP_SANDBOX_READY_OUTPUT"; then
+				return 0
+			fi
+			SCCP_SANDBOX_READY_PID=
 		fi
 		attempt=$((attempt + 1))
 		sleep 0.1
 	done
+	if [ -n "$SCCP_SANDBOX_READY_PID" ]; then
+		kill "$SCCP_SANDBOX_READY_PID" 2>/dev/null || true
+		wait "$SCCP_SANDBOX_READY_PID" 2>/dev/null || true
+	fi
 	SCCP_SANDBOX_READY_FAILURE=timeout
 	return 1
 }

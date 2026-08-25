@@ -1,4 +1,4 @@
-#[path = "../src/asterisk/native/channel/ownership.rs"]
+#[path = "../../src/asterisk/native/channel/ownership.rs"]
 mod ownership;
 
 mod support;

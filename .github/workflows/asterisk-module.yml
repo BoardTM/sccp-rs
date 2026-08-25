@@ -42,8 +42,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Test isolated Asterisk readiness helper
+        run: ./asterisk-module/ci/test-support/test-asterisk-sandbox.sh
+
       - name: Test SQLite, PostgreSQL, and MySQL realtime migrations
-        run: ./asterisk-module/realtime/test-backends.sh
+        run: ./asterisk-module/ci/realtime/test-backends.sh
 
       - uses: docker/setup-buildx-action@v3
 
@@ -51,7 +54,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: asterisk-module/Dockerfile
+          file: asterisk-module/ci/Dockerfile
           target: realtime-test
           cache-from: type=gha,scope=asterisk-ci-22.7.0
           cache-to: type=gha,mode=max,scope=asterisk-ci-22.7.0
@@ -175,7 +178,7 @@ jobs:
             --cache-to "type=gha,mode=max,scope=asterisk-arm64-${{ matrix.abi }}" \
             --target artifact \
             --output type=local,dest=dist \
-            --file asterisk-module/Dockerfile \
+            --file asterisk-module/ci/Dockerfile \
             .
 
       - uses: actions/upload-artifact@v4

@@ -94,7 +94,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && ASTERISK_BIN=/opt/asterisk-live/sbin/asterisk \
         ASTERISK_MODULE_DIR=/opt/asterisk-live/lib/asterisk/modules \
         ASTERISK_DATA_DIR=/opt/asterisk-live/var/lib/asterisk \
-        ./asterisk-module/live-tests/test-bridges.sh target/release/libchan_sccp2.so
+        ./asterisk-module/ci/live-tests/test-bridges.sh target/release/libchan_sccp2.so
 
 FROM asterisk-live AS realtime-test
 
@@ -108,18 +108,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && ASTERISK_BIN=/opt/asterisk-live/sbin/asterisk \
         ASTERISK_MODULE_DIR=/opt/asterisk-live/lib/asterisk/modules \
         ASTERISK_DATA_DIR=/opt/asterisk-live/var/lib/asterisk \
-        ./asterisk-module/realtime/test-live-provider.sh sqlite target/release/libchan_sccp2.so \
+        ./asterisk-module/ci/realtime/test-live-provider.sh sqlite target/release/libchan_sccp2.so \
     && service postgresql start \
     && su postgres -c 'createuser root' \
     && su postgres -c 'createdb --owner=root sccp2_realtime' \
     && ASTERISK_BIN=/opt/asterisk-live/sbin/asterisk \
         ASTERISK_MODULE_DIR=/opt/asterisk-live/lib/asterisk/modules \
         ASTERISK_DATA_DIR=/opt/asterisk-live/var/lib/asterisk \
-        ./asterisk-module/realtime/test-live-provider.sh postgresql target/release/libchan_sccp2.so \
+        ./asterisk-module/ci/realtime/test-live-provider.sh postgresql target/release/libchan_sccp2.so \
     && service postgresql stop \
     && service mariadb start \
     && mysql --user=root --execute 'CREATE DATABASE sccp2_realtime CHARACTER SET utf8mb4' \
     && ASTERISK_BIN=/opt/asterisk-live/sbin/asterisk \
         ASTERISK_MODULE_DIR=/opt/asterisk-live/lib/asterisk/modules \
         ASTERISK_DATA_DIR=/opt/asterisk-live/var/lib/asterisk \
-        ./asterisk-module/realtime/test-live-provider.sh mysql target/release/libchan_sccp2.so
+        ./asterisk-module/ci/realtime/test-live-provider.sh mysql target/release/libchan_sccp2.so

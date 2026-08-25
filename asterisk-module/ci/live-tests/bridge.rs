@@ -16,7 +16,7 @@ use super::system::cli_write;
 use crate::pbx::operations::{BridgeControl, CallFeatureError};
 use crate::pbx::party::AsteriskChannel;
 
-const SOURCE_FILE: &CStr = c"live-tests/bridge.rs";
+const SOURCE_FILE: &CStr = c"ci/live-tests/bridge.rs";
 const SOURCE_FUNCTION: &CStr = c"live_bridge_harness";
 const MODULE_RESOURCE: &CStr = c"chan_sccp2.so";
 const COMMAND: &CStr = c"sccp test bridges";

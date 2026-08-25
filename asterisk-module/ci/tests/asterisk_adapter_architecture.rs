@@ -778,7 +778,7 @@ fn recording_callback_owner_precedes_channel_owner_in_actual_session_layout() {
 
 #[test]
 fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
-    let script = source("test-native-lifecycle.sh");
+    let script = source("ci/test-native-lifecycle.sh");
     for required in [
         "module load chan_sccp2.so",
         "module unload chan_sccp2.so",
@@ -800,7 +800,7 @@ fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
     assert!(script.contains("autoload = no"));
     assert!(!script.contains("autoload = yes"));
 
-    let docker = source("Dockerfile");
+    let docker = source("ci/Dockerfile");
     let artifact_source = docker_stage(&docker, "asterisk-source");
     let artifact_build = docker_stage(&docker, "artifact-build");
     assert!(artifact_source.contains("make include/asterisk/buildopts.h"));
@@ -829,7 +829,7 @@ fn release_artifacts_are_named_for_the_oldest_compatible_abi_baseline() {
     assert!(script.contains("chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"));
     assert!(!script.contains("chan_sccp2-asterisk-${asterisk_version}-linux-x86_64.so"));
 
-    let docker = source("Dockerfile");
+    let docker = source("ci/Dockerfile");
     assert!(docker.contains("ASTERISK_ARTIFACT_LANE"));
     assert!(docker.contains("artifact_lane=\"${ASTERISK_ARTIFACT_LANE:-"));
     assert!(docker.contains("amd64) artifact_arch=x86_64"));

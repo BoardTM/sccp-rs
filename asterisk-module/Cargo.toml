@@ -52,3 +52,27 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 rcgen.workspace = true
 syn = { version = "2", features = ["full", "visit"] }
 tempfile.workspace = true
+
+[[test]]
+name = "asterisk_adapter_architecture"
+path = "ci/tests/asterisk_adapter_architecture.rs"
+
+[[test]]
+name = "call_completion_contract"
+path = "ci/tests/call_completion_contract.rs"
+
+[[test]]
+name = "live_bridge_harness_contract"
+path = "ci/tests/live_bridge_harness_contract.rs"
+
+[[test]]
+name = "native_channel_ownership"
+path = "ci/tests/native_channel_ownership.rs"
+
+[[test]]
+name = "native_media_ownership"
+path = "ci/tests/native_media_ownership.rs"
+
+[[test]]
+name = "targeted_reload_contract"
+path = "ci/tests/targeted_reload_contract.rs"

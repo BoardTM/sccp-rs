@@ -84,5 +84,5 @@ jobs:
           docker run --rm --pull always
           --volume "${GITHUB_WORKSPACE}:/workspace:ro"
           "$DISTRO_IMAGE"
-          /workspace/asterisk-module/distro-tests/test-package.sh
+          /workspace/asterisk-module/ci/distro-tests/test-package.sh
           "$PACKAGE_FAMILY" "$ASTERISK_MAJOR" "/workspace/dist/$ARTIFACT"

@@ -8,7 +8,7 @@ fn live_bridge_gate_is_feature_scoped_and_separate_from_artifact_builds() {
     let native = source("src/asterisk/native/mod.rs");
     let driver = source("src/asterisk/direct/cli.rs");
     let artifact = source("build-linux-x86_64.sh");
-    let live = source("live-tests/test-bridges.sh");
+    let live = source("ci/live-tests/test-bridges.sh");
     let workflow = workspace_source(".github/workflows/asterisk-live-bridges.yml");
 
     assert!(manifest.contains("live-asterisk-tests = []"));
@@ -21,13 +21,13 @@ fn live_bridge_gate_is_feature_scoped_and_separate_from_artifact_builds() {
     assert!(!artifact.contains("test-bridges.sh"));
     assert!(workflow.contains("22.7.0"));
     assert!(workflow.contains("23.4.1"));
-    assert!(workflow.contains("asterisk-module/Dockerfile"));
+    assert!(workflow.contains("asterisk-module/ci/Dockerfile"));
     assert!(workflow.contains("target: bridge-test"));
 }
 
 #[test]
 fn live_bridge_gate_uses_real_owned_native_boundaries() {
-    let harness = source("live-tests/bridge.rs");
+    let harness = source("ci/live-tests/bridge.rs");
     let bridge = source("src/asterisk/native/bridge/conference.rs");
 
     for required in [

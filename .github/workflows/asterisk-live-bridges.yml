@@ -4,10 +4,12 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - "asterisk-module/live-tests/**"
+      - "asterisk-module/ci/Dockerfile"
+      - "asterisk-module/ci/live-tests/**"
+      - "asterisk-module/ci/test-native-lifecycle.sh"
+      - "asterisk-module/ci/test-support/**"
       - "asterisk-module/src/**"
       - "asterisk-module/build.rs"
-      - "asterisk-module/test-native-lifecycle.sh"
       - "asterisk-module/Cargo.toml"
       - "sccp-protocol/**"
       - ".cargo/**"
@@ -20,10 +22,12 @@ on:
       - "!**/LICENSE*"
   pull_request:
     paths:
-      - "asterisk-module/live-tests/**"
+      - "asterisk-module/ci/Dockerfile"
+      - "asterisk-module/ci/live-tests/**"
+      - "asterisk-module/ci/test-native-lifecycle.sh"
+      - "asterisk-module/ci/test-support/**"
       - "asterisk-module/src/**"
       - "asterisk-module/build.rs"
-      - "asterisk-module/test-native-lifecycle.sh"
       - "asterisk-module/Cargo.toml"
       - "sccp-protocol/**"
       - ".cargo/**"
@@ -56,7 +60,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: asterisk-module/Dockerfile
+          file: asterisk-module/ci/Dockerfile
           target: bridge-test
           build-args: |
             ASTERISK_VERSION=${{ matrix.asterisk }}

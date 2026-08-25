@@ -7,7 +7,7 @@ pub mod dialplan;
 pub mod handles;
 pub mod http;
 #[cfg(feature = "live-asterisk-tests")]
-#[path = "../../../live-tests/bridge.rs"]
+#[path = "../../../ci/live-tests/bridge.rs"]
 mod live_bridge_tests;
 pub mod manager;
 mod ownership;

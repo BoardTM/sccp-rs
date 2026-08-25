@@ -65,4 +65,4 @@ ASTERISK_MODULE_DIR=$asterisk_module_dir \
 ASTERISK_DATA_DIR=/usr/share/asterisk \
 SCCP_LIFECYCLE_WARMUP_CYCLES=1 \
 SCCP_LIFECYCLE_BATCH_CYCLES=1 \
-	/workspace/asterisk-module/test-native-lifecycle.sh "$module_path"
+	/workspace/asterisk-module/ci/test-native-lifecycle.sh "$module_path"

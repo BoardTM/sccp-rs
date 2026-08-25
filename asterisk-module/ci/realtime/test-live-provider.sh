@@ -184,7 +184,8 @@ assert_not_contains() {
 	esac
 }
 
-cli 'module load chan_sccp2.so' >/dev/null
+module_load=$(cli 'module load chan_sccp2.so')
+assert_contains module-load "$module_load" 'Loaded chan_sccp2.so'
 initial_device=$(cli 'sccp show devices SEP000000000001')
 initial_buttons=$(cli 'sccp show devices SEP000000000001 buttons')
 initial_lines=$(cli 'sccp show lines')
@@ -233,5 +234,6 @@ after_mixed_lines=$(cli 'sccp show lines')
 assert_contains mixed-live-device "$after_mixed_devices" 'SEP000000000003'
 assert_contains mixed-live-line "$after_mixed_lines" 'Complete å'
 
-cli 'module unload chan_sccp2.so' >/dev/null
+module_unload=$(cli 'module unload chan_sccp2.so')
+assert_contains module-unload "$module_unload" 'Unloaded chan_sccp2.so'
 printf 'RT-001 PASS backend=%s\n' "$backend"
