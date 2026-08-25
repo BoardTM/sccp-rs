@@ -149,6 +149,18 @@ pub enum ForwardingWriteOutcome {
     Failed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ForwardingDigitOutcome {
+    Collected,
+    Commit(ForwardingCommit),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ForwardingExpiryOutcome {
+    Cancel(ForwardingEntry),
+    Commit(ForwardingCommit),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ForwardingEntryTiming {
     pub now: Instant,
@@ -165,6 +177,7 @@ pub struct ForwardingEntry {
     pub kind: ForwardingKind,
     pub phase: ForwardingEntryPhase,
     pub deadline: Instant,
+    dial_terminator: Digit,
     first_digit_timeout: Duration,
     interdigit_timeout: Duration,
     digits: String,
@@ -214,6 +227,18 @@ impl ForwardingEntry {
         });
         self.deadline = now + self.interdigit_timeout;
         Ok(())
+    }
+
+    fn input_digit(
+        &mut self,
+        digit: Digit,
+        now: Instant,
+    ) -> Result<ForwardingDigitOutcome, ForwardingRejection> {
+        if digit == self.dial_terminator {
+            return self.begin_commit().map(ForwardingDigitOutcome::Commit);
+        }
+        self.push_digit(digit, now)?;
+        Ok(ForwardingDigitOutcome::Collected)
     }
 
     fn backspace(&mut self, now: Instant) -> Result<(), ForwardingRejection> {
@@ -283,6 +308,7 @@ impl ForwardingEntryRegistry {
         line_instance: u32,
         call_id: CallId,
         kind: ForwardingKind,
+        dial_terminator: Digit,
         timing: ForwardingEntryTiming,
     ) -> Result<ForwardingEntry, ForwardingRejection> {
         if line_instance == 0
@@ -313,6 +339,7 @@ impl ForwardingEntryRegistry {
             kind,
             phase: ForwardingEntryPhase::Collecting,
             deadline: timing.now + timing.first_digit_timeout,
+            dial_terminator,
             first_digit_timeout: timing.first_digit_timeout,
             interdigit_timeout: timing.interdigit_timeout,
             digits: String::new(),
@@ -331,14 +358,14 @@ impl ForwardingEntryRegistry {
             .find(|entry| entry.call_id == call_id)
     }
 
-    pub fn push_digit(
+    pub fn input_digit(
         &mut self,
         device_id: &DeviceId,
         entry_id: ForwardingEntryId,
         digit: Digit,
         now: Instant,
-    ) -> Result<(), ForwardingRejection> {
-        self.exact_mut(device_id, entry_id)?.push_digit(digit, now)
+    ) -> Result<ForwardingDigitOutcome, ForwardingRejection> {
+        self.exact_mut(device_id, entry_id)?.input_digit(digit, now)
     }
 
     pub fn backspace(
@@ -357,6 +384,10 @@ impl ForwardingEntryRegistry {
         digits: &str,
         now: Instant,
     ) -> Result<(), ForwardingRejection> {
+        let entry = self.exact_mut(device_id, entry_id)?;
+        let digits = digits
+            .strip_suffix(entry.dial_terminator.as_char())
+            .unwrap_or(digits);
         if digits.len() > MAX_FORWARD_DESTINATION_BYTES {
             return Err(ForwardingRejection::DestinationTooLong);
         }
@@ -366,7 +397,6 @@ impl ForwardingEntryRegistry {
         {
             return Err(ForwardingRejection::InvalidDestination);
         }
-        let entry = self.exact_mut(device_id, entry_id)?;
         if entry.phase != ForwardingEntryPhase::Collecting {
             return Err(ForwardingRejection::InvalidPhase);
         }
@@ -381,7 +411,7 @@ impl ForwardingEntryRegistry {
         Ok(())
     }
 
-    pub fn expire(&mut self, now: Instant) -> Vec<ForwardingEntry> {
+    pub fn claim_expired(&mut self, now: Instant) -> Vec<ForwardingExpiryOutcome> {
         let mut expired = self
             .by_device
             .values()
@@ -401,7 +431,28 @@ impl ForwardingEntryRegistry {
                 }) {
                     return None;
                 }
-                self.by_device.remove(&device_id)
+                if self
+                    .by_device
+                    .get(&device_id)
+                    .is_some_and(|entry| entry.digits.is_empty())
+                {
+                    return self
+                        .by_device
+                        .remove(&device_id)
+                        .map(ForwardingExpiryOutcome::Cancel);
+                }
+                match self
+                    .by_device
+                    .get_mut(&device_id)
+                    .expect("exact expired forwarding entry was checked")
+                    .begin_commit()
+                {
+                    Ok(commit) => Some(ForwardingExpiryOutcome::Commit(commit)),
+                    Err(_) => self
+                        .by_device
+                        .remove(&device_id)
+                        .map(ForwardingExpiryOutcome::Cancel),
+                }
             })
             .collect()
     }
@@ -480,6 +531,22 @@ impl ForwardingEntryRegistry {
             .by_device
             .remove(device_id)
             .expect("exact forwarding entry was checked"))
+    }
+
+    pub fn cancel_collection(
+        &mut self,
+        device_id: &DeviceId,
+        entry_id: ForwardingEntryId,
+    ) -> Result<ForwardingEntry, ForwardingRejection> {
+        if self.by_device.get(device_id).is_none_or(|entry| {
+            entry.id != entry_id || entry.phase != ForwardingEntryPhase::Collecting
+        }) {
+            return Err(ForwardingRejection::Conflict);
+        }
+        Ok(self
+            .by_device
+            .remove(device_id)
+            .expect("exact forwarding collection was checked"))
     }
 
     fn exact_mut(
@@ -724,6 +791,7 @@ mod tests {
                 1,
                 CallId(10),
                 ForwardingKind::All,
+                Digit::D,
                 entry_timing(now),
             )
             .unwrap();
@@ -733,6 +801,7 @@ mod tests {
                 2,
                 CallId(11),
                 ForwardingKind::Busy,
+                Digit::D,
                 entry_timing(now),
             ),
             Err(ForwardingRejection::Conflict)
@@ -744,14 +813,14 @@ mod tests {
             Digit::Pound,
         ] {
             entries
-                .push_digit(&device(1), first.id, digit, now)
+                .input_digit(&device(1), first.id, digit, now)
                 .unwrap();
         }
         entries.backspace(&device(1), first.id, now).unwrap();
         let commit = entries.begin_commit(&device(1), first.id).unwrap();
         assert_eq!(commit.destination.as_str(), "12*");
         assert_eq!(
-            entries.push_digit(&device(1), first.id, Digit::Number(3), now),
+            entries.input_digit(&device(1), first.id, Digit::Number(3), now),
             Err(ForwardingRejection::InvalidPhase)
         );
         entries.commit(&device(1), first.id).unwrap();
@@ -762,6 +831,7 @@ mod tests {
                 1,
                 CallId(11),
                 ForwardingKind::Busy,
+                Digit::Pound,
                 entry_timing(now),
             )
             .unwrap();
@@ -783,6 +853,7 @@ mod tests {
                 1,
                 CallId(10),
                 ForwardingKind::NoAnswer,
+                Digit::Pound,
                 entry_timing(now),
             )
             .unwrap();
@@ -792,17 +863,136 @@ mod tests {
         );
         for _ in 0..MAX_FORWARD_DESTINATION_BYTES {
             entries
-                .push_digit(&device(1), entry.id, Digit::Number(9), now)
+                .input_digit(&device(1), entry.id, Digit::Number(9), now)
                 .unwrap();
         }
         assert_eq!(
-            entries.push_digit(&device(1), entry.id, Digit::Number(9), now),
+            entries.input_digit(&device(1), entry.id, Digit::Number(9), now),
             Err(ForwardingRejection::DestinationTooLong)
         );
         assert_eq!(
             entries.for_call(CallId(10)).unwrap().digits().len(),
             MAX_FORWARD_DESTINATION_BYTES
         );
+    }
+
+    #[test]
+    fn configured_terminator_commits_without_becoming_part_of_the_destination() {
+        let mut entries = ForwardingEntryRegistry::default();
+        let now = Instant::now();
+        let entry = entries
+            .begin(
+                device(1),
+                1,
+                CallId(10),
+                ForwardingKind::All,
+                Digit::Pound,
+                entry_timing(now),
+            )
+            .unwrap();
+        assert_eq!(
+            entries.input_digit(&device(1), entry.id, Digit::Number(2), now),
+            Ok(ForwardingDigitOutcome::Collected)
+        );
+        let ForwardingDigitOutcome::Commit(commit) = entries
+            .input_digit(&device(1), entry.id, Digit::Pound, now)
+            .unwrap()
+        else {
+            panic!("dial terminator did not commit forwarding")
+        };
+        assert_eq!(commit.destination.as_str(), "2");
+        assert_eq!(
+            entries.get(&device(1)).unwrap().phase,
+            ForwardingEntryPhase::Committing
+        );
+        assert_eq!(
+            entries.cancel_collection(&device(1), entry.id),
+            Err(ForwardingRejection::Conflict),
+            "handset teardown must not cancel an in-flight commit"
+        );
+
+        entries.cancel(&device(1), entry.id).unwrap();
+        let enbloc = entries
+            .begin(
+                device(1),
+                1,
+                CallId(11),
+                ForwardingKind::All,
+                Digit::Pound,
+                entry_timing(now),
+            )
+            .unwrap();
+        entries
+            .replace_digits(&device(1), enbloc.id, "2001#", now)
+            .unwrap();
+        assert_eq!(
+            entries
+                .begin_commit(&device(1), enbloc.id)
+                .unwrap()
+                .destination
+                .as_str(),
+            "2001"
+        );
+    }
+
+    #[test]
+    fn populated_interdigit_timeout_claims_one_commit_while_empty_timeout_cancels() {
+        let mut entries = ForwardingEntryRegistry::default();
+        let now = Instant::now();
+        let populated = entries
+            .begin(
+                device(1),
+                1,
+                CallId(10),
+                ForwardingKind::All,
+                Digit::Pound,
+                entry_timing(now),
+            )
+            .unwrap();
+        entries
+            .input_digit(
+                &device(1),
+                populated.id,
+                Digit::Number(2),
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(
+            entries
+                .claim_expired(now + Duration::from_secs(8))
+                .is_empty()
+        );
+        let expired = entries.claim_expired(now + Duration::from_secs(9));
+        let [ForwardingExpiryOutcome::Commit(commit)] = expired.as_slice() else {
+            panic!("populated forwarding entry did not become a commit")
+        };
+        assert_eq!(commit.entry_id, populated.id);
+        assert_eq!(commit.destination.as_str(), "2");
+        assert!(
+            entries
+                .claim_expired(now + Duration::from_secs(30))
+                .is_empty(),
+            "a committing generation must not be claimed twice"
+        );
+
+        entries.cancel(&device(1), populated.id).unwrap();
+        let empty = entries
+            .begin(
+                device(1),
+                1,
+                CallId(11),
+                ForwardingKind::Busy,
+                Digit::Pound,
+                entry_timing(now),
+            )
+            .unwrap();
+        assert!(matches!(
+            entries
+                .claim_expired(now + Duration::from_secs(16))
+                .as_slice(),
+            [ForwardingExpiryOutcome::Cancel(entry)] if entry.id == empty.id
+        ));
+        assert!(entries.get(&device(1)).is_none());
     }
 
     #[test]
@@ -815,13 +1005,18 @@ mod tests {
                 1,
                 CallId(10),
                 ForwardingKind::All,
+                Digit::Pound,
                 entry_timing(now),
             )
             .unwrap();
         assert_eq!(entry.deadline, now + Duration::from_secs(16));
-        assert!(entries.expire(now + Duration::from_secs(15)).is_empty());
+        assert!(
+            entries
+                .claim_expired(now + Duration::from_secs(15))
+                .is_empty()
+        );
         entries
-            .push_digit(
+            .input_digit(
                 &device(1),
                 entry.id,
                 Digit::Number(2),
@@ -846,13 +1041,17 @@ mod tests {
             entries.get(&device(1)).unwrap().deadline,
             now + Duration::from_secs(28)
         );
-        assert!(entries.expire(now + Duration::from_secs(27)).is_empty());
+        assert!(
+            entries
+                .claim_expired(now + Duration::from_secs(27))
+                .is_empty()
+        );
         assert_eq!(
-            entries.expire(now + Duration::from_secs(28)),
-            [ForwardingEntry {
+            entries.claim_expired(now + Duration::from_secs(28)),
+            [ForwardingExpiryOutcome::Cancel(ForwardingEntry {
                 deadline: now + Duration::from_secs(28),
                 ..entry
-            }]
+            })]
         );
 
         let committing = entries
@@ -861,6 +1060,7 @@ mod tests {
                 1,
                 CallId(11),
                 ForwardingKind::Busy,
+                Digit::Pound,
                 entry_timing(now),
             )
             .unwrap();
@@ -873,7 +1073,11 @@ mod tests {
             )
             .unwrap();
         entries.begin_commit(&device(1), committing.id).unwrap();
-        assert!(entries.expire(now + Duration::from_secs(30)).is_empty());
+        assert!(
+            entries
+                .claim_expired(now + Duration::from_secs(30))
+                .is_empty()
+        );
         assert_eq!(entries.get(&device(1)).unwrap().id, committing.id);
     }
 
@@ -887,6 +1091,7 @@ mod tests {
                 1,
                 CallId(10),
                 ForwardingKind::All,
+                Digit::Pound,
                 entry_timing(now),
             )
             .unwrap();
@@ -906,6 +1111,7 @@ mod tests {
                 1,
                 CallId(12),
                 ForwardingKind::Busy,
+                Digit::Pound,
                 entry_timing(now),
             )
             .unwrap();
@@ -933,6 +1139,7 @@ mod tests {
                 1,
                 CallId(11),
                 ForwardingKind::All,
+                Digit::Pound,
                 entry_timing(now),
             )
             .unwrap();
@@ -1147,6 +1354,7 @@ mod tests {
                 1,
                 CallId(10),
                 ForwardingKind::All,
+                Digit::Pound,
                 entry_timing(Instant::now()),
             ),
             Err(ForwardingRejection::IdentifierExhausted)

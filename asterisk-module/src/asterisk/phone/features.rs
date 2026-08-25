@@ -251,6 +251,8 @@ pub(super) async fn handle_forwarding_soft_key(
         first_digit_timeout: Duration::from_millis(config.general.first_digit_timeout_ms),
         interdigit_timeout: Duration::from_millis(config.general.interdigit_timeout_ms),
     };
+    let dial_terminator = dial_terminator_digit(config.general.dial_terminator.character)
+        .expect("configuration parser validated the forwarding dial terminator");
     drop(config);
     let Some(binding) = binding.filter(|_| enabled) else {
         return;
@@ -278,6 +280,7 @@ pub(super) async fn handle_forwarding_soft_key(
         line_instance,
         call_id,
         kind,
+        dial_terminator,
         timing,
     );
     let Ok(entry) = entry else {
@@ -379,7 +382,7 @@ pub(super) fn cancel_forwarding_entry_for_call(
     else {
         return false;
     };
-    entries.cancel(device_id, entry.id).is_ok()
+    entries.cancel_collection(device_id, entry.id).is_ok()
 }
 
 pub(super) fn cancel_forwarding_entry_for_device(access: &Access, device_id: &DeviceId) -> bool {
@@ -404,16 +407,26 @@ pub(super) async fn handle_forwarding_digit(
         if &entry.device_id != device_id {
             return true;
         }
-        entries.push_digit(device_id, entry.id, digit, Instant::now())
+        entries.input_digit(device_id, entry.id, digit, Instant::now())
     };
-    if result.is_err() {
-        display_voicemail_prompt(
-            access,
-            device_id.clone(),
-            Some(call_id),
-            "Forwarding destination is too long",
-        )
-        .await;
+    match result {
+        Ok(ForwardingDigitOutcome::Collected) => {}
+        Ok(ForwardingDigitOutcome::Commit(commit)) => {
+            finish_forwarding_commit(access, commit).await;
+        }
+        Err(error) => {
+            display_voicemail_prompt(
+                access,
+                device_id.clone(),
+                Some(call_id),
+                if error == ForwardingRejection::InvalidDestination {
+                    "Enter a forwarding destination"
+                } else {
+                    "Forwarding destination is too long"
+                },
+            )
+            .await;
+        }
     }
     true
 }
@@ -514,6 +527,12 @@ pub(super) async fn commit_forwarding_entry(
         .await;
         return;
     };
+    finish_forwarding_commit(access, commit).await;
+}
+
+pub(super) async fn finish_forwarding_commit(access: &Access, commit: ForwardingCommit) {
+    let device_id = &commit.device_id;
+    let call_id = commit.call_id;
     let close_outcome = send_confirmed_forwarding(
         access,
         PhoneCommand::new(device_id.clone(), PhoneCommandAction::CloseCall { call_id }),
@@ -536,7 +555,7 @@ pub(super) async fn commit_forwarding_entry(
         .and_then(|line| {
             execute_forwarding_mutation(
                 access,
-                device_id.clone(),
+                commit.device_id.clone(),
                 line,
                 commit.kind,
                 Some(commit.destination.clone()),

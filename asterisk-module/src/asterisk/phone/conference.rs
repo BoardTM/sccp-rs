@@ -1508,6 +1508,13 @@ pub fn publish_device_features(access: &Access, device_id: &DeviceId, state: &De
     let Some(device) = config.devices.get(device_id) else {
         return;
     };
+    access.spawn_phone(PhoneCommand::new(
+        device_id.clone(),
+        PhoneCommandAction::SetStatusMessage {
+            message: handset_status_message(state.dnd),
+            beep: false,
+        },
+    ));
     for (instance, button_mode) in config.dnd_buttons_for_device(device_id) {
         access.spawn_phone(PhoneCommand::new(
             device_id.clone(),
@@ -1595,24 +1602,31 @@ pub async fn expire_forwarding_entries(access: &Access, now: Instant) {
         .shared
         .forwarding_entries
         .lock_unpoisoned()
-        .expire(now);
-    for entry in expired {
-        if send_confirmed_forwarding(
-            access,
-            PhoneCommand::new(
-                entry.device_id,
-                PhoneCommandAction::CloseCall {
-                    call_id: entry.call_id,
-                },
-            ),
-        )
-        .await
-            == ForwardingWriteOutcome::Failed
-        {
-            ast_log(
-                LogLevel::Warning,
-                "unable to close expired forwarding collection on the handset",
-            );
+        .claim_expired(now);
+    for outcome in expired {
+        match outcome {
+            ForwardingExpiryOutcome::Cancel(entry) => {
+                if send_confirmed_forwarding(
+                    access,
+                    PhoneCommand::new(
+                        entry.device_id,
+                        PhoneCommandAction::CloseCall {
+                            call_id: entry.call_id,
+                        },
+                    ),
+                )
+                .await
+                    == ForwardingWriteOutcome::Failed
+                {
+                    ast_log(
+                        LogLevel::Warning,
+                        "unable to close expired forwarding collection on the handset",
+                    );
+                }
+            }
+            ForwardingExpiryOutcome::Commit(commit) => {
+                finish_forwarding_commit(access, commit).await;
+            }
         }
     }
 }

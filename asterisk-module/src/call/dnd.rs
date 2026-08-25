@@ -2,6 +2,7 @@
 
 use crate::config::DndButtonMode;
 use crate::runtime::controller::DndMode;
+use sccp_protocol::{HandsetStatusMessage, NotificationPriority};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DndMutation {
@@ -44,6 +45,24 @@ pub const fn default_button_mode(default: DndMode) -> DndButtonMode {
     }
 }
 
+pub fn handset_status_message(mode: DndMode) -> HandsetStatusMessage {
+    match mode {
+        DndMode::Off => HandsetStatusMessage::Clear {
+            priority: Some(NotificationPriority::DoNotDisturb),
+        },
+        DndMode::Silent => HandsetStatusMessage::Display {
+            text: "DND (Silent)".into(),
+            timeout_seconds: 0,
+            priority: Some(NotificationPriority::DoNotDisturb),
+        },
+        DndMode::Reject => HandsetStatusMessage::Display {
+            text: "DND (Busy)".into(),
+            timeout_seconds: 0,
+            priority: Some(NotificationPriority::DoNotDisturb),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +99,35 @@ mod tests {
         assert_eq!(default_button_mode(DndMode::Off), DndButtonMode::Cycle);
         assert_eq!(default_button_mode(DndMode::Silent), DndButtonMode::Silent);
         assert_eq!(default_button_mode(DndMode::Reject), DndButtonMode::Reject);
+    }
+
+    #[test]
+    fn handset_feedback_is_persistent_and_uses_the_dnd_priority_plane() {
+        assert_eq!(
+            handset_status_message(DndMode::Reject),
+            HandsetStatusMessage::Display {
+                text: "DND (Busy)".into(),
+                timeout_seconds: 0,
+                priority: Some(NotificationPriority::DoNotDisturb),
+            }
+        );
+        assert_eq!(
+            handset_status_message(DndMode::Silent),
+            HandsetStatusMessage::Display {
+                text: "DND (Silent)".into(),
+                timeout_seconds: 0,
+                priority: Some(NotificationPriority::DoNotDisturb),
+            }
+        );
+    }
+
+    #[test]
+    fn disabling_dnd_clears_only_the_dnd_priority_plane() {
+        assert_eq!(
+            handset_status_message(DndMode::Off),
+            HandsetStatusMessage::Clear {
+                priority: Some(NotificationPriority::DoNotDisturb),
+            }
+        );
     }
 }
