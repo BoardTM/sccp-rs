@@ -576,9 +576,12 @@ unsafe extern "C" fn device_state(line: *const c_char) -> c_int {
         match line_device_state(&line) {
             DeviceState::NotInUse => sys::AST_DEVICE_NOT_INUSE as c_int,
             DeviceState::InUse => sys::AST_DEVICE_INUSE as c_int,
+            DeviceState::Busy => sys::AST_DEVICE_BUSY as c_int,
+            DeviceState::Removed => sys::AST_DEVICE_INVALID as c_int,
             DeviceState::Unavailable => sys::AST_DEVICE_UNAVAILABLE as c_int,
             DeviceState::Ringing => sys::AST_DEVICE_RINGING as c_int,
-            DeviceState::Unknown => sys::AST_DEVICE_UNKNOWN as c_int,
+            DeviceState::RingInUse => sys::AST_DEVICE_RINGINUSE as c_int,
+            DeviceState::OnHold => sys::AST_DEVICE_ONHOLD as c_int,
         }
     })
 }

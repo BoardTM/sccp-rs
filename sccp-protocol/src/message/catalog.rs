@@ -399,7 +399,7 @@ const fn field_fidelity(id: MessageId) -> FieldFidelity {
         StopTone => FieldFidelity::CanonicalServerOutput("post-v11 tone word"),
         ButtonTemplate | SoftKeyTemplateResponse | SoftKeySetResponse => {
             FieldFidelity::CanonicalServerOutput(
-                "template offsets/count metadata and unused fixed-array entries",
+                "unused fixed-array entries outside the declared template count",
             )
         }
         ConnectionStatisticsRequest => {

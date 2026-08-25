@@ -227,6 +227,9 @@ description = Reception phone
 ; per-device ringing, subscription, and privacy policy.
 button = line, 1001, label=Main desk, caller_name=Reception, caller_number=1001, ring=normal, subscription=1001@from-internal, privacy=no
 button = speed_dial, Helpdesk, 2000
+; The third field is dialed when pressed. The fourth is an Asterisk dialplan
+; hint (extension@context), whose devices may be PJSIP, SIP, SCCP, Custom, or
+; any aggregate supported by Asterisk. Do not put PJSIP/foo directly here.
 button = blf, Warehouse, 2001, 2001@from-internal
 ; Omit the final argument to cycle off/reject/silent. Use silent or reject for
 ; a fixed-mode toggle (busy is accepted and normalized to reject).
@@ -241,7 +244,7 @@ button = service, Directory, http://pbx.example.test/sccp/directory
 button = addon, 1, 7914
 button = empty
 ; Feature defaults address feature-button instances, not physical positions.
-feature_default = 1, off
+feature_default = 2, off
 ; The original line syntax remains a shorthand for a line button and keeps
 ; its position relative to surrounding button entries.
 line = 1002

@@ -51,11 +51,14 @@ pub fn cli_completion(value: &CStr) -> *mut c_char {
 
 pub fn publish_device_state(line: &str, state: DeviceState) {
     let mapped = match state {
-        DeviceState::Unknown => sys::AST_DEVICE_UNKNOWN,
         DeviceState::NotInUse => sys::AST_DEVICE_NOT_INUSE,
         DeviceState::InUse => sys::AST_DEVICE_INUSE,
+        DeviceState::Busy => sys::AST_DEVICE_BUSY,
+        DeviceState::Removed => sys::AST_DEVICE_INVALID,
         DeviceState::Unavailable => sys::AST_DEVICE_UNAVAILABLE,
         DeviceState::Ringing => sys::AST_DEVICE_RINGING,
+        DeviceState::RingInUse => sys::AST_DEVICE_RINGINUSE,
+        DeviceState::OnHold => sys::AST_DEVICE_ONHOLD,
     };
     let Ok(device) = CString::new(format!("SCCP/{line}")) else {
         return;

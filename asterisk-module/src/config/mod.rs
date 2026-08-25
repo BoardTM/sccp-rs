@@ -1117,6 +1117,8 @@ pub struct DeviceConfig {
     pub buttons: Vec<ButtonDefinition>,
     /// Optional feature arguments keyed by feature-button instance.
     pub feature_arguments: HashMap<u32, String>,
+    /// Asterisk extension hints keyed by BLF feature-button instance.
+    pub blf_targets: HashMap<u32, HintTarget>,
     /// Ordered, validated PBX variables applied before logical-line values.
     pub channel_variables: Vec<ChannelVariable>,
     /// Canonical name of the resolved reusable soft-key profile.
@@ -1129,6 +1131,52 @@ pub struct DeviceConfig {
     pub allow_overlap: bool,
     pub media: DeviceMediaConfig,
     pub network: DeviceNetworkPolicy,
+}
+
+/// An Asterisk dialplan hint addressed independently from the number dialed by
+/// its SCCP BLF button.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HintTarget {
+    extension: String,
+    context: String,
+}
+
+impl HintTarget {
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        let value = value.trim();
+        let Some((extension, context)) = value.split_once('@') else {
+            return Err(ConfigError::InvalidValue {
+                key: "button.blf.hint".into(),
+                value: value.into(),
+            });
+        };
+        let extension = extension.trim();
+        let context = context.trim();
+        if extension.is_empty() || context.is_empty() || context.contains('@') {
+            return Err(ConfigError::InvalidValue {
+                key: "button.blf.hint".into(),
+                value: value.into(),
+            });
+        }
+        Ok(Self {
+            extension: extension.into(),
+            context: context.into(),
+        })
+    }
+
+    pub fn extension(&self) -> &str {
+        &self.extension
+    }
+
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+}
+
+impl fmt::Display for HintTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}@{}", self.extension, self.context)
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1683,6 +1731,7 @@ impl ButtonInstances {
 struct ParsedButton {
     definition: ButtonDefinition,
     feature_argument: Option<(u32, String)>,
+    blf_target: Option<(u32, HintTarget)>,
 }
 
 struct ParsedLine {
@@ -1756,6 +1805,7 @@ impl QosPolicyPatch {
 struct DeviceSectionDraft<'a> {
     buttons: Vec<ButtonDefinition>,
     feature_arguments: HashMap<u32, String>,
+    blf_targets: HashMap<u32, HintTarget>,
     instances: ButtonInstances,
     soft_key_profile: Option<String>,
     forward_all_enabled: Option<bool>,
@@ -1911,7 +1961,7 @@ impl ModuleConfig {
             for entry in canonical_section_entries(section)? {
                 output.push_str(&entry.key);
                 output.push_str(" = ");
-                output.push_str(&canonical_value(&entry.value));
+                output.push_str(&canonical_value(entry.value));
                 output.push('\n');
             }
         }
@@ -2674,7 +2724,7 @@ fn check_canonical_section(section: &RawSection, kind: &str) -> Result<(), Confi
     for (entry, canonical) in section.values.iter().zip(canonical_entries) {
         if entry.key != canonical.key {
             return Err(invalid_option(
-                &entry.diagnostic_key(),
+                entry.diagnostic_key(),
                 &entry.value,
                 &format!("canonical option name {}", canonical.key),
                 section_values::sensitive_option_name(&entry.key),
@@ -3930,6 +3980,9 @@ fn parse_device(
         if let Some((instance, argument)) = parsed.feature_argument {
             draft.feature_arguments.insert(instance, argument);
         }
+        if let Some((instance, target)) = parsed.blf_target {
+            draft.blf_targets.insert(instance, target);
+        }
         draft.buttons.push(parsed.definition);
     }
 
@@ -4112,6 +4165,7 @@ fn parse_device(
         lines: line_names,
         buttons: draft.buttons,
         feature_arguments: draft.feature_arguments,
+        blf_targets: draft.blf_targets,
         channel_variables: draft.channel_variables,
         soft_key_profile: resolved_soft_key_profile,
         feature_defaults,
@@ -4189,6 +4243,7 @@ fn parse_line_button(
     Ok(ParsedButton {
         definition: ButtonDefinition::Line(appearance),
         feature_argument: None,
+        blf_target: None,
     })
 }
 
@@ -4211,16 +4266,16 @@ fn parse_button(
             let label = required_button_field(fields[1], raw)?;
             let number = required_button_field(fields[2], raw)?;
             if fields.len() == 4 {
-                let hint = parse_blf_hint(fields[3], raw)?;
-                let instance = ButtonInstances::next(&mut instances.speed_dial);
+                let target = parse_blf_hint(fields[3], raw)?;
+                let instance = ButtonInstances::next(&mut instances.feature);
                 Ok(ParsedButton {
                     definition: ButtonDefinition::BlfSpeedDial(BlfSpeedDialDefinition {
                         instance,
                         number: number.to_owned(),
                         display_name: label.to_owned(),
-                        hint: hint.to_owned(),
                     }),
                     feature_argument: None,
+                    blf_target: Some((instance, target)),
                 })
             } else {
                 let instance = ButtonInstances::next(&mut instances.speed_dial);
@@ -4231,22 +4286,23 @@ fn parse_button(
                         display_name: label.to_owned(),
                     }),
                     feature_argument: None,
+                    blf_target: None,
                 })
             }
         }
         "blf" | "blfspeeddial" if fields.len() == 4 => {
             let label = required_button_field(fields[1], raw)?;
             let number = required_button_field(fields[2], raw)?;
-            let hint = parse_blf_hint(fields[3], raw)?;
-            let instance = ButtonInstances::next(&mut instances.speed_dial);
+            let target = parse_blf_hint(fields[3], raw)?;
+            let instance = ButtonInstances::next(&mut instances.feature);
             Ok(ParsedButton {
                 definition: ButtonDefinition::BlfSpeedDial(BlfSpeedDialDefinition {
                     instance,
                     number: number.to_owned(),
                     display_name: label.to_owned(),
-                    hint: hint.to_owned(),
                 }),
                 feature_argument: None,
+                blf_target: Some((instance, target)),
             })
         }
         "feature" if fields.len() >= 3 => {
@@ -4267,6 +4323,7 @@ fn parse_button(
                     feature,
                 }),
                 feature_argument,
+                blf_target: None,
             })
         }
         "service" if fields.len() >= 3 => {
@@ -4281,11 +4338,13 @@ fn parse_button(
                     url: url.to_owned(),
                 }),
                 feature_argument: None,
+                blf_target: None,
             })
         }
         "empty" | "unused" if fields.len() == 1 => Ok(ParsedButton {
             definition: ButtonDefinition::Unused,
             feature_argument: None,
+            blf_target: None,
         }),
         "addon" | "addonmodule" if fields.len() == 3 => {
             let slot = parse::<u32>("button.addon.slot", required_button_field(fields[1], raw)?)?;
@@ -4302,6 +4361,7 @@ fn parse_button(
                     device_type,
                 }),
                 feature_argument: None,
+                blf_target: None,
             })
         }
         _ => Err(invalid_button(raw)),
@@ -4385,21 +4445,9 @@ fn required_button_field<'a>(field: &'a str, raw: &str) -> Result<&'a str, Confi
     }
 }
 
-fn parse_blf_hint<'a>(field: &'a str, raw: &str) -> Result<&'a str, ConfigError> {
+fn parse_blf_hint(field: &str, raw: &str) -> Result<HintTarget, ConfigError> {
     let hint = required_button_field(field, raw)?;
-    let Some((extension, context)) = hint.split_once('@') else {
-        return Err(ConfigError::InvalidValue {
-            key: "button.blf.hint".into(),
-            value: hint.into(),
-        });
-    };
-    if extension.trim().is_empty() || context.trim().is_empty() || context.contains('@') {
-        return Err(ConfigError::InvalidValue {
-            key: "button.blf.hint".into(),
-            value: hint.into(),
-        });
-    }
-    Ok(hint)
+    HintTarget::parse(hint)
 }
 
 fn invalid_button(raw: &str) -> ConfigError {
@@ -8809,8 +8857,12 @@ mod tests {
         assert!(matches!(
             &first.buttons[1],
             ButtonDefinition::BlfSpeedDial(speed)
-                if speed.instance == 2 && speed.number == "2001"
+                if speed.instance == 1 && speed.number == "2001"
         ));
+        assert_eq!(
+            first.blf_targets.get(&1).map(ToString::to_string),
+            Some("2001@internal".into())
+        );
         assert!(matches!(&first.buttons[2], ButtonDefinition::Unused));
         assert!(matches!(
             &first.buttons[3],
@@ -10237,11 +10289,11 @@ mod tests {
             .unwrap();
         assert_eq!(device.lines, ["1001", "1002"]);
         assert_eq!(
-            device.feature_arguments.get(&1).map(String::as_str),
+            device.feature_arguments.get(&2).map(String::as_str),
             Some("silent")
         );
         assert_eq!(
-            config.dnd_button_mode(&device.id, 1),
+            config.dnd_button_mode(&device.id, 2),
             Some(DndButtonMode::Silent)
         );
         assert!(matches!(
@@ -10268,12 +10320,16 @@ mod tests {
         assert!(matches!(
             &device.buttons[3],
             ButtonDefinition::BlfSpeedDial(blf)
-                if blf.instance == 2 && blf.hint == "2001@internal"
+                if blf.instance == 1
         ));
+        assert_eq!(
+            device.blf_targets.get(&1).map(ToString::to_string),
+            Some("2001@internal".into())
+        );
         assert!(matches!(
             &device.buttons[4],
             ButtonDefinition::Feature(feature)
-                if feature.instance == 1 && feature.feature == ButtonType::DoNotDisturb
+                if feature.instance == 2 && feature.feature == ButtonType::DoNotDisturb
         ));
         assert!(matches!(
             &device.buttons[5],
@@ -10317,8 +10373,16 @@ mod tests {
             ButtonDefinition::BlfSpeedDial(blf)
                 if blf.instance == 1
                     && blf.number == "2000"
-                    && blf.hint == "2000@internal"
         ));
+        let device = ModuleConfig::parse(&input)
+            .unwrap()
+            .devices
+            .remove(&DeviceId::new("SEP001122334455").unwrap())
+            .unwrap();
+        assert_eq!(
+            device.blf_targets.get(&1).map(ToString::to_string),
+            Some("2000@internal".into())
+        );
     }
 
     #[test]
@@ -10555,7 +10619,7 @@ mod tests {
                     && value.contains("expected")
         ));
 
-        let empty_buttons = "button = empty\n".repeat(56);
+        let empty_buttons = "button = empty\n".repeat(256);
         let oversized = CONFIG.replace(
             "line = 1001",
             &format!("button = line, 1001\n{empty_buttons}"),
@@ -10564,7 +10628,7 @@ mod tests {
             ModuleConfig::parse(&oversized),
             Err(ConfigError::InvalidValue { key, value })
                 if key.contains("[SEP001122334455].button")
-                && value.contains("protocol limit is 42")
+                && value.contains("logical layout limit is 256")
                     && value.contains("expected")
         ));
     }

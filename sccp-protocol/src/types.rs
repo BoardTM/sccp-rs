@@ -440,12 +440,10 @@ pub struct SpeedDialDefinition {
 /// A speed-dial button whose lamp and icon follow an external presence target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlfSpeedDialDefinition {
-    /// Nonzero station button instance, unique among monitored speed dials.
+    /// Nonzero station feature instance, shared with other feature buttons.
     pub instance: u32,
     pub number: String,
     pub display_name: String,
-    /// Presence-provider hint address, normally `extension@context`.
-    pub hint: String,
 }
 
 /// Semantic state of a monitored speed-dial target.
@@ -455,6 +453,7 @@ pub enum BlfState {
     Ringing,
     Busy,
     Held,
+    DoNotDisturb,
     Unavailable,
     Unknown,
 }
@@ -830,7 +829,10 @@ impl Default for StationUiPolicy {
 impl DeviceDefinition {
     /// Validates the station definition and its nested button/service policies.
     pub fn validate(&self) -> Result<(), CodecError> {
-        const MAX_BUTTONS: usize = 42;
+        // One canonical ButtonTemplate frame carries 42 definitions. Larger
+        // station/sidecar layouts are sent as offset chunks; retain the
+        // library's validated logical-layout ceiling independently.
+        const MAX_BUTTONS: usize = 256;
 
         self.soft_keys.validate()?;
         if let Some(signaling_qos) = self.signaling_qos {
@@ -839,7 +841,7 @@ impl DeviceDefinition {
 
         if self.buttons.len() > MAX_BUTTONS {
             return Err(CodecError::InvalidDefinition(format!(
-                "device {} has {} buttons; the protocol limit is {MAX_BUTTONS}",
+                "device {} has {} buttons; the logical layout limit is {MAX_BUTTONS}",
                 self.id,
                 self.buttons.len()
             )));
@@ -873,7 +875,7 @@ impl DeviceDefinition {
         expanded_buttons += addon_buttons_remaining.unwrap_or_default();
         if expanded_buttons > MAX_BUTTONS {
             return Err(CodecError::InvalidDefinition(format!(
-                "device {} expands to {expanded_buttons} buttons; the protocol limit is {MAX_BUTTONS}",
+                "device {} expands to {expanded_buttons} buttons; the logical layout limit is {MAX_BUTTONS}",
                 self.id
             )));
         }
@@ -1026,7 +1028,7 @@ impl ButtonDefinition {
         match self {
             Self::Line(definition) => Some(("line", definition.instance)),
             Self::SpeedDial(definition) => Some(("speed dial", definition.instance)),
-            Self::BlfSpeedDial(definition) => Some(("BLF speed dial", definition.instance)),
+            Self::BlfSpeedDial(definition) => Some(("feature", definition.instance)),
             Self::Feature(definition) => Some(("feature", definition.instance)),
             Self::Service(definition) => Some(("service URL", definition.instance)),
             Self::AddonModule(definition) => Some(("addon module", definition.slot)),
@@ -1248,10 +1250,9 @@ mod tests {
                     instance: 1,
                     number: "2002".into(),
                     display_name: "Dispatch".into(),
-                    hint: "2002@internal".into(),
                 }),
                 ButtonDefinition::Feature(FeatureDefinition {
-                    instance: 1,
+                    instance: 2,
                     label: "DND".into(),
                     feature: crate::message::values::ButtonType::DoNotDisturb,
                 }),
@@ -1359,17 +1360,44 @@ mod tests {
             Err(CodecError::InvalidDefinition(message))
                 if message.contains("feature button with instance zero")
         ));
+
+        let definition = DeviceDefinition {
+            id: DeviceId::new("SEP001122334455").unwrap(),
+            description: "Desk".into(),
+            transport: StationTransportRequirement::Either,
+            signaling_qos: None,
+            buttons: vec![
+                line_button(1, "1001"),
+                ButtonDefinition::Feature(FeatureDefinition {
+                    instance: 1,
+                    label: "DND".into(),
+                    feature: crate::message::values::ButtonType::DoNotDisturb,
+                }),
+                ButtonDefinition::BlfSpeedDial(BlfSpeedDialDefinition {
+                    instance: 1,
+                    number: "2001".into(),
+                    display_name: "Warehouse".into(),
+                }),
+            ],
+            soft_keys: SoftKeyProfile::default(),
+            ui: StationUiPolicy::default(),
+        };
+        assert!(matches!(
+            definition.validate(),
+            Err(CodecError::InvalidDefinition(message))
+                if message.contains("repeats feature button instance 1")
+        ));
     }
 
     #[test]
-    fn station_definition_enforces_protocol_button_limit() {
+    fn station_definition_enforces_bounded_logical_button_limit() {
         let definition = DeviceDefinition {
             id: DeviceId::new("SEP001122334455").unwrap(),
             description: "Desk".into(),
             transport: StationTransportRequirement::Either,
             signaling_qos: None,
             buttons: std::iter::once(line_button(1, "1001"))
-                .chain(std::iter::repeat_n(ButtonDefinition::Unused, 42))
+                .chain(std::iter::repeat_n(ButtonDefinition::Unused, 256))
                 .collect(),
             soft_keys: SoftKeyProfile::default(),
             ui: StationUiPolicy::default(),
@@ -1377,7 +1405,7 @@ mod tests {
         assert!(matches!(
             definition.validate(),
             Err(CodecError::InvalidDefinition(message))
-                if message.contains("protocol limit is 42")
+                if message.contains("logical layout limit is 256")
         ));
     }
 

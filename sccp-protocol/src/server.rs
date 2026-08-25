@@ -54,7 +54,7 @@ pub use qos::{
 };
 pub use transport::{ServerIngress, StationIo};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -982,8 +982,6 @@ pub enum CommandAction {
     },
     SetBlfStatus {
         instance: LineInstance,
-        number: String,
-        label: String,
         state: BlfState,
         caller: Option<BlfCallerInfo>,
     },
@@ -1222,6 +1220,8 @@ pub enum ServerError {
     DeviceNotConnected(DeviceId),
     #[error("call {0:?} does not exist")]
     UnknownCall(CallId),
+    #[error("device {device} has no BLF feature button instance {instance}")]
+    UnknownBlfButton { device: DeviceId, instance: u32 },
     #[error("call {call_id:?} cannot {operation} while in state {state:?}")]
     InvalidCallTransaction {
         call_id: CallId,
@@ -1270,6 +1270,7 @@ impl ServerError {
         matches!(
             self,
             Self::InvalidCallTransaction { .. }
+                | Self::UnknownBlfButton { .. }
                 | Self::InvalidStationCommand { .. }
                 | Self::InvalidMulticastMedia(_)
                 | Self::UnsupportedMulticastCodec
@@ -2521,11 +2522,65 @@ struct SessionState {
     active_key_mode: KeyMode,
     active_call_id: Option<CallId>,
     pending_parking_menu: Option<PendingParkingMenu>,
+    active_blf_alerts: BTreeMap<u32, HandsetStatusMessage>,
+    visible_blf_alert: Option<HandsetStatusMessage>,
     persistent_status_message: bool,
     headset_enabled: bool,
     media_path_states:
         HashMap<crate::message::values::MediaPathId, crate::message::values::MediaPathEvent>,
     pending_media_path_release: Option<PendingMediaPathRelease>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        let device_id = DeviceId::new("UNINITIALIZED").expect("default device ID is valid");
+        Self {
+            device: DeviceDefinition {
+                id: device_id.clone(),
+                description: String::new(),
+                transport: StationTransportRequirement::Either,
+                signaling_qos: None,
+                buttons: Vec::new(),
+                soft_keys: SoftKeyProfile::default(),
+                ui: crate::types::StationUiPolicy::default(),
+            },
+            registration: DeviceRegistration {
+                id: device_id,
+                peer: SocketAddr::from(([0, 0, 0, 0], 0)),
+                transport: StationTransport::Clear,
+                reported_address: None,
+                reported_ipv6_address: None,
+                device_type: DeviceType::Undefined,
+                protocol: ProtocolVersion::V3,
+                firmware: String::new(),
+            },
+            features: PhoneFeatures::default(),
+            generation: SessionGeneration::new(1).expect("one is a valid session generation"),
+            calls_by_id: HashMap::new(),
+            calls_by_wire: HashMap::new(),
+            media_capabilities: StationMediaCapabilities::default(),
+            next_media_token: MediaRequestToken::new(1),
+            next_multicast_generation: 0,
+            multicast: HashMap::new(),
+            pending_connection_statistics: HashMap::new(),
+            statistics_references: HashSet::new(),
+            cancelled_calls: HashSet::new(),
+            last_number_by_line: HashMap::new(),
+            forwarding_by_line: HashMap::new(),
+            feature_states: HashMap::new(),
+            mwi_by_line: HashMap::new(),
+            mobility_appearances: HashMap::new(),
+            active_key_mode: KeyMode::OnHook,
+            active_call_id: None,
+            pending_parking_menu: None,
+            active_blf_alerts: BTreeMap::new(),
+            visible_blf_alert: None,
+            persistent_status_message: false,
+            headset_enabled: false,
+            media_path_states: HashMap::new(),
+            pending_media_path_release: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2753,7 +2808,13 @@ async fn run_session(
                             DeviceEventKind::Registered(device_registration.clone()),
                         )).await.map_err(|_| ServerError::Stopped)?;
                         info!(device_id = %registration.device_id, %protocol, peer = %context.peer, "SCCP device registered");
-                        state = Some(SessionState { device: definition, registration: device_registration, features, generation, calls_by_id: HashMap::new(), calls_by_wire: HashMap::new(), media_capabilities: StationMediaCapabilities::default(), next_media_token: MediaRequestToken::new(1), next_multicast_generation: 0, multicast: HashMap::new(), pending_connection_statistics: HashMap::new(), statistics_references: HashSet::new(), cancelled_calls: HashSet::new(), last_number_by_line: HashMap::new(), forwarding_by_line: HashMap::new(), feature_states: HashMap::new(), mwi_by_line: HashMap::new(), mobility_appearances: HashMap::new(), active_key_mode: KeyMode::OnHook, active_call_id: None, pending_parking_menu: None, persistent_status_message: false, headset_enabled: false, media_path_states: HashMap::new(), pending_media_path_release: None });
+                        state = Some(SessionState {
+                            device: definition,
+                            registration: device_registration,
+                            features,
+                            generation,
+                            ..SessionState::default()
+                        });
                         last_keepalive = Instant::now();
                     } else if let Some(state) = state.as_mut() {
                         if matches!(message, ClientMessage::KeepAlive) { last_keepalive = Instant::now(); }
@@ -3194,14 +3255,7 @@ async fn handle_client_message(
             }
         }
         ClientMessage::ButtonTemplateRequest => {
-            send_message(
-                stream,
-                &ServerMessage::ButtonTemplate {
-                    buttons: button_template(&state.device),
-                },
-                protocol,
-            )
-            .await?;
+            send_button_template(stream, &state.device, protocol).await?;
         }
         ClientMessage::VersionRequest => {
             send_message(
@@ -4892,6 +4946,44 @@ fn button_template(device: &DeviceDefinition) -> Vec<ButtonTemplateEntry> {
     buttons
 }
 
+async fn send_button_template(
+    stream: &mut dyn StationIo,
+    device: &DeviceDefinition,
+    session: impl Into<StationSessionContext>,
+) -> Result<(), ServerError> {
+    let session = session.into();
+    for message in button_template_messages(device)? {
+        send_message(stream, &message, session).await?;
+    }
+    Ok(())
+}
+
+fn button_template_messages(device: &DeviceDefinition) -> Result<Vec<ServerMessage>, CodecError> {
+    let buttons = button_template(device);
+    let total = u32::try_from(buttons.len()).map_err(|_| {
+        CodecError::InvalidDefinition(format!(
+            "device {} button template is too large for SCCP",
+            device.id
+        ))
+    })?;
+    if buttons.is_empty() {
+        return Ok(vec![ServerMessage::ButtonTemplate {
+            offset: 0,
+            total: 0,
+            buttons: Vec::new(),
+        }]);
+    }
+    Ok(buttons
+        .chunks(42)
+        .enumerate()
+        .map(|(chunk_index, chunk)| ServerMessage::ButtonTemplate {
+            offset: u32::try_from(chunk_index * 42).expect("validated button template offset"),
+            total,
+            buttons: chunk.to_vec(),
+        })
+        .collect())
+}
+
 fn line_status(device: &DeviceDefinition, instance: u32) -> Option<ServerMessage> {
     device
         .line(instance)
@@ -4944,9 +5036,6 @@ fn speed_dial_status(device: &DeviceDefinition, instance: u32) -> ServerMessage 
         ButtonDefinition::SpeedDial(speed_dial) if speed_dial.instance == instance => {
             Some((&speed_dial.number, &speed_dial.display_name))
         }
-        ButtonDefinition::BlfSpeedDial(speed_dial) if speed_dial.instance == instance => {
-            Some((&speed_dial.number, &speed_dial.display_name))
-        }
         _ => None,
     });
     ServerMessage::SpeedDialStatus {
@@ -4959,12 +5048,10 @@ fn speed_dial_status(device: &DeviceDefinition, instance: u32) -> ServerMessage 
 fn feature_status(
     device: &DeviceDefinition,
     instance: u32,
-    capabilities: u32,
+    _capabilities: u32,
 ) -> Option<ServerMessage> {
     device.buttons.iter().find_map(|button| match button {
-        ButtonDefinition::BlfSpeedDial(speed_dial)
-            if capabilities == 1 && speed_dial.instance == instance =>
-        {
+        ButtonDefinition::BlfSpeedDial(speed_dial) if speed_dial.instance == instance => {
             Some(ServerMessage::FeatureStatus {
                 instance,
                 button_type: ButtonType::BlfSpeedDial,
@@ -5062,51 +5149,30 @@ fn do_not_disturb_state_messages(
     ])
 }
 
-fn blf_status_messages(
+fn blf_status_message(
+    device: &DeviceDefinition,
     instance: u32,
-    number: &str,
-    label: &str,
     state: BlfState,
-    caller: Option<&BlfCallerInfo>,
-) -> [ServerMessage; 3] {
-    let caller = caller.map(BlfCallerInfo::display).unwrap_or_default();
-    let dynamic_label = if caller.is_empty() {
-        label.to_owned()
-    } else {
-        format!("{label}: {caller}")
-    };
+) -> Option<ServerMessage> {
+    let definition = device.buttons.iter().find_map(|button| match button {
+        ButtonDefinition::BlfSpeedDial(definition) if definition.instance == instance => {
+            Some(definition)
+        }
+        _ => None,
+    })?;
     let icon = match state {
         BlfState::Idle => BusyLampFieldState::Idle,
         BlfState::Ringing => BusyLampFieldState::Alerting,
         BlfState::Busy | BlfState::Held => BusyLampFieldState::InUse,
+        BlfState::DoNotDisturb => BusyLampFieldState::DoNotDisturb,
         BlfState::Unavailable | BlfState::Unknown => BusyLampFieldState::UnknownState,
     };
-    let lamp = match state {
-        BlfState::Idle => LampMode::Off,
-        BlfState::Ringing => LampMode::Blink,
-        BlfState::Busy => LampMode::On,
-        BlfState::Held => LampMode::Hold,
-        BlfState::Unavailable => LampMode::Flash,
-        BlfState::Unknown => LampMode::Wink,
-    };
-    [
-        ServerMessage::SpeedDialStatus {
-            instance,
-            number: truncate_utf8(number, 23),
-            display_name: truncate_utf8(&dynamic_label, 39),
-        },
-        ServerMessage::FeatureStatus {
-            instance,
-            button_type: ButtonType::BlfSpeedDial,
-            label: truncate_utf8(&dynamic_label, 39),
-            state: icon.wire_value(),
-        },
-        ServerMessage::SetLamp {
-            stimulus: ButtonType::BlfSpeedDial,
-            instance,
-            mode: lamp,
-        },
-    ]
+    Some(ServerMessage::FeatureStatus {
+        instance,
+        button_type: ButtonType::BlfSpeedDial,
+        label: definition.display_name.clone(),
+        state: icon.wire_value(),
+    })
 }
 
 fn hinted_ringing_notification(
@@ -5129,6 +5195,28 @@ fn hinted_ringing_notification(
         timeout_seconds: 5,
         priority: None,
     })
+}
+
+fn reconcile_blf_alert(
+    instance: u32,
+    notification: Option<HandsetStatusMessage>,
+    active: &mut BTreeMap<u32, HandsetStatusMessage>,
+    visible: &mut Option<HandsetStatusMessage>,
+) -> Option<HandsetStatusMessage> {
+    match notification {
+        Some(notification) => {
+            active.insert(instance, notification);
+        }
+        None => {
+            active.remove(&instance);
+        }
+    }
+    let next = active.first_key_value().map(|(_, message)| message.clone());
+    if *visible == next {
+        return None;
+    }
+    *visible = next.clone();
+    Some(next.unwrap_or(HandsetStatusMessage::Clear { priority: None }))
 }
 
 fn truncate_utf8(value: &str, maximum_bytes: usize) -> String {
@@ -6133,14 +6221,7 @@ async fn handle_session_command(
                         &next_appearances,
                     )?;
 
-                    send_message(
-                        stream,
-                        &ServerMessage::ButtonTemplate {
-                            buttons: button_template(&candidate),
-                        },
-                        protocol,
-                    )
-                    .await?;
+                    send_button_template(stream, &candidate, protocol).await?;
                     if let Some(appearance) = &appearance {
                         if let Some(message) = line_status(&candidate, appearance.instance) {
                             send_station_ui_message(stream, state, &message).await?;
@@ -6162,23 +6243,46 @@ async fn handle_session_command(
                 }
                 CommandAction::SetBlfStatus {
                     instance,
-                    number,
-                    label,
                     state: blf_state,
                     caller,
                     ..
                 } => {
                     let instance = instance.get();
-                    for message in
-                        blf_status_messages(instance, &number, &label, blf_state, caller.as_ref())
-                    {
-                        send_station_ui_message(stream, state, &message).await?;
-                    }
-                    if let Some(notification) = hinted_ringing_notification(
+                    let Some(message) = blf_status_message(&state.device, instance, blf_state)
+                    else {
+                        return Err(ServerError::UnknownBlfButton {
+                            device: state.device.id.clone(),
+                            instance,
+                        });
+                    };
+                    let ServerMessage::FeatureStatus {
+                        button_type,
+                        state: feature_state,
+                        ref label,
+                        ..
+                    } = message
+                    else {
+                        unreachable!("BLF status is a feature-state message")
+                    };
+                    state.feature_states.insert(
+                        instance,
+                        SessionFeatureState {
+                            button_type,
+                            state: feature_state,
+                        },
+                    );
+                    send_station_ui_message(stream, state, &message).await?;
+                    let notification = hinted_ringing_notification(
                         &state.device,
-                        &label,
+                        label,
                         caller.as_ref(),
                         blf_state,
+                    );
+                    if let Some(notification) = reconcile_blf_alert(
+                        instance,
+                        notification,
+                        &mut state.active_blf_alerts,
+                        &mut state.visible_blf_alert,
                     ) {
                         for message in status_message_frames(
                             notification,
@@ -9261,34 +9365,13 @@ mod tests {
                 firmware: "test".into(),
             },
             device,
-            features: PhoneFeatures::empty(),
-            generation: SessionGeneration::new(1).unwrap(),
-            calls_by_id: HashMap::new(),
-            calls_by_wire: HashMap::new(),
             media_capabilities: vec![MediaCapability {
                 codec: Codec::Pcmu,
                 max_frames_per_packet: 2,
                 codec_parameters: [0; 8],
             }]
             .into(),
-            next_media_token: MediaRequestToken::new(1),
-            next_multicast_generation: 0,
-            multicast: HashMap::new(),
-            pending_connection_statistics: HashMap::new(),
-            statistics_references: HashSet::new(),
-            cancelled_calls: HashSet::new(),
-            last_number_by_line: HashMap::new(),
-            forwarding_by_line: HashMap::new(),
-            feature_states: HashMap::new(),
-            mwi_by_line: HashMap::new(),
-            mobility_appearances: HashMap::new(),
-            active_key_mode: KeyMode::OnHook,
-            active_call_id: None,
-            pending_parking_menu: None,
-            persistent_status_message: false,
-            headset_enabled: false,
-            media_path_states: HashMap::new(),
-            pending_media_path_release: None,
+            ..SessionState::default()
         }
     }
 
@@ -12227,7 +12310,6 @@ mod tests {
                 instance: 2,
                 number: "2002".into(),
                 display_name: "Warehouse".into(),
-                hint: "2002@internal".into(),
             }),
         ]);
         device
@@ -12325,57 +12407,31 @@ mod tests {
     }
 
     #[test]
-    fn blf_updates_map_every_state_to_icon_and_lamp() {
+    fn blf_updates_map_every_state_to_native_feature_status() {
         let cases = [
-            (BlfState::Idle, BusyLampFieldState::Idle, LampMode::Off),
-            (
-                BlfState::Ringing,
-                BusyLampFieldState::Alerting,
-                LampMode::Blink,
-            ),
-            (BlfState::Busy, BusyLampFieldState::InUse, LampMode::On),
-            (BlfState::Held, BusyLampFieldState::InUse, LampMode::Hold),
-            (
-                BlfState::Unavailable,
-                BusyLampFieldState::UnknownState,
-                LampMode::Flash,
-            ),
-            (
-                BlfState::Unknown,
-                BusyLampFieldState::UnknownState,
-                LampMode::Wink,
-            ),
+            (BlfState::Idle, BusyLampFieldState::Idle),
+            (BlfState::Ringing, BusyLampFieldState::Alerting),
+            (BlfState::Busy, BusyLampFieldState::InUse),
+            (BlfState::Held, BusyLampFieldState::InUse),
+            (BlfState::DoNotDisturb, BusyLampFieldState::DoNotDisturb),
+            (BlfState::Unavailable, BusyLampFieldState::UnknownState),
+            (BlfState::Unknown, BusyLampFieldState::UnknownState),
         ];
 
-        for (state, expected_icon, expected_lamp) in cases {
-            let [speed_dial, feature, lamp] =
-                blf_status_messages(7, "4100", "Support", state, None);
-            assert!(matches!(
-                speed_dial,
-                ServerMessage::SpeedDialStatus {
-                    instance: 7,
-                    ref number,
-                    ref display_name,
-                } if number == "4100" && display_name == "Support"
-            ));
+        let device = mixed_definition();
+        for (state, expected_icon) in cases {
+            let feature = blf_status_message(&device, 2, state).unwrap();
             assert!(matches!(
                 feature,
                 ServerMessage::FeatureStatus {
-                    instance: 7,
+                    instance: 2,
                     button_type: ButtonType::BlfSpeedDial,
                     ref label,
                     state,
-                } if label == "Support" && state == expected_icon.wire_value()
-            ));
-            assert!(matches!(
-                lamp,
-                ServerMessage::SetLamp {
-                    stimulus: ButtonType::BlfSpeedDial,
-                    instance: 7,
-                    mode,
-                } if mode == expected_lamp
+                } if label == "Warehouse" && state == expected_icon.wire_value()
             ));
         }
+        assert_eq!(blf_status_message(&device, 99, BlfState::Idle), None);
     }
 
     #[test]
@@ -12384,7 +12440,7 @@ mod tests {
             name: "Taylor".into(),
             number: "5550100".into(),
         };
-        let mut disabled = definition();
+        let mut disabled = mixed_definition();
         assert_eq!(
             hinted_ringing_notification(&disabled, "Dispatch", Some(&caller), BlfState::Ringing,),
             None
@@ -12403,6 +12459,7 @@ mod tests {
             BlfState::Idle,
             BlfState::Busy,
             BlfState::Held,
+            BlfState::DoNotDisturb,
             BlfState::Unavailable,
             BlfState::Unknown,
         ] {
@@ -12411,12 +12468,36 @@ mod tests {
                 None,
                 "non-ringing BLF state {state:?} must not be replaced by a notification"
             );
-            assert_eq!(
-                blf_status_messages(7, "4100", "Dispatch", state, Some(&caller)).len(),
-                3,
-                "ordinary BLF projection must remain intact"
-            );
+            assert!(blf_status_message(&disabled, 2, state).is_some());
         }
+    }
+
+    #[test]
+    fn simultaneous_blf_alerts_replace_and_clear_without_hiding_survivors() {
+        let alert = |text: &str| HandsetStatusMessage::Display {
+            text: text.into(),
+            timeout_seconds: 5,
+            priority: None,
+        };
+        let mut active = BTreeMap::new();
+        let mut visible = None;
+
+        assert_eq!(
+            reconcile_blf_alert(2, Some(alert("Two")), &mut active, &mut visible),
+            Some(alert("Two"))
+        );
+        assert_eq!(
+            reconcile_blf_alert(3, Some(alert("Three")), &mut active, &mut visible),
+            None
+        );
+        assert_eq!(
+            reconcile_blf_alert(2, None, &mut active, &mut visible),
+            Some(alert("Three"))
+        );
+        assert_eq!(
+            reconcile_blf_alert(3, None, &mut active, &mut visible),
+            Some(HandsetStatusMessage::Clear { priority: None })
+        );
     }
 
     #[test]
@@ -12523,24 +12604,12 @@ mod tests {
     }
 
     #[test]
-    fn blf_update_only_displays_explicitly_permitted_caller_information() {
-        let [_, without_caller, _] =
-            blf_status_messages(2, "4200", "Dispatch", BlfState::Ringing, None);
+    fn blf_feature_status_keeps_the_static_configured_label() {
+        let device = mixed_definition();
+        let without_caller = blf_status_message(&device, 2, BlfState::Ringing).unwrap();
         assert!(matches!(
             without_caller,
-            ServerMessage::FeatureStatus { label, .. } if label == "Dispatch"
-        ));
-
-        let caller = BlfCallerInfo {
-            name: "Taylor".into(),
-            number: "5550100".into(),
-        };
-        let [_, with_caller, _] =
-            blf_status_messages(2, "4200", "Dispatch", BlfState::Ringing, Some(&caller));
-        assert!(matches!(
-            with_caller,
-            ServerMessage::FeatureStatus { label, .. }
-                if label == "Dispatch: Taylor (5550100)"
+            ServerMessage::FeatureStatus { label, .. } if label == "Warehouse"
         ));
     }
 
@@ -12643,6 +12712,47 @@ mod tests {
     }
 
     #[test]
+    fn button_template_chunks_preserve_global_offset_count_and_total() {
+        for total in [43_usize, 56, 84] {
+            let mut device = definition();
+            device
+                .buttons
+                .extend(std::iter::repeat_n(ButtonDefinition::Unused, total - 1));
+            device.validate().unwrap();
+
+            let messages = button_template_messages(&device).unwrap();
+            assert_eq!(messages.len(), total.div_ceil(42));
+            let mut next_offset = 0_u32;
+            for (index, message) in messages.into_iter().enumerate() {
+                let ServerMessage::ButtonTemplate {
+                    offset,
+                    total: message_total,
+                    ref buttons,
+                } = message
+                else {
+                    unreachable!("button template helper returns only template chunks")
+                };
+                assert_eq!(offset, next_offset);
+                assert_eq!(message_total, total as u32);
+                assert_eq!(buttons.len(), (total - index * 42).min(42));
+                if index == 0 {
+                    assert_eq!(buttons[0].button_type, ButtonType::Line);
+                }
+                next_offset += buttons.len() as u32;
+
+                let bytes = message.encode(ProtocolVersion::V22).unwrap();
+                let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+                assert_eq!(frame.payload.len(), 96);
+                assert_eq!(
+                    ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                    message
+                );
+            }
+            assert_eq!(next_offset, total as u32);
+        }
+    }
+
+    #[test]
     fn static_button_statuses_use_typed_instances_and_safe_unknowns() {
         let device = mixed_definition();
 
@@ -12676,12 +12786,12 @@ mod tests {
             speed_dial_status(&device, 2),
             ServerMessage::SpeedDialStatus {
                 instance: 2,
-                number: "2002".into(),
-                display_name: "Warehouse".into(),
+                number: String::new(),
+                display_name: String::new(),
             }
         );
         assert_eq!(
-            feature_status(&device, 2, 1),
+            feature_status(&device, 2, 0),
             Some(ServerMessage::FeatureStatus {
                 instance: 2,
                 button_type: ButtonType::BlfSpeedDial,
@@ -12689,6 +12799,7 @@ mod tests {
                 state: BusyLampFieldState::UnknownState.wire_value(),
             })
         );
+        assert_eq!(feature_status(&device, 2, 1), feature_status(&device, 2, 0));
         assert_eq!(
             service_url_status(&device, 1),
             Some(ServerMessage::ServiceUrlStatus {
@@ -12891,7 +13002,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
-            ServerMessage::ButtonTemplate { buttons: expected }
+            ServerMessage::ButtonTemplate {
+                offset: 0,
+                total: expected.len() as u32,
+                buttons: expected,
+            }
         );
 
         phone
@@ -12938,8 +13053,8 @@ mod tests {
             ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
             ServerMessage::SpeedDialStatus {
                 instance: 2,
-                number: "2002".into(),
-                display_name: "Warehouse".into(),
+                number: String::new(),
+                display_name: String::new(),
             }
         );
 
@@ -12997,7 +13112,7 @@ mod tests {
             .write_all(
                 &ClientMessage::FeatureStatusRequest {
                     index: 2,
-                    capabilities: 1,
+                    capabilities: 0,
                 }
                 .encode(ProtocolVersion::V22)
                 .unwrap(),
@@ -13070,6 +13185,112 @@ mod tests {
             )),
             "unknown feature and service requests must not produce placeholder statuses"
         );
+
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_blf_update_is_validated_cached_and_replayed_as_feature_status_only() {
+        let device = mixed_definition();
+        let device_id = device.id.clone();
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            advertised_address: Ipv4Addr::LOCALHOST,
+            ..ServerConfig::default()
+        };
+        let (server, handle, _events) = Server::bind(config, [device]).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(server.run());
+        let protocol = ProtocolVersion::V22;
+        let mut phone = TcpStream::connect(address).await.unwrap();
+        let mut decoder = FrameDecoder::new();
+        phone.write_all(&register_bytes(protocol)).await.unwrap();
+        read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+
+        handle
+            .send_confirmed(Command::new(
+                device_id.clone(),
+                CommandAction::SetBlfStatus {
+                    instance: LineInstance::new(2),
+                    state: BlfState::Busy,
+                    caller: Some(BlfCallerInfo {
+                        name: "Must not replace label".into(),
+                        number: "5550100".into(),
+                    }),
+                },
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_message(&mut phone, &mut decoder, id::FEATURE_STAT).await;
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(
+                    frame.message_id,
+                    id::FEATURE_STAT | id::FEATURE_STAT_DYNAMIC
+                ))
+                .count(),
+            1
+        );
+        assert!(frames.iter().all(|frame| !matches!(
+            frame.message_id,
+            id::SPEED_DIAL_STAT | id::SPEED_DIAL_STAT_DYNAMIC | id::SET_LAMP
+        )));
+        let feature = frames
+            .into_iter()
+            .find(|frame| {
+                matches!(
+                    frame.message_id,
+                    id::FEATURE_STAT | id::FEATURE_STAT_DYNAMIC
+                )
+            })
+            .unwrap();
+        assert!(matches!(
+            ServerMessage::decode(feature, protocol).unwrap(),
+            ServerMessage::FeatureStatus {
+                instance: 2,
+                button_type: ButtonType::BlfSpeedDial,
+                label,
+                state,
+            } if label == "Warehouse" && state == BusyLampFieldState::InUse.wire_value()
+        ));
+
+        phone
+            .write_all(
+                &ClientMessage::FeatureStatusRequest {
+                    index: 2,
+                    capabilities: 0,
+                }
+                .encode(protocol)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let frames = read_until_message(&mut phone, &mut decoder, id::FEATURE_STAT).await;
+        let feature = frames
+            .into_iter()
+            .find(|frame| frame.message_id == id::FEATURE_STAT)
+            .unwrap();
+        assert!(matches!(
+            ServerMessage::decode(feature, protocol).unwrap(),
+            ServerMessage::FeatureStatus { state, .. }
+                if state == BusyLampFieldState::InUse.wire_value()
+        ));
+
+        assert!(matches!(
+            handle
+                .send_confirmed(Command::new(
+                    device_id,
+                    CommandAction::SetBlfStatus {
+                        instance: LineInstance::new(99),
+                        state: BlfState::Idle,
+                        caller: None,
+                    },
+                ))
+                .await,
+            Err(ServerError::CommandWrite(message)) if message.contains("no BLF feature button instance 99")
+        ));
 
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
@@ -13453,7 +13674,7 @@ mod tests {
         )));
         assert!(frames.iter().any(|frame| matches!(
             ServerMessage::decode(frame.clone(), protocol),
-            Ok(ServerMessage::ButtonTemplate { buttons })
+            Ok(ServerMessage::ButtonTemplate { buttons, .. })
                 if buttons == vec![ButtonTemplateEntry {
                     instance: 1,
                     button_type: ButtonType::Line,
@@ -14317,7 +14538,7 @@ mod tests {
         let frames = read_until_message(&mut phone, &mut decoder, id::LINE_STAT_DYNAMIC).await;
         assert!(frames.iter().any(|frame| matches!(
             ServerMessage::decode(frame.clone(), protocol),
-            Ok(ServerMessage::ButtonTemplate { ref buttons })
+            Ok(ServerMessage::ButtonTemplate { ref buttons, .. })
                 if buttons.iter().any(|button| button.instance == 2 && button.button_type == ButtonType::Line)
         )));
         assert!(frames.iter().any(|frame| matches!(
@@ -16936,7 +17157,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
-            ServerMessage::ButtonTemplate { buttons: expected }
+            ServerMessage::ButtonTemplate {
+                offset: 0,
+                total: expected.len() as u32,
+                buttons: expected,
+            }
         );
 
         handle.shutdown().await.unwrap();
@@ -18961,29 +19186,8 @@ mod tests {
                 firmware: "test".into(),
             },
             device,
-            features: PhoneFeatures::empty(),
-            generation: SessionGeneration::new(1).unwrap(),
-            calls_by_id: HashMap::new(),
-            calls_by_wire: HashMap::new(),
-            media_capabilities: StationMediaCapabilities::default(),
-            next_media_token: MediaRequestToken::new(1),
-            next_multicast_generation: 0,
-            multicast: HashMap::new(),
-            pending_connection_statistics: HashMap::new(),
             statistics_references: HashSet::from([42]),
-            cancelled_calls: HashSet::new(),
-            last_number_by_line: HashMap::new(),
-            forwarding_by_line: HashMap::new(),
-            feature_states: HashMap::new(),
-            mwi_by_line: HashMap::new(),
-            mobility_appearances: HashMap::new(),
-            active_key_mode: KeyMode::OnHook,
-            active_call_id: None,
-            pending_parking_menu: None,
-            persistent_status_message: false,
-            headset_enabled: false,
-            media_path_states: HashMap::new(),
-            pending_media_path_release: None,
+            ..SessionState::default()
         };
         let replacement = insert_call(&mut state, CallId(42), 1, Codec::Pcmu, CallState::OffHook);
         assert_eq!(replacement.wire_reference, 43);
@@ -19034,29 +19238,8 @@ mod tests {
                 firmware: "test".into(),
             },
             device,
-            features: PhoneFeatures::empty(),
-            generation: SessionGeneration::new(1).unwrap(),
-            calls_by_id: HashMap::new(),
-            calls_by_wire: HashMap::new(),
-            media_capabilities: StationMediaCapabilities::default(),
-            next_media_token: MediaRequestToken::new(1),
-            next_multicast_generation: 0,
-            multicast: HashMap::new(),
-            pending_connection_statistics: HashMap::new(),
-            statistics_references: HashSet::new(),
-            cancelled_calls: HashSet::new(),
-            last_number_by_line: HashMap::new(),
-            forwarding_by_line: HashMap::new(),
-            feature_states: HashMap::new(),
-            mwi_by_line: HashMap::new(),
-            mobility_appearances: HashMap::new(),
             active_key_mode: KeyMode::RingIn,
-            active_call_id: None,
-            pending_parking_menu: None,
-            persistent_status_message: false,
-            headset_enabled: false,
-            media_path_states: HashMap::new(),
-            pending_media_path_release: None,
+            ..SessionState::default()
         };
         let first = insert_call(
             &mut state,

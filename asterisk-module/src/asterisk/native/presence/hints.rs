@@ -152,7 +152,7 @@ unsafe fn hint_caller(info: &sys::ast_state_cb_info) -> Option<HintCaller> {
     if info.device_state_info.is_null() {
         return None;
     }
-    let mut result = None;
+    let mut candidates = Vec::new();
     let mut iterator = unsafe { sys::ao2_iterator_init(info.device_state_info, 0) };
     loop {
         let device = unsafe {
@@ -169,28 +169,44 @@ unsafe fn hint_caller(info: &sys::ast_state_cb_info) -> Option<HintCaller> {
             break;
         };
         let channel = unsafe { (*device.as_ptr()).causing_channel };
-        let mut inspected_channel = false;
         if let Some(channel) = unsafe { ChannelRef::acquire(channel) } {
             if let Ok(channel) = ChannelLock::acquire(channel) {
-                inspected_channel = true;
+                let pickup_private = unsafe {
+                    let value = sys::pbx_builtin_getvar_helper(
+                        channel.as_ptr(),
+                        c"SCCP_PICKUP_PRIVATE".as_ptr(),
+                    );
+                    sys::ast_true(value) != 0
+                };
                 let caller = unsafe { sys::ast_channel_caller(channel.as_ptr()) };
-                if let Some(caller) = unsafe { caller.as_ref() } {
-                    result = Some(HintCaller {
-                        name: (caller.id.name.valid != 0).then(|| lossy_text(caller.id.name.str_)),
-                        number: (caller.id.number.valid != 0)
-                            .then(|| lossy_text(caller.id.number.str_)),
-                        name_presentation: caller.id.name.presentation,
-                        number_presentation: caller.id.number.presentation,
-                    });
-                }
+                let caller = unsafe { caller.as_ref() }.map(|caller| HintCaller {
+                    name: (caller.id.name.valid != 0).then(|| lossy_text(caller.id.name.str_)),
+                    number: (caller.id.number.valid != 0)
+                        .then(|| lossy_text(caller.id.number.str_)),
+                    name_presentation: caller.id.name.presentation,
+                    number_presentation: caller.id.number.presentation,
+                });
+                candidates.push(visible_caller(pickup_private, caller));
             }
-        }
-        if inspected_channel {
-            break;
         }
     }
     unsafe { sys::ao2_iterator_destroy(&mut iterator) };
-    result
+    unambiguous_caller(candidates)
+}
+
+/// Caller identity is meaningful only when Asterisk reports exactly one
+/// causal channel. Selecting the first member of an aggregate would make
+/// privacy and identity depend on AO2 iteration order.
+fn unambiguous_caller(mut candidates: Vec<Option<HintCaller>>) -> Option<HintCaller> {
+    if candidates.len() == 1 {
+        candidates.pop().flatten()
+    } else {
+        None
+    }
+}
+
+fn visible_caller(pickup_private: bool, caller: Option<HintCaller>) -> Option<HintCaller> {
+    (!pickup_private).then_some(caller).flatten()
 }
 
 unsafe extern "C" fn hint_update(
@@ -227,7 +243,9 @@ unsafe extern "C" fn hint_watcher_destroy(_id: c_int, userdata: *mut c_void) {
         return;
     }
     contain_callback_panic((), || unsafe {
-        release_watcher_reference(userdata.cast());
+        let watcher = userdata.cast::<HintWatcher>();
+        (*watcher).id.store(-1, Ordering::Release);
+        release_watcher_reference(watcher);
     });
 }
 
@@ -308,5 +326,46 @@ impl HintBackend for NativeHintAdapter {
         }
         watcher.id.store(id, Ordering::Release);
         Ok(NativeHintSubscription { watcher })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caller(number: &str) -> HintCaller {
+        HintCaller {
+            name: Some("Desk".into()),
+            number: Some(number.into()),
+            name_presentation: 0,
+            number_presentation: 0,
+        }
+    }
+
+    #[test]
+    fn caller_requires_exactly_one_causal_channel() {
+        assert_eq!(unambiguous_caller(Vec::new()), None);
+        assert_eq!(unambiguous_caller(vec![None]), None);
+        assert_eq!(
+            unambiguous_caller(vec![Some(caller("4000"))]),
+            Some(caller("4000"))
+        );
+        assert_eq!(
+            unambiguous_caller(vec![Some(caller("4000")), Some(caller("4000"))]),
+            None
+        );
+        assert_eq!(
+            unambiguous_caller(vec![Some(caller("4000")), Some(caller("5000"))]),
+            None
+        );
+    }
+
+    #[test]
+    fn pickup_private_channel_never_exposes_caller() {
+        assert_eq!(visible_caller(true, Some(caller("4000"))), None);
+        assert_eq!(
+            visible_caller(false, Some(caller("4000"))),
+            Some(caller("4000"))
+        );
     }
 }

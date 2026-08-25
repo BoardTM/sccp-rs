@@ -1915,7 +1915,13 @@ pub enum ServerMessage {
         number: String,
         display_name: String,
     },
+    /// One canonical chunk of a station's logical button template.
+    ///
+    /// SCCP reserves 42 definition slots in every frame. `offset` and `total`
+    /// let larger physical layouts, including expansion modules, span frames.
     ButtonTemplate {
+        offset: u32,
+        total: u32,
         buttons: Vec<ButtonTemplateEntry>,
     },
     Version {

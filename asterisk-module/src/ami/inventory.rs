@@ -195,7 +195,17 @@ pub fn configured_inventory(
             });
         }
         for (index, button) in device.buttons.iter().enumerate() {
-            let mut configured = inventory_button(device_id, index + 1, button);
+            let mut configured = inventory_button(
+                device_id,
+                index + 1,
+                button,
+                match button {
+                    ButtonDefinition::BlfSpeedDial(speed_dial) => {
+                        device.blf_targets.get(&speed_dial.instance)
+                    }
+                    _ => None,
+                },
+            );
             if let ButtonDefinition::Feature(feature) = button
                 && device.feature_arguments.contains_key(&feature.instance)
             {
@@ -250,6 +260,7 @@ fn inventory_button(
     device_id: &DeviceId,
     position: usize,
     button: &ButtonDefinition,
+    blf_target: Option<&crate::config::HintTarget>,
 ) -> InventoryButton {
     let (kind, instance, label, target) = match button {
         ButtonDefinition::Line(line) => (
@@ -294,12 +305,7 @@ fn inventory_button(
         ),
         ButtonDefinition::Unused => (InventoryButtonKind::Unused, None, String::new(), None),
     };
-    let hint = match button {
-        ButtonDefinition::BlfSpeedDial(speed_dial) => {
-            Some(InventoryValue::Public(speed_dial.hint.clone()))
-        }
-        _ => None,
-    };
+    let hint = blf_target.map(|target| InventoryValue::Public(target.to_string()));
     InventoryButton {
         device_id: device_id.clone(),
         position,

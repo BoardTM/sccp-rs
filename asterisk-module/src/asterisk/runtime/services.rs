@@ -45,6 +45,7 @@ pub async fn run_events(
                 let _ = request.response.send(result);
             }
             _ = deadlines.tick() => {
+                retry_blf(&access, Instant::now());
                 let (actions, auto_answers) = controller_step(&access.shared.controller, |controller| {
                     let now = Instant::now();
                     let mut effects = controller.expire_digits(now);

@@ -36,9 +36,12 @@ pub enum LogLevel {
 /// Logical SCCP line state before conversion to Asterisk's device-state enum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceState {
-    Unknown,
     NotInUse,
     InUse,
+    Busy,
+    Removed,
     Unavailable,
     Ringing,
+    RingInUse,
+    OnHold,
 }

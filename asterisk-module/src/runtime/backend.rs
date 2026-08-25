@@ -1066,13 +1066,14 @@ mod tests {
     };
     use crate::call::transfer::{TransferCompletionKind, TransferId, TransferLeg};
     use crate::call::voicemail::{VoicemailAction, VoicemailTarget, VoicemailTransactionId};
+    use crate::config::HintTarget;
     use crate::config::LineConfig;
     use crate::media::recording::{
         RecordingCallback, RecordingDirection, RecordingEvent, RecordingProvider,
         RecordingSessionControl, RecordingState,
     };
-    use crate::presence::blf::HintCallback;
-    use crate::presence::hints::{ExtensionState, Hint, HintUpdate, HintUpdateReason};
+    use crate::presence::blf::{HintCallback, HintSnapshot};
+    use crate::presence::hints::{ExtensionState, HintUpdateReason};
     use crate::runtime::controller::Controller;
     use crate::state::persistence::PersistenceError;
     use sccp_protocol::{DeviceRegistration, DeviceType, ProtocolVersion, StationTransport};
@@ -1196,31 +1197,30 @@ mod tests {
         type Subscription = FakeHintSubscription;
         type Error = FakeError;
 
-        fn lookup(&self, context: &str, extension: &str) -> Result<Option<Hint>, Self::Error> {
+        fn lookup(&self, target: &HintTarget) -> Result<Option<HintSnapshot>, Self::Error> {
             self.harness.record(
                 "hints:lookup",
-                ServiceRequest::HintLookup(context.into(), extension.into()),
+                ServiceRequest::HintLookup(target.context().into(), target.extension().into()),
             )?;
-            Ok(Some(Hint {
-                devices: "PJSIP/1001".into(),
-                name: "Desk".into(),
+            Ok(Some(HintSnapshot {
+                target: target.clone(),
                 state: ExtensionState::IDLE,
+                reason: HintUpdateReason::Device,
+                caller: None,
             }))
         }
 
         fn subscribe(
             &self,
-            context: &str,
-            extension: &str,
+            target: &HintTarget,
             callback: HintCallback,
         ) -> Result<Self::Subscription, Self::Error> {
             self.harness.record(
                 "hints:subscribe",
-                ServiceRequest::HintSubscribe(context.into(), extension.into()),
+                ServiceRequest::HintSubscribe(target.context().into(), target.extension().into()),
             )?;
-            callback(HintUpdate {
-                context: context.into(),
-                extension: extension.into(),
+            callback(HintSnapshot {
+                target: target.clone(),
                 state: ExtensionState::RINGING,
                 reason: HintUpdateReason::Device,
                 caller: None,
@@ -2981,6 +2981,7 @@ mod tests {
     fn direct_capabilities_preserve_typed_requests_callbacks_and_sessions() {
         let harness = ServiceHarness::default();
         let backend = backend_with_services(harness.clone());
+        let hint_target = HintTarget::parse("1001@internal").unwrap();
 
         assert_eq!(
             backend.persistence().get("driver", "device/dnd").unwrap(),
@@ -2996,11 +2997,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            backend.hints().lookup("internal", "1001").unwrap(),
-            Some(Hint {
-                devices: "PJSIP/1001".into(),
-                name: "Desk".into(),
+            backend.hints().lookup(&hint_target).unwrap(),
+            Some(HintSnapshot {
+                target: hint_target.clone(),
                 state: ExtensionState::IDLE,
+                reason: HintUpdateReason::Device,
+                caller: None,
             })
         );
         let hint_updates = Arc::new(Mutex::new(Vec::new()));
@@ -3008,14 +3010,13 @@ mod tests {
         let _subscription = backend
             .hints()
             .subscribe(
-                "internal",
-                "1001",
+                &hint_target,
                 Arc::new(move |update| callback_updates.lock().unwrap().push(update)),
             )
             .unwrap();
         assert!(matches!(
             hint_updates.lock().unwrap().as_slice(),
-            [HintUpdate {
+            [HintSnapshot {
                 state: ExtensionState::RINGING,
                 ..
             }]
@@ -3066,6 +3067,7 @@ mod tests {
     fn every_direct_capability_propagates_its_backend_error() {
         let harness = ServiceHarness::default();
         let backend = backend_with_services(harness.clone());
+        let hint_target = HintTarget::parse("1001@internal").unwrap();
 
         harness.fail("persistence:get");
         assert!(matches!(
@@ -3087,14 +3089,14 @@ mod tests {
 
         harness.fail("hints:lookup");
         assert_eq!(
-            backend.hints().lookup("internal", "1001").unwrap_err(),
+            backend.hints().lookup(&hint_target).unwrap_err(),
             FakeError("hints:lookup")
         );
         harness.fail("hints:subscribe");
         assert_eq!(
             backend
                 .hints()
-                .subscribe("internal", "1001", Arc::new(|_| {}))
+                .subscribe(&hint_target, Arc::new(|_| {}))
                 .err(),
             Some(FakeError("hints:subscribe"))
         );
@@ -3137,6 +3139,7 @@ mod tests {
             ..ServiceHarness::default()
         };
         let backend = backend_with_services(harness);
+        let hint_target = HintTarget::parse("1001@internal").unwrap();
         let effects = {
             controller.lock().unwrap().begin_phone_call(
                 CallId(7),
@@ -3148,13 +3151,12 @@ mod tests {
         assert!(!effects.is_empty());
 
         backend.persistence().get("driver", "key").unwrap();
-        backend.hints().lookup("internal", "1001").unwrap();
+        backend.hints().lookup(&hint_target).unwrap();
         let hint_controller = Arc::clone(&controller);
         backend
             .hints()
             .subscribe(
-                "internal",
-                "1001",
+                &hint_target,
                 Arc::new(move |_| {
                     assert!(
                         hint_controller.try_lock().is_ok(),

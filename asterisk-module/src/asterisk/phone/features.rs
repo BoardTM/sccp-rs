@@ -87,6 +87,7 @@ pub fn execute_dnd_mutation(
         }
     };
     publish_device_features(access, device_id, &current);
+    publish_device_lines(access, device_id);
     publish_feature_changes(access, device_id, &previous, &current);
     Ok(RuntimeDndMutationOutcome { previous, current })
 }

@@ -402,6 +402,8 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
             id::BUTTON_TEMPLATE,
             96,
             ServerMessage::ButtonTemplate {
+                offset: 0,
+                total: 2,
                 buttons: vec![
                     ButtonTemplateEntry {
                         instance: 1,

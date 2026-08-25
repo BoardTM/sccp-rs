@@ -3,14 +3,28 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sccp_protocol::{BlfCallerInfo, BlfSpeedDialDefinition, BlfState, DeviceId};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::presence::hints::{ExtensionState, Hint, HintUpdate, HintUpdateReason};
+use crate::config::HintTarget;
+use crate::presence::hints::{ExtensionState, HintCaller, HintUpdateReason};
 
-pub type HintCallback = Arc<dyn Fn(HintUpdate) + Send + Sync + 'static>;
+/// A technology-opaque semantic snapshot of one Asterisk extension hint.
+///
+/// The target remains an extension and context even when the dialplan hint is
+/// backed by PJSIP, SIP, SCCP, Custom device state, or an aggregate of them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HintSnapshot {
+    pub target: HintTarget,
+    pub state: ExtensionState,
+    pub reason: HintUpdateReason,
+    pub caller: Option<HintCaller>,
+}
+
+pub type HintCallback = Arc<dyn Fn(HintSnapshot) + Send + Sync + 'static>;
 
 /// Abstracts hint lookup/subscription so lifecycle and race handling can be
 /// verified without loading the native module.
@@ -18,11 +32,10 @@ pub trait HintProvider {
     type Subscription: Send + 'static;
     type Error: fmt::Display;
 
-    fn lookup(&self, context: &str, extension: &str) -> Result<Option<Hint>, Self::Error>;
+    fn lookup(&self, target: &HintTarget) -> Result<Option<HintSnapshot>, Self::Error>;
     fn subscribe(
         &self,
-        context: &str,
-        extension: &str,
+        target: &HintTarget,
         callback: HintCallback,
     ) -> Result<Self::Subscription, Self::Error>;
 }
@@ -38,10 +51,9 @@ struct BlfKey {
 pub struct BlfEvent {
     pub device_id: DeviceId,
     pub instance: u32,
-    pub number: String,
-    pub label: String,
     pub state: BlfState,
     pub caller: Option<BlfCallerInfo>,
+    terminal: bool,
     generation: u64,
 }
 
@@ -50,10 +62,16 @@ struct Entry<Subscription> {
     _subscription: Subscription,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetryState {
+    attempts: u8,
+    retry_at: Instant,
+}
+
 #[derive(Default)]
 struct InitialGate {
     initializing: bool,
-    pending: Option<HintUpdate>,
+    pending: Option<HintSnapshot>,
 }
 
 /// Owns all active monitored-button subscriptions.
@@ -61,6 +79,7 @@ pub struct BlfSubscriptions<Provider: HintProvider> {
     provider: Provider,
     events: mpsc::UnboundedSender<BlfEvent>,
     entries: HashMap<BlfKey, Entry<Provider::Subscription>>,
+    retries: HashMap<BlfKey, RetryState>,
     next_generation: u64,
 }
 
@@ -70,6 +89,7 @@ impl<Provider: HintProvider> BlfSubscriptions<Provider> {
             provider,
             events,
             entries: HashMap::new(),
+            retries: HashMap::new(),
             next_generation: 1,
         }
     }
@@ -80,8 +100,8 @@ impl<Provider: HintProvider> BlfSubscriptions<Provider> {
         &mut self,
         device_id: DeviceId,
         definition: &BlfSpeedDialDefinition,
+        target: &HintTarget,
     ) -> Result<(), BlfSubscriptionError> {
-        let (extension, context) = parse_hint(&definition.hint)?;
         let key = BlfKey {
             device_id,
             instance: definition.instance,
@@ -96,8 +116,6 @@ impl<Provider: HintProvider> BlfSubscriptions<Provider> {
         }));
         let events = self.events.clone();
         let callback_key = key.clone();
-        let number = definition.number.clone();
-        let label = definition.display_name.clone();
         let callback_gate = Arc::clone(&gate);
         let callback: HintCallback = Arc::new(move |update| {
             let mut gate = callback_gate
@@ -107,19 +125,16 @@ impl<Provider: HintProvider> BlfSubscriptions<Provider> {
                 gate.pending = Some(update);
                 return;
             }
-            let _ = events.send(normalize_event(
-                &callback_key,
-                generation,
-                &number,
-                &label,
-                update,
-            ));
+            let _ = events.send(normalize_event(&callback_key, generation, update));
         });
 
-        let subscription = self
-            .provider
-            .subscribe(context, extension, callback)
-            .map_err(|error| BlfSubscriptionError::Provider(error.to_string()))?;
+        let subscription = match self.provider.subscribe(target, callback) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                self.record_failure(key);
+                return Err(BlfSubscriptionError::Provider(error.to_string()));
+            }
+        };
         self.entries.insert(
             key.clone(),
             Entry {
@@ -128,32 +143,70 @@ impl<Provider: HintProvider> BlfSubscriptions<Provider> {
             },
         );
 
-        let snapshot = match self.provider.lookup(context, extension) {
-            Ok(Some(hint)) => HintUpdate {
-                context: context.to_owned(),
-                extension: extension.to_owned(),
-                state: hint.state,
-                reason: HintUpdateReason::Device,
-                caller: None,
-            },
-            Ok(None) => unknown_update(context, extension),
+        let snapshot = match self.provider.lookup(target) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => unknown_snapshot(target),
             Err(error) => {
                 self.entries.remove(&key);
+                self.record_failure(key);
                 return Err(BlfSubscriptionError::Provider(error.to_string()));
             }
         };
 
         let mut gate = gate.lock().expect("BLF initialization lock poisoned");
         let initial = gate.pending.take().unwrap_or(snapshot);
-        let _ = self.events.send(normalize_event(
-            &key,
-            generation,
-            &definition.number,
-            &definition.display_name,
-            initial,
-        ));
+        let _ = self.events.send(normalize_event(&key, generation, initial));
         gate.initializing = false;
+        self.retries.remove(&key);
         Ok(())
+    }
+
+    /// Returns whether a missing subscription is due for another attempt.
+    pub fn retry_due(&self, device_id: &DeviceId, instance: u32, now: Instant) -> bool {
+        let key = BlfKey {
+            device_id: device_id.clone(),
+            instance,
+        };
+        !self.entries.contains_key(&key)
+            && self
+                .retries
+                .get(&key)
+                .is_some_and(|retry| retry.retry_at <= now)
+    }
+
+    /// Retires a watcher after Asterisk removed/deactivated its hint and
+    /// schedules a generation-safe resubscription.
+    pub fn retry_terminal(&mut self, event: &BlfEvent) {
+        let key = BlfKey {
+            device_id: event.device_id.clone(),
+            instance: event.instance,
+        };
+        if !event.terminal
+            || !self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.generation == event.generation)
+        {
+            return;
+        }
+        self.entries.remove(&key);
+        self.record_failure(key);
+    }
+
+    fn record_failure(&mut self, key: BlfKey) {
+        let attempts = self
+            .retries
+            .get(&key)
+            .map_or(1, |retry| retry.attempts.saturating_add(1));
+        let exponent = u32::from(attempts.saturating_sub(1).min(5));
+        let seconds = 1u64.checked_shl(exponent).unwrap_or(32).min(60);
+        self.retries.insert(
+            key,
+            RetryState {
+                attempts,
+                retry_at: Instant::now() + Duration::from_secs(seconds),
+            },
+        );
     }
 
     /// Returns whether an event belongs to the currently installed generation.
@@ -169,11 +222,13 @@ impl<Provider: HintProvider> BlfSubscriptions<Provider> {
     /// Unsubscribes every monitored button owned by one device.
     pub fn remove_device(&mut self, device_id: &DeviceId) {
         self.entries.retain(|key, _| &key.device_id != device_id);
+        self.retries.retain(|key, _| &key.device_id != device_id);
     }
 
     /// Unsubscribes every monitored button, including during reload/unload.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.retries.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -187,9 +242,6 @@ impl<Provider: HintProvider> BlfSubscriptions<Provider> {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum BlfSubscriptionError {
-    #[error("invalid BLF hint {0:?}; expected extension@context")]
-    InvalidHint(String),
-
     #[error("hint service failed: {0}")]
     Provider(String),
 }
@@ -212,36 +264,20 @@ pub fn map_extension_state(state: ExtensionState) -> BlfState {
     }
 }
 
-fn parse_hint(value: &str) -> Result<(&str, &str), BlfSubscriptionError> {
-    let Some((extension, context)) = value.split_once('@') else {
-        return Err(BlfSubscriptionError::InvalidHint(value.to_owned()));
-    };
-    if extension.is_empty() || context.is_empty() || context.contains('@') {
-        return Err(BlfSubscriptionError::InvalidHint(value.to_owned()));
-    }
-    Ok((extension, context))
-}
-
-fn unknown_update(context: &str, extension: &str) -> HintUpdate {
-    HintUpdate {
-        context: context.to_owned(),
-        extension: extension.to_owned(),
+fn unknown_snapshot(target: &HintTarget) -> HintSnapshot {
+    HintSnapshot {
+        target: target.clone(),
         state: ExtensionState::DEACTIVATED,
         reason: HintUpdateReason::Device,
         caller: None,
     }
 }
 
-fn normalize_event(
-    key: &BlfKey,
-    generation: u64,
-    number: &str,
-    label: &str,
-    update: HintUpdate,
-) -> BlfEvent {
-    let state = map_extension_state(update.state);
+fn normalize_event(key: &BlfKey, generation: u64, snapshot: HintSnapshot) -> BlfEvent {
+    let state = map_extension_state(snapshot.state);
+    let terminal = snapshot.state.raw() < 0;
     let caller = matches!(state, BlfState::Ringing | BlfState::Busy | BlfState::Held)
-        .then(|| update.caller)
+        .then(|| snapshot.caller)
         .flatten()
         .filter(|caller| caller.presentation_allowed())
         .map(|caller| BlfCallerInfo {
@@ -251,10 +287,9 @@ fn normalize_event(
     BlfEvent {
         device_id: key.device_id.clone(),
         instance: key.instance,
-        number: number.to_owned(),
-        label: label.to_owned(),
         state,
         caller,
+        terminal,
         generation,
     }
 }
@@ -275,8 +310,9 @@ mod tests {
 
     struct FakeState {
         snapshot: ExtensionState,
-        update_during_lookup: Option<HintUpdate>,
+        update_during_lookup: Option<HintSnapshot>,
         callback: Option<HintCallback>,
+        targets: Vec<HintTarget>,
     }
 
     struct FakeSubscription(Arc<AtomicUsize>);
@@ -291,9 +327,10 @@ mod tests {
         type Subscription = FakeSubscription;
         type Error = &'static str;
 
-        fn lookup(&self, _context: &str, _extension: &str) -> Result<Option<Hint>, Self::Error> {
+        fn lookup(&self, target: &HintTarget) -> Result<Option<HintSnapshot>, Self::Error> {
             let (callback, update, snapshot) = {
                 let mut state = self.state.lock().unwrap();
+                state.targets.push(target.clone());
                 (
                     state.callback.clone(),
                     state.update_during_lookup.take(),
@@ -303,28 +340,33 @@ mod tests {
             if let (Some(callback), Some(update)) = (callback, update) {
                 callback(update);
             }
-            Ok(Some(Hint {
-                devices: "PJSIP/4000".into(),
-                name: "Desk".into(),
+            Ok(Some(HintSnapshot {
+                target: target.clone(),
                 state: snapshot,
+                reason: HintUpdateReason::Device,
+                caller: None,
             }))
         }
 
         fn subscribe(
             &self,
-            _context: &str,
-            _extension: &str,
+            target: &HintTarget,
             callback: HintCallback,
         ) -> Result<Self::Subscription, Self::Error> {
-            self.state.lock().unwrap().callback = Some(callback);
+            let mut state = self.state.lock().unwrap();
+            state.targets.push(target.clone());
+            state.callback = Some(callback);
             Ok(FakeSubscription(Arc::clone(&self.drops)))
         }
     }
 
-    fn update(state: ExtensionState) -> HintUpdate {
-        HintUpdate {
-            context: "internal".into(),
-            extension: "4000".into(),
+    fn target() -> HintTarget {
+        HintTarget::parse("4000@internal").unwrap()
+    }
+
+    fn update(state: ExtensionState) -> HintSnapshot {
+        HintSnapshot {
+            target: target(),
             state,
             reason: HintUpdateReason::Device,
             caller: None,
@@ -333,7 +375,7 @@ mod tests {
 
     fn setup(
         snapshot: ExtensionState,
-        during_lookup: Option<HintUpdate>,
+        during_lookup: Option<HintSnapshot>,
     ) -> (
         BlfSubscriptions<FakeHints>,
         mpsc::UnboundedReceiver<BlfEvent>,
@@ -344,6 +386,7 @@ mod tests {
             snapshot,
             update_during_lookup: during_lookup,
             callback: None,
+            targets: Vec::new(),
         }));
         let drops = Arc::new(AtomicUsize::new(0));
         let provider = FakeHints {
@@ -359,7 +402,6 @@ mod tests {
             instance: 2,
             number: "4000".into(),
             display_name: "Desk".into(),
-            hint: "4000@internal".into(),
         }
     }
 
@@ -390,7 +432,11 @@ mod tests {
         let (mut subscriptions, mut events, _, _) =
             setup(ExtensionState::IDLE, Some(update(ExtensionState::ON_HOLD)));
         subscriptions
-            .subscribe(DeviceId::new("SEP001122334455").unwrap(), &definition())
+            .subscribe(
+                DeviceId::new("SEP001122334455").unwrap(),
+                &definition(),
+                &target(),
+            )
             .unwrap();
 
         let event = events.try_recv().unwrap();
@@ -404,12 +450,12 @@ mod tests {
         let (mut subscriptions, mut events, _, drops) = setup(ExtensionState::IDLE, None);
         let device = DeviceId::new("SEP001122334455").unwrap();
         subscriptions
-            .subscribe(device.clone(), &definition())
+            .subscribe(device.clone(), &definition(), &target())
             .unwrap();
         let old = events.try_recv().unwrap();
 
         subscriptions
-            .subscribe(device.clone(), &definition())
+            .subscribe(device.clone(), &definition(), &target())
             .unwrap();
         let current = events.try_recv().unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -426,12 +472,20 @@ mod tests {
     fn clear_unsubscribes_every_device_for_reload_or_unload() {
         let (mut subscriptions, mut events, _, drops) = setup(ExtensionState::IDLE, None);
         subscriptions
-            .subscribe(DeviceId::new("SEP001122334455").unwrap(), &definition())
+            .subscribe(
+                DeviceId::new("SEP001122334455").unwrap(),
+                &definition(),
+                &target(),
+            )
             .unwrap();
         let mut second = definition();
         second.instance = 3;
         subscriptions
-            .subscribe(DeviceId::new("SEP00AABBCCDDEE").unwrap(), &second)
+            .subscribe(
+                DeviceId::new("SEP00AABBCCDDEE").unwrap(),
+                &second,
+                &target(),
+            )
             .unwrap();
         let first_event = events.try_recv().unwrap();
         let second_event = events.try_recv().unwrap();
@@ -445,6 +499,66 @@ mod tests {
     }
 
     #[test]
+    fn terminal_hint_update_retires_generation_and_schedules_retry() {
+        let (mut subscriptions, mut events, state, drops) = setup(ExtensionState::IDLE, None);
+        let device = DeviceId::new("SEP001122334455").unwrap();
+        subscriptions
+            .subscribe(device.clone(), &definition(), &target())
+            .unwrap();
+        let initial = events.try_recv().unwrap();
+        assert!(subscriptions.is_current(&initial));
+
+        state.lock().unwrap().callback.as_ref().unwrap()(update(ExtensionState::REMOVED));
+        let removed = events.try_recv().unwrap();
+        assert_eq!(removed.state, BlfState::Unknown);
+        subscriptions.retry_terminal(&removed);
+
+        assert!(!subscriptions.is_current(&removed));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(!subscriptions.retry_due(&device, definition().instance, Instant::now()));
+        assert!(subscriptions.retry_due(
+            &device,
+            definition().instance,
+            Instant::now() + Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn same_state_caller_only_update_is_delivered() {
+        let (mut subscriptions, mut events, state, _) = setup(ExtensionState::RINGING, None);
+        subscriptions
+            .subscribe(
+                DeviceId::new("SEP001122334455").unwrap(),
+                &definition(),
+                &target(),
+            )
+            .unwrap();
+        let initial = events.try_recv().unwrap();
+        assert_eq!(initial.state, BlfState::Ringing);
+        assert_eq!(initial.caller, None);
+
+        state.lock().unwrap().callback.as_ref().unwrap()(HintSnapshot {
+            target: target(),
+            state: ExtensionState::RINGING,
+            reason: HintUpdateReason::Device,
+            caller: Some(HintCaller {
+                name: Some("Taylor".into()),
+                number: Some("5550100".into()),
+                name_presentation: 0,
+                number_presentation: 0,
+            }),
+        });
+
+        assert_eq!(
+            events.try_recv().unwrap().caller,
+            Some(BlfCallerInfo {
+                name: "Taylor".into(),
+                number: "5550100".into(),
+            })
+        );
+    }
+
+    #[test]
     fn restricted_caller_information_is_removed_before_delivery() {
         let key = BlfKey {
             device_id: DeviceId::new("SEP001122334455").unwrap(),
@@ -453,9 +567,7 @@ mod tests {
         let allowed = normalize_event(
             &key,
             1,
-            "4000",
-            "Desk",
-            HintUpdate {
+            HintSnapshot {
                 caller: Some(HintCaller {
                     name: Some("Taylor".into()),
                     number: Some("5550100".into()),
@@ -476,9 +588,7 @@ mod tests {
         let restricted = normalize_event(
             &key,
             1,
-            "4000",
-            "Desk",
-            HintUpdate {
+            HintSnapshot {
                 caller: Some(HintCaller {
                     name: Some("Taylor".into()),
                     number: Some("5550100".into()),

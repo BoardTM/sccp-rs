@@ -5023,14 +5023,6 @@ impl ServerMessage {
                     });
                 }
                 let total = usize_from_wire(frame.message_id, "button definitions", value.total)?;
-                if total > 42 {
-                    return Err(CodecError::CountTooLarge {
-                        message_id: frame.message_id,
-                        field: "button definitions",
-                        count: total,
-                        maximum: 42,
-                    });
-                }
                 let offset = usize_from_wire(frame.message_id, "button offset", value.offset)?;
                 let count = usize_from_wire(frame.message_id, "button definitions", value.count)?;
                 if offset.checked_add(count).is_none_or(|end| end > total) {
@@ -5040,19 +5032,18 @@ impl ServerMessage {
                         value: u64::from(value.offset) + u64::from(value.count),
                     });
                 }
-                let mut buttons = value.definitions[..count]
+                let buttons = value.definitions[..count]
                     .iter()
                     .map(|definition| ButtonTemplateEntry {
                         instance: u32::from(definition.instance),
                         button_type: ButtonType::from(u32::from(definition.button_type)),
                     })
                     .collect::<Vec<_>>();
-                while buttons.last().is_some_and(|button| {
-                    button.instance == 0 && button.button_type == ButtonType::Unused
-                }) {
-                    buttons.pop();
-                }
-                Ok(Self::ButtonTemplate { buttons })
+                Ok(Self::ButtonTemplate {
+                    offset: value.offset,
+                    total: value.total,
+                    buttons,
+                })
             }
             id::VERSION => {
                 let value: WireFixedText<16> = decode(frame.message_id, p)?;
@@ -5999,13 +5990,29 @@ impl ServerMessage {
                     id::LINE_STAT
                 }
             }
-            Self::ButtonTemplate { buttons } => {
+            Self::ButtonTemplate {
+                offset,
+                total,
+                buttons,
+            } => {
                 if buttons.len() > 42 {
                     return Err(CodecError::CountTooLarge {
                         message_id: id::BUTTON_TEMPLATE,
                         field: "button definitions",
                         count: buttons.len(),
                         maximum: 42,
+                    });
+                }
+                let count = u32::try_from(buttons.len()).map_err(|_| CodecError::InvalidValue {
+                    message_id: id::BUTTON_TEMPLATE,
+                    field: "button definitions in message",
+                    value: buttons.len() as u64,
+                })?;
+                if offset.checked_add(count).is_none_or(|end| end > *total) {
+                    return Err(CodecError::InvalidValue {
+                        message_id: id::BUTTON_TEMPLATE,
+                        field: "button template range",
+                        value: u64::from(*offset) + u64::from(count),
                     });
                 }
                 let mut definitions = [WireButtonDefinition::default(); 42];
@@ -6030,9 +6037,9 @@ impl ServerMessage {
                 p = encode(
                     id::BUTTON_TEMPLATE,
                     &WireButtonTemplate {
-                        offset: 0,
-                        count: 42,
-                        total: 42,
+                        offset: *offset,
+                        count,
+                        total: *total,
                         definitions,
                     },
                 )?;
@@ -11056,6 +11063,8 @@ mod tests {
     #[test]
     fn line_only_button_template_preserves_the_fixed_wire_layout() {
         let message = ServerMessage::ButtonTemplate {
+            offset: 0,
+            total: 1,
             buttons: vec![ButtonTemplateEntry {
                 instance: 1,
                 button_type: ButtonType::Line,
@@ -11066,8 +11075,8 @@ mod tests {
         let payload: WireButtonTemplate = decode(frame.message_id, &frame.payload).unwrap();
 
         assert_eq!(payload.offset, 0);
-        assert_eq!(payload.count, 42);
-        assert_eq!(payload.total, 42);
+        assert_eq!(payload.count, 1);
+        assert_eq!(payload.total, 1);
         assert_eq!(
             payload.definitions[0],
             WireButtonDefinition {
@@ -11089,6 +11098,8 @@ mod tests {
     #[test]
     fn mixed_button_template_round_trips_ordered_semantic_entries() {
         let message = ServerMessage::ButtonTemplate {
+            offset: 42,
+            total: 48,
             buttons: vec![
                 ButtonTemplateEntry {
                     instance: 1,
@@ -11128,6 +11139,8 @@ mod tests {
     #[test]
     fn button_template_rejects_unrepresentable_entries_and_counts() {
         let too_many = ServerMessage::ButtonTemplate {
+            offset: 0,
+            total: 43,
             buttons: vec![
                 ButtonTemplateEntry {
                     instance: 1,
@@ -11142,6 +11155,8 @@ mod tests {
         ));
 
         let large_instance = ServerMessage::ButtonTemplate {
+            offset: 0,
+            total: 1,
             buttons: vec![ButtonTemplateEntry {
                 instance: 256,
                 button_type: ButtonType::Line,
