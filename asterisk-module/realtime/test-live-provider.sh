@@ -4,6 +4,7 @@ set -eu
 backend=${1:-}
 module_path=${2:-}
 realtime_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$realtime_dir/../test-support/asterisk-sandbox.sh"
 asterisk_bin=${ASTERISK_BIN:-/opt/asterisk-live/sbin/asterisk}
 asterisk_module_dir=${ASTERISK_MODULE_DIR:-/opt/asterisk-live/lib/asterisk/modules}
 asterisk_data_dir=${ASTERISK_DATA_DIR:-/opt/asterisk-live/var/lib/asterisk}
@@ -21,45 +22,28 @@ if [ -z "$module_path" ] || [ ! -f "$module_path" ]; then
 	exit 2
 fi
 
-test_root=$(mktemp -d "/tmp/chan-sccp2-realtime-${backend}.XXXXXX")
-asterisk_pid=
-asterisk_log="$test_root/asterisk.log"
-cli_log="$test_root/cli.log"
+test_root=
+asterisk_log=
+cli_log=
 
 finish() {
 	status=$1
 	trap - EXIT HUP INT TERM
-	if [ -n "$asterisk_pid" ] && kill -0 "$asterisk_pid" 2>/dev/null; then
-		kill "$asterisk_pid" 2>/dev/null || true
-		wait "$asterisk_pid" 2>/dev/null || true
-	fi
+	sccp_sandbox_stop
 	if [ "$status" -ne 0 ]; then
-		printf '\nAsterisk CLI transcript:\n' >&2
-		[ ! -f "$cli_log" ] || cat "$cli_log" >&2
-		printf '\nAsterisk log:\n' >&2
-		[ ! -f "$asterisk_log" ] || cat "$asterisk_log" >&2
+		sccp_sandbox_diagnostics "$cli_log" "$asterisk_log"
 	fi
-	rm -rf "$test_root"
+	sccp_sandbox_cleanup
 	exit "$status"
 }
 trap 'finish $?' EXIT
 trap 'exit 130' HUP INT TERM
 
-mkdir -p \
-	"$test_root/etc" \
-	"$test_root/modules" \
-	"$test_root/var/db" \
-	"$test_root/var/key" \
-	"$test_root/var/lib" \
-	"$test_root/var/log" \
-	"$test_root/var/run" \
-	"$test_root/var/spool"
-
-for installed_module in "$asterisk_module_dir"/*.so; do
-	[ ! -f "$installed_module" ] || \
-		ln -s "$installed_module" "$test_root/modules/$(basename "$installed_module")"
-done
-cp "$module_path" "$test_root/modules/chan_sccp2.so"
+sccp_sandbox_create "chan-sccp2-realtime-${backend}" "$module_path" \
+	"$asterisk_module_dir" "$asterisk_data_dir"
+test_root=$SCCP_SANDBOX_ROOT
+asterisk_log="$test_root/asterisk.log"
+cli_log="$test_root/cli.log"
 
 database_exec() {
 	case "$backend" in
@@ -125,25 +109,6 @@ if [ ! -f "$test_root/modules/$realtime_module" ]; then
 	exit 2
 fi
 
-cat >"$test_root/etc/asterisk.conf" <<EOF
-[directories]
-astetcdir => $test_root/etc
-astmoddir => $test_root/modules
-astvarlibdir => $test_root/var/lib
-astdbdir => $test_root/var/db
-astkeydir => $test_root/var/key
-astdatadir => $asterisk_data_dir
-astspooldir => $test_root/var/spool
-astrundir => $test_root/var/run
-astlogdir => $test_root/var/log
-
-[options]
-verbose = 0
-debug = 0
-nocolor = yes
-documentation_language = en_US
-EOF
-
 cat >"$test_root/etc/modules.conf" <<EOF
 [modules]
 autoload = no
@@ -167,15 +132,12 @@ devicetable = sccp_devices
 linetable = sccp_lines
 EOF
 
-SCCP_CONFIG="$test_root/etc/sccp.conf" \
-	"$asterisk_bin" -C "$test_root/etc/asterisk.conf" -f -g -vvv \
-	>"$asterisk_log" 2>&1 &
-asterisk_pid=$!
+sccp_sandbox_start "$asterisk_bin" "$test_root/etc/sccp.conf" "$asterisk_log"
 
 cli() {
 	command=$1
 	printf '\n%s\n' "$command" >>"$cli_log"
-	if output=$("$asterisk_bin" -C "$test_root/etc/asterisk.conf" -rx "$command" 2>&1); then
+	if output=$(sccp_sandbox_cli "$asterisk_bin" "$command" 2>&1); then
 		status=0
 	else
 		status=$?
@@ -185,30 +147,13 @@ cli() {
 	return "$status"
 }
 
-ready=0
-attempt=0
-while [ "$attempt" -lt 100 ]; do
-	if ! kill -0 "$asterisk_pid" 2>/dev/null; then
-		if wait "$asterisk_pid"; then
-			asterisk_status=0
-		else
-			asterisk_status=$?
-		fi
-		asterisk_pid=
+if ! sccp_sandbox_wait_ready "$asterisk_bin"; then
+	if [ "$SCCP_SANDBOX_READY_FAILURE" = exited ]; then
 		printf 'Asterisk exited during startup (status %s)\n' \
-			"$asterisk_status" >&2
-		exit 1
+			"$SCCP_SANDBOX_EXIT_STATUS" >&2
+	else
+		printf 'Asterisk did not become ready within 10 seconds\n' >&2
 	fi
-	if "$asterisk_bin" -C "$test_root/etc/asterisk.conf" -rx 'core show uptime' \
-		>/dev/null 2>&1; then
-		ready=1
-		break
-	fi
-	attempt=$((attempt + 1))
-	sleep 0.1
-done
-if [ "$ready" -ne 1 ]; then
-	printf 'Asterisk did not become ready within 10 seconds\n' >&2
 	exit 1
 fi
 

@@ -2,6 +2,8 @@
 set -eu
 
 realtime_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+"$realtime_dir/check-migration-parity.sh"
+"$realtime_dir/test-migration-parity.sh"
 sqlite_database=$(mktemp "${TMPDIR:-/tmp}/sccp2-realtime.XXXXXX")
 postgres_container="sccp2-realtime-postgres-$$"
 mysql_container="sccp2-realtime-mysql-$$"

@@ -48,5 +48,7 @@ tokio-rustls.workspace = true
 bindgen = "0.72"
 
 [dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
 rcgen.workspace = true
+syn = { version = "2", features = ["full", "visit"] }
 tempfile.workspace = true

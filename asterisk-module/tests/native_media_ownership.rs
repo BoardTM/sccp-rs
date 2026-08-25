@@ -1,20 +1,9 @@
-use std::fs;
-use std::path::PathBuf;
+mod support;
+use support::{SourceContract, rust_item, rust_match_arm, source};
 
-fn source(relative: &str) -> String {
-    fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
-        .unwrap_or_else(|error| panic!("unable to read {relative}: {error}"))
-}
-
-fn function_body<'a>(source: &'a str, signature: &str, next_signature: &str) -> &'a str {
-    let start = source
-        .find(signature)
-        .unwrap_or_else(|| panic!("function signature {signature:?} must exist"));
-    let tail = &source[start..];
-    let end = tail
-        .find(next_signature)
-        .unwrap_or_else(|| panic!("following signature {next_signature:?} must exist"));
-    &tail[..end]
+fn function_body(source: &str, signature: &str, next_signature: &str) -> SourceContract {
+    let _ = next_signature;
+    rust_item(source, signature)
 }
 
 #[test]
@@ -22,7 +11,7 @@ fn provisional_recording_start_is_stopped_until_session_ownership_commits() {
     let recording = source("src/asterisk/native/recording.rs");
     let guard = function_body(
         &recording,
-        "struct ProvisionalMixMonitor",
+        "impl Drop for ProvisionalMixMonitor",
         "fn direction_parameters(",
     );
     assert!(guard.contains("impl Drop for ProvisionalMixMonitor"));
@@ -119,10 +108,11 @@ fn deferred_anchor_completion_is_registry_owned_and_shutdown_drained() {
     );
     assert!(run_events.contains("let mut recording_sessions = RuntimeRecordings::default()"));
 
+    let recording_backend = source("src/asterisk/runtime/backend/recording.rs");
     let session = function_body(
-        &backend,
-        "pub(super) struct AnchoredRecordingSession",
-        "pub(super) struct PendingRecordingAnchor",
+        &recording_backend,
+        "pub(in super::super) struct AnchoredRecordingSession",
+        "pub(in super::super) struct PendingRecordingAnchor",
     );
     assert!(session.find("inner: RecordingSession").unwrap() < session.find("anchor:").unwrap());
 }
@@ -267,7 +257,7 @@ fn video_rtp_has_independent_transactional_ownership_and_glue() {
     let video = source("src/asterisk/native/channel/video.rs");
     let driver = source("src/asterisk/direct/channel_driver.rs");
     let runtime = source("src/asterisk/runtime/channel.rs");
-    let calls = source("src/asterisk/phone/calls.rs");
+    let calls = source("src/asterisk/phone/calls/media_events.rs");
     let formats = source("src/media/formats/video.rs");
 
     assert!(allocation.contains("audio: OwnedAudioRtp"));
@@ -285,10 +275,14 @@ fn video_rtp_has_independent_transactional_ownership_and_glue() {
         "pub unsafe fn private_rtp(",
     );
     for fd in 0..=3 {
-        assert!(teardown.contains(&format!("ast_channel_set_fd(channel.as_ptr(), {fd}, -1)")));
+        assert!(teardown.contains(format!("ast_channel_set_fd(channel.as_ptr(), {fd}, -1)")));
     }
 
-    let prepare = &video[video.find("pub(super) unsafe fn prepare_video(").unwrap()..];
+    let prepare = function_body(
+        &video,
+        "pub(super) unsafe fn prepare_video(",
+        "pub unsafe fn disable_video(",
+    );
     let candidate = prepare.find("OwnedRtpInstance::create").unwrap();
     let configure = prepare.find("configure_format(").unwrap();
     let install = prepare.find("OwnedVideoRtp").unwrap();
@@ -319,7 +313,11 @@ fn video_rtp_has_independent_transactional_ownership_and_glue() {
     assert!(remote.contains("with_locked_video_rtp(channel"));
     assert!(!remote.contains("private_rtp(private).as_ptr()"));
 
-    let local = &video[video.find("pub unsafe fn local_video_endpoint(").unwrap()..];
+    let local = function_body(
+        &video,
+        "pub unsafe fn local_video_endpoint(",
+        "pub unsafe fn disable_video(",
+    );
     assert!(local.contains("with_locked_video_rtp(channel"));
     assert!(!local.contains("private_rtp(private).as_ptr()"));
 
@@ -368,7 +366,7 @@ fn video_rtp_has_independent_transactional_ownership_and_glue() {
     assert!(driver.contains("sys::AST_CONTROL_VIDUPDATE"));
     assert!(calls.contains("ChannelControl::VideoUpdate"));
     assert!(calls.contains("MultimediaTransmitStarted"));
-    let backend = source("src/asterisk/runtime/backend.rs");
+    let backend = source("src/asterisk/runtime/backend/handset.rs");
     assert!(backend.contains("MultimediaTransmitControl::FastPictureUpdate"));
 
     let disable = function_body(
@@ -407,20 +405,23 @@ fn video_rtp_has_independent_transactional_ownership_and_glue() {
     let video_only = update.find("else if !video.is_null()").unwrap();
     let anchor = update.find("MediaPeerUpdate::Anchor").unwrap();
     assert!(audio < video_only && video_only < anchor);
-    assert!(update[video_only..anchor].contains("Ok(())"));
+    assert!(update.contains_between(
+        "else if !video.is_null()",
+        "MediaPeerUpdate::Anchor",
+        "Ok(())"
+    ));
 
     assert!(runtime.contains("video: selected_video.ready().map"));
     assert!(runtime.contains("VideoFallbackReason::DescriptorUnavailable"));
     assert!(runtime.contains("VideoFallbackReason::NativeRtpUnavailable"));
     assert!(runtime.contains("VideoFallbackReason::LocalEndpointUnavailable"));
-    assert!(runtime.contains("unable to apply configured video socket QoS"));
-    assert!(runtime.contains("unable to allocate optional video RTP"));
+    assert!(runtime.contains_literal("unable to apply configured video socket QoS"));
+    assert!(runtime.contains_literal("unable to allocate optional video RTP"));
     assert!(runtime.contains("local_video_endpoint(access, pbx_id)"));
 
-    let receive = function_body(
+    let receive = rust_match_arm(
         &calls,
         "PhoneDeviceEventKind::MultimediaReceiveChannelOpened",
-        "PhoneDeviceEventKind::TransmitChannelImplied",
     );
     assert!(receive.contains("normalize_phone_video_endpoint"));
     assert!(receive.contains("set_remote_video_endpoint"));
@@ -562,7 +563,7 @@ fn audio_qos_marks_both_owned_media_sockets_without_disrupting_lifecycle() {
         .find("allocation.channel.as_ptr()")
         .unwrap();
     assert!(report < publish);
-    assert!(allocate_runtime.contains("unable to apply configured audio socket QoS"));
+    assert!(allocate_runtime.contains_literal("unable to apply configured audio socket QoS"));
 
     let retarget = function_body(
         &media,
@@ -584,7 +585,7 @@ fn audio_qos_marks_both_owned_media_sockets_without_disrupting_lifecycle() {
 
 #[test]
 fn cli_device_controls_are_bounded_and_share_exact_raii_registration() {
-    let driver = source("src/asterisk/direct/channel_driver.rs");
+    let driver = source("src/asterisk/direct/cli.rs");
     let handles = source("src/asterisk/direct/handles.rs");
     let exports = source("src/asterisk/exports.rs");
 
@@ -641,10 +642,16 @@ fn cli_device_controls_are_bounded_and_share_exact_raii_registration() {
         "impl RegisteredCli",
         "/// Owns every native registration",
     );
+    let registration_drop = function_body(
+        &handles,
+        "impl Drop for RegisteredCli",
+        "/// Owns every native registration",
+    );
     assert!(registration.contains("unsafe fn register<const N: usize>"));
     assert!(registration.contains("c_int::try_from(N)"));
     assert!(
-        registration.contains("ast_cli_unregister_multiple(self.entries.as_ptr(), self.count)")
+        registration_drop
+            .contains("ast_cli_unregister_multiple(self.entries.as_ptr(), self.count)")
     );
 }
 

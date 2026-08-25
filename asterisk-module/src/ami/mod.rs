@@ -33,6 +33,7 @@
 //! and unregister/unload invalidates new work and waits for in-flight callbacks.
 
 pub mod cli;
+mod cli_support;
 pub mod controls;
 pub mod diagnostics;
 pub mod events;

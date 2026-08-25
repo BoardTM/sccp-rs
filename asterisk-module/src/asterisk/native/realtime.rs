@@ -6,7 +6,7 @@
 //! adapter boundary.
 
 use std::ffi::{CStr, CString, c_char, c_int};
-use std::ptr;
+use std::ptr::{self, NonNull};
 
 use crate::asterisk::sys;
 use crate::config::realtime::{
@@ -14,26 +14,44 @@ use crate::config::realtime::{
     decode_snapshot_rows, validate_query,
 };
 
+use super::ownership::AstConfigOwner;
+
 const SOURCE_FILE: &CStr = c"asterisk/native/realtime.rs";
 const SOURCE_FUNCTION: &CStr = c"sccp_realtime";
 const EMPTY: &CStr = c"";
 
-struct AstVariables(*mut sys::ast_variable);
+type VariablesDestroy = unsafe fn(*mut sys::ast_variable);
 
-impl Drop for AstVariables {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { sys::ast_variables_destroy(self.0) };
+unsafe fn destroy_variables(variables: *mut sys::ast_variable) {
+    unsafe { sys::ast_variables_destroy(variables) };
+}
+
+struct AstVariables {
+    pointer: Option<NonNull<sys::ast_variable>>,
+    destroy: VariablesDestroy,
+}
+
+impl AstVariables {
+    fn empty() -> Self {
+        Self {
+            pointer: None,
+            destroy: destroy_variables,
         }
+    }
+
+    #[cfg(test)]
+    fn with_destroy(
+        pointer: Option<NonNull<sys::ast_variable>>,
+        destroy: VariablesDestroy,
+    ) -> Self {
+        Self { pointer, destroy }
     }
 }
 
-struct AstConfig(*mut sys::ast_config);
-
-impl Drop for AstConfig {
+impl Drop for AstVariables {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { sys::ast_config_destroy(self.0) };
+        if let Some(variables) = self.pointer {
+            unsafe { (self.destroy)(variables.as_ptr()) };
         }
     }
 }
@@ -97,7 +115,7 @@ unsafe fn copy_row(
 unsafe fn build_predicates(
     predicates: &[RealtimePredicate],
 ) -> Result<AstVariables, RealtimeError> {
-    let mut variables = AstVariables(ptr::null_mut());
+    let mut variables = AstVariables::empty();
     let mut tail = ptr::null_mut::<sys::ast_variable>();
     for (index, predicate) in predicates.iter().enumerate() {
         let name = owned_c_string(format!("predicate[{index}].name"), &predicate.name)?;
@@ -116,7 +134,7 @@ unsafe fn build_predicates(
             return Err(RealtimeError::BackendFailure);
         }
         if tail.is_null() {
-            variables.0 = variable;
+            variables.pointer = NonNull::new(variable);
         } else {
             unsafe { (*tail).next = variable };
         }
@@ -129,17 +147,18 @@ unsafe fn load_multiple(
     family: &CStr,
     filters: *const sys::ast_variable,
 ) -> Result<RealtimeLoad, RealtimeError> {
-    let config =
-        AstConfig(unsafe { sys::ast_load_realtime_multientry_fields(family.as_ptr(), filters) });
-    if config.0.is_null() {
+    let Some(config) =
+        NonNull::new(unsafe { sys::ast_load_realtime_multientry_fields(family.as_ptr(), filters) })
+    else {
         return Ok(RealtimeLoad::default());
-    }
+    };
+    let config = AstConfigOwner::new(config);
 
     let mut rows = Vec::new();
     let mut category = ptr::null_mut::<sys::ast_category>();
     loop {
         category = unsafe {
-            sys::ast_category_browse_filtered(config.0, ptr::null(), category, ptr::null())
+            sys::ast_category_browse_filtered(config.as_ptr(), ptr::null(), category, ptr::null())
         };
         if category.is_null() {
             break;
@@ -161,12 +180,29 @@ pub fn load_realtime(
     if unsafe { sys::ast_check_realtime(family.as_ptr()) } == 0 {
         return Err(RealtimeError::BackendUnavailable);
     }
-    unsafe { load_multiple(&family, filters.0) }
+    unsafe {
+        load_multiple(
+            &family,
+            filters
+                .pointer
+                .map_or(ptr::null(), |variables| variables.as_ptr()),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    static VARIABLE_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+    static VARIABLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    unsafe fn count_variable_destroy(_: *mut sys::ast_variable) {
+        VARIABLE_DESTROYS.fetch_add(1, Ordering::SeqCst);
+    }
 
     #[test]
     fn native_values_preserve_null_empty_and_asterisk_empty_sentinel() {
@@ -199,5 +235,25 @@ mod tests {
         }
         .unwrap_err();
         assert!(matches!(error, RealtimeError::InvalidNativeText { .. }));
+    }
+
+    #[test]
+    fn empty_realtime_variable_owner_destroys_nothing() {
+        let _guard = VARIABLE_TEST_LOCK.lock().unwrap();
+        VARIABLE_DESTROYS.store(0, Ordering::SeqCst);
+        drop(AstVariables::with_destroy(None, count_variable_destroy));
+        assert_eq!(VARIABLE_DESTROYS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nonempty_realtime_variable_owner_destroys_once() {
+        let _guard = VARIABLE_TEST_LOCK.lock().unwrap();
+        VARIABLE_DESTROYS.store(0, Ordering::SeqCst);
+        let variables = NonNull::<sys::ast_variable>::dangling();
+        drop(AstVariables::with_destroy(
+            Some(variables),
+            count_variable_destroy,
+        ));
+        assert_eq!(VARIABLE_DESTROYS.load(Ordering::SeqCst), 1);
     }
 }

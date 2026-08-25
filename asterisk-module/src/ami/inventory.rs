@@ -14,14 +14,13 @@
 //! row is an inventory field.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use sccp_protocol::{AppearanceRingMode, ButtonDefinition, DeviceId};
 use thiserror::Error;
 
 use crate::ami::manager::{
-    ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege, ManagerRequest,
-    ManagerResponse, RequestFields, RequestFieldsError,
+    ActionDefinition, ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege,
+    ManagerRequest, ManagerResponse, RequestFields, register_action_group,
 };
 use crate::config::ModuleConfig;
 
@@ -402,26 +401,39 @@ impl InventoryAction {
     }
 }
 
+impl<P: InventoryProvider> ActionDefinition<P> for InventoryAction {
+    fn name(self) -> &'static str {
+        self.name()
+    }
+
+    fn synopsis(self) -> &'static str {
+        self.synopsis()
+    }
+
+    fn description(self) -> &'static str {
+        self.description()
+    }
+
+    fn privileges(self) -> ManagerPrivilege {
+        INVENTORY_PRIVILEGES
+    }
+
+    fn limits(self) -> ManagerLimits {
+        INVENTORY_LIMITS
+    }
+
+    fn handle(self, provider: &P, request: ManagerRequest) -> ManagerResponse {
+        handle_inventory_request(provider, request)
+    }
+}
+
 /// Register all inventory actions as one RAII-owned lifecycle group. A failure
 /// drops every action already registered by this call.
 pub fn register_inventory_actions<P: InventoryProvider, M: ManagerBackend>(
     provider: P,
     manager: M,
 ) -> Result<Vec<M::Registration>, ManagerError> {
-    let provider = Arc::new(provider);
-    let mut registrations = Vec::with_capacity(InventoryAction::ALL.len());
-    for action in InventoryAction::ALL {
-        let provider = Arc::clone(&provider);
-        registrations.push(manager.register_action(
-            action.name(),
-            INVENTORY_PRIVILEGES,
-            action.synopsis(),
-            action.description(),
-            INVENTORY_LIMITS,
-            move |request| handle_inventory_request(provider.as_ref(), request),
-        )?);
-    }
-    Ok(registrations)
+    register_action_group(provider, manager, &InventoryAction::ALL)
 }
 
 pub fn handle_inventory_request<P: InventoryProvider + ?Sized>(
@@ -460,6 +472,8 @@ enum InventoryActionError {
     #[error(transparent)]
     Provider(#[from] InventoryProviderError),
 }
+
+crate::ami::manager::impl_request_fields_error!(InventoryActionError);
 
 impl InventoryActionError {
     const fn response_message(self) -> &'static str {
@@ -627,12 +641,7 @@ fn parse_selectors(
 ) -> Result<BTreeMap<String, String>, InventoryActionError> {
     RequestFields::new(request)
         .collect(allowed, &[])
-        .map_err(|error| match error {
-            RequestFieldsError::Sensitive => InventoryActionError::SensitiveField,
-            RequestFieldsError::Duplicate => InventoryActionError::DuplicateField,
-            RequestFieldsError::Unknown => InventoryActionError::UnknownField,
-            RequestFieldsError::ActionMismatch => InventoryActionError::UnknownAction,
-        })
+        .map_err(Into::into)
 }
 
 fn selector<'a>(
@@ -1358,5 +1367,11 @@ mod tests {
             register_inventory_actions(provider(), crate::ami::manager::UnavailableManager),
             Err(ManagerError::Unavailable)
         ));
+        let manager = crate::ami::manager::RollbackManager::fail_on(2);
+        assert!(matches!(
+            register_inventory_actions(provider(), manager.clone()),
+            Err(ManagerError::RegistrationFailed)
+        ));
+        manager.assert_partial_rollback(3, 2);
     }
 }

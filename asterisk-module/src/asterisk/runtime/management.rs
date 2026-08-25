@@ -1,5 +1,44 @@
-use super::super::*;
+use super::{
+    ActiveConferenceAnnouncement, AmiEventPublisher, AppearanceRingMode, AppearanceRingSummary,
+    Arc, AsteriskChannel, AsteriskDatabase, AsteriskHints, AsteriskManager, AsteriskPartyUpdates,
+    AsteriskRegistrationExtensions, AsyncMutex, AtomicU64, BTreeMap, BTreeSet, BargeBridgeSession,
+    BlfSubscriptions, BridgeSession, CallDirection, CallId, CallState, CallStatus,
+    CalledPartyOverride, CalledPartyProvider, CalledPartyProviderError, ChannelAppearanceSnapshot,
+    ChannelDirectionSummary, ChannelMediaStateSummary, ChannelQueryLookupError,
+    ChannelQueryProvider, ChannelQuerySnapshot, ChannelQueryTarget, ChannelStateSummary, Codec,
+    CodecPreferenceContext, CodecPreferenceProvider, CodecPreferenceProviderError,
+    CodecPreferenceRejection, ConferenceId, ConferenceParticipantStatus, ConferenceStatus,
+    ConferenceTaskRegistry, ConfigurationProvider, ConnectedLineSource, ConnectedLineUpdate,
+    ControlOperation, ControlOutcome, ControlProvider, ControlProviderError, Controller,
+    DeviceCallSummary, DeviceDndSummary, DeviceFeatureState, DeviceFeatureSummary, DeviceId,
+    DeviceQueryLookupError, DeviceQueryProvider, DeviceQuerySnapshot, DeviceQueryTarget,
+    DeviceState, DialplanRegistration, DirectMediaCall, DirectoryProvider, DirectoryProviderError,
+    DirectoryRecord, DndMode, DriverEffect, ExternalAddressCache, FeatureControlMutation,
+    FeatureControlOutcome, FeatureControlProvider, FeatureControlProviderError, FeatureStore,
+    FeatureStoreError, ForwardingDestination, ForwardingEntryRegistry, ForwardingKind,
+    ForwardingOperation, Handle, HandsetEffect, HandsetMessageOperation, HandsetMessageProvider,
+    HandsetMessageProviderError, HashMap, HashSet, HttpRegistration, Instant, InventoryProvider,
+    InventoryProviderError, InventoryRegistration, InventorySnapshot, InventoryValue, JoinHandle,
+    LineAppearanceSnapshot, LineCallSummary, LineQueryLookupError, LineQueryProvider,
+    LineQuerySnapshot, LineQueryTarget, MANAGER_CONTROL_TIMEOUT, ManagerActionRegistration,
+    MediaAnchorRegistry, MediaAnchorRestores, MediaDirection, MediaKind, MediaStatisticsStatus,
+    MediaStreamState, MediaStreamStatus, MobilityRegistry, MobilitySlot, ModuleConfig, Mutex,
+    MutexExt as _, NameCharset, NoAnswerTimerRegistry, NonNull, NumberPlan, ParkingRegistry,
+    ParkingSubscription, PartyIdentity, PartySnapshot, PbxAudioFormat, PbxBridgeId, PbxCallId,
+    PhoneCommand, PhoneCommandAction, Presentation, RegisteredDeviceSummary,
+    RegistrationContextRegistry, RegistrationRegistryError, Runtime, RuntimeDndMutation,
+    RuntimeDndMutationError, RuntimeStatusProvider, RuntimeStatusProviderError,
+    RuntimeStatusSnapshot, RwLock, RwLockExt as _, ServerHandle, ServiceControlProvider,
+    ServiceOperation, ServiceOutcome, ServiceProviderError, SharedNoAnswerRoute,
+    StationMediaCapabilities, SystemHostResolver, TransactionId, Weak, configured_inventory,
+    configured_registration_appearances, controller_step, execute_dnd_mutation,
+    forwarding_ui_line_instances, mpsc, native_audio_format, native_bridging, native_channel,
+    negotiate_audio, pbx_audio_format, publish_device_features, publish_feature_changes, raw,
+    records_from_config, runtime_line_binding, state_from_channel, sys,
+    update_device_features_locked,
+};
 use crate::ami::runtime::MediaStatisticsPrivacy;
+use crate::asterisk::raw::handles::ChannelRef;
 use crate::asterisk::raw::presence::NativeMwiSubscription;
 use crate::media::encryption::AudioEncryptionAdmissions;
 use crate::runtime::controller::{VideoMediaState, VideoStreamState};
@@ -167,6 +206,12 @@ impl RuntimeRegistrationContexts {
             .filter(|device| !self.suppressed_devices.contains(*device));
         self.registry
             .reconcile(configured_registration_appearances(config, published))
+    }
+}
+
+impl Default for RuntimeRegistrationContexts {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1407,6 +1452,16 @@ pub struct PendingParkingNotification {
 #[cfg(test)]
 mod media_statistics_privacy_tests {
     use super::*;
+
+    #[test]
+    fn registration_context_default_is_empty_and_reconciles_empty_registration_set() {
+        let config = ModuleConfig::parse(include_str!("../../../sccp.conf.example")).unwrap();
+        let mut contexts = RuntimeRegistrationContexts::default();
+        assert!(contexts.suppressed_devices.is_empty());
+        assert_eq!(contexts.registry.active_target_count(), 0);
+        contexts.reconcile(&config, &[]).unwrap();
+        assert_eq!(contexts.registry.active_target_count(), 0);
+    }
 
     fn binding(device_id: &DeviceId) -> LineBinding {
         LineBinding {

@@ -194,11 +194,14 @@ impl fmt::Debug for ForwardingEntry {
             .field("kind", &self.kind)
             .field("phase", &self.phase)
             .field("deadline", &self.deadline)
+            .field("dial_terminator", &self.dial_terminator)
+            .field("first_digit_timeout", &self.first_digit_timeout)
+            .field("interdigit_timeout", &self.interdigit_timeout)
             .field(
                 "digits",
                 &format_args!("<redacted:{} bytes>", self.digits.len()),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -760,6 +763,33 @@ mod tests {
             ForwardingDestination::new("12\n34"),
             Err(ForwardingRejection::InvalidDestination)
         );
+    }
+
+    #[test]
+    fn forwarding_entry_debug_exposes_safe_timing_but_not_digits() {
+        let now = Instant::now();
+        let device_id = device(1);
+        let mut entries = ForwardingEntryRegistry::default();
+        let entry = entries
+            .begin(
+                device_id.clone(),
+                1,
+                CallId(9),
+                ForwardingKind::All,
+                Digit::Pound,
+                entry_timing(now),
+            )
+            .unwrap();
+        entries
+            .replace_digits(&device_id, entry.id, "5551212", now)
+            .unwrap();
+        let debug = format!("{:?}", entries.get(&device_id).unwrap());
+        assert!(debug.contains("dial_terminator"));
+        assert!(debug.contains("first_digit_timeout"));
+        assert!(debug.contains("interdigit_timeout"));
+        assert!(debug.contains("<redacted:7 bytes>"));
+        assert!(debug.ends_with(".. }"));
+        assert!(!debug.contains("5551212"));
     }
 
     #[test]

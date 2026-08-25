@@ -1,31 +1,58 @@
 //! Group/directed pickup policy and retained pickup-channel ownership.
 
-use std::ffi::{CStr, CString, c_char, c_int};
-use std::ptr;
+use std::ffi::{CStr, CString, c_int};
+use std::ptr::{self, NonNull};
 
 use super::lock_channel;
+use crate::asterisk::boundary::nullable_lossy_c_text;
 use crate::asterisk::raw::handles::{ChannelLock, ChannelRef};
 use crate::asterisk::sys;
 use crate::pbx::operations::{CallFeatureError, PickupChannelControl};
 use crate::pbx::party::AsteriskChannel;
 use crate::runtime::backend::PickupOutcome;
 
-fn owned_text(value: *const c_char) -> String {
-    if value.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(value) }
-            .to_string_lossy()
-            .into_owned()
+type NamedGroupsUnref = unsafe fn(*mut sys::ast_namedgroups);
+
+unsafe fn unref_named_groups(groups: *mut sys::ast_namedgroups) {
+    unsafe { sys::ast_unref_namedgroups(groups) };
+}
+
+struct NamedGroups {
+    pointer: Option<NonNull<sys::ast_namedgroups>>,
+    unref: NamedGroupsUnref,
+}
+
+impl NamedGroups {
+    const fn none() -> Self {
+        Self {
+            pointer: None,
+            unref: unref_named_groups,
+        }
+    }
+
+    unsafe fn parse(value: &CStr) -> Self {
+        Self::from_raw(
+            unsafe { sys::ast_get_namedgroups(value.as_ptr()) },
+            unref_named_groups,
+        )
+    }
+
+    fn from_raw(pointer: *mut sys::ast_namedgroups, unref: NamedGroupsUnref) -> Self {
+        Self {
+            pointer: NonNull::new(pointer),
+            unref,
+        }
+    }
+
+    fn as_ptr(&self) -> *mut sys::ast_namedgroups {
+        self.pointer.map_or(std::ptr::null_mut(), NonNull::as_ptr)
     }
 }
 
-struct NamedGroups(*mut sys::ast_namedgroups);
-
 impl Drop for NamedGroups {
     fn drop(&mut self) {
-        unsafe {
-            sys::ast_unref_namedgroups(self.0);
+        if let Some(groups) = self.pointer {
+            unsafe { (self.unref)(groups.as_ptr()) };
         }
     }
 }
@@ -45,12 +72,12 @@ unsafe fn configure_pickup_policy(
         });
     }
     let (named_call, named_pickup) = if private_call {
-        (NamedGroups(ptr::null_mut()), NamedGroups(ptr::null_mut()))
+        (NamedGroups::none(), NamedGroups::none())
     } else {
-        let call = NamedGroups(unsafe { sys::ast_get_namedgroups(named_call_groups.as_ptr()) });
-        let pickup = NamedGroups(unsafe { sys::ast_get_namedgroups(named_pickup_groups.as_ptr()) });
-        if (!named_call_groups.to_bytes().is_empty() && call.0.is_null())
-            || (!named_pickup_groups.to_bytes().is_empty() && pickup.0.is_null())
+        let call = unsafe { NamedGroups::parse(named_call_groups) };
+        let pickup = unsafe { NamedGroups::parse(named_pickup_groups) };
+        if (!named_call_groups.to_bytes().is_empty() && call.pointer.is_none())
+            || (!named_pickup_groups.to_bytes().is_empty() && pickup.pointer.is_none())
         {
             return Err(CallFeatureError::NativeFailure {
                 operation: OPERATION,
@@ -83,8 +110,8 @@ unsafe fn configure_pickup_policy(
             channel.as_ptr().cast(),
             if private_call { 0 } else { pickup_groups },
         );
-        sys::ast_channel_named_callgroups_set(channel.as_ptr().cast(), named_call.0);
-        sys::ast_channel_named_pickupgroups_set(channel.as_ptr().cast(), named_pickup.0);
+        sys::ast_channel_named_callgroups_set(channel.as_ptr().cast(), named_call.as_ptr());
+        sys::ast_channel_named_pickupgroups_set(channel.as_ptr().cast(), named_pickup.as_ptr());
     }
     Ok(())
 }
@@ -116,7 +143,7 @@ unsafe fn pickup_identity(identity: *const sys::ast_party_id) -> (String, String
         && (identity.name.presentation & sys::AST_PRES_RESTRICTION as c_int)
             == sys::AST_PRES_ALLOWED as c_int
     {
-        owned_text(identity.name.str_)
+        unsafe { nullable_lossy_c_text(identity.name.str_) }
     } else {
         String::new()
     };
@@ -124,7 +151,7 @@ unsafe fn pickup_identity(identity: *const sys::ast_party_id) -> (String, String
         && (identity.number.presentation & sys::AST_PRES_RESTRICTION as c_int)
             == sys::AST_PRES_ALLOWED as c_int
     {
-        owned_text(identity.number.str_)
+        unsafe { nullable_lossy_c_text(identity.number.str_) }
     } else {
         String::new()
     };
@@ -380,5 +407,50 @@ pub fn configure_pickup(
             &named_pickup_groups,
             private_call,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static UNREFS: AtomicUsize = AtomicUsize::new(0);
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    unsafe fn count_unref(_: *mut sys::ast_namedgroups) {
+        UNREFS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn private_pickup_has_no_named_group_ownership() {
+        let groups = NamedGroups::none();
+        assert!(groups.pointer.is_none());
+        assert!(groups.as_ptr().is_null());
+        drop(groups);
+    }
+
+    #[test]
+    fn parse_failure_has_no_owner_and_never_unrefs() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        UNREFS.store(0, Ordering::SeqCst);
+        let groups = NamedGroups::from_raw(ptr::null_mut(), count_unref);
+        assert!(groups.pointer.is_none());
+        drop(groups);
+        assert_eq!(UNREFS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn owned_named_groups_unref_exactly_once() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        UNREFS.store(0, Ordering::SeqCst);
+        let groups = NamedGroups::from_raw(
+            NonNull::<sys::ast_namedgroups>::dangling().as_ptr(),
+            count_unref,
+        );
+        drop(groups);
+        assert_eq!(UNREFS.load(Ordering::SeqCst), 1);
     }
 }

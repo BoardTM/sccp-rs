@@ -1,9 +1,60 @@
-use super::super::*;
 use super::media::admit_clear_audio_media;
 use super::media::{retarget_to_anchor, retarget_to_direct};
+use super::{
+    AbortHandle, Access, AmiEventError, AnnouncementAdapter, AnnouncementCall,
+    AnnouncementFailureStage, AnnouncementGeneration, Arc, AsteriskCallFeatures, AsteriskChannel,
+    AsteriskChannelMetadata, AsteriskDatabase, AsteriskHints, AsteriskPartyUpdates, BargeOperation,
+    BridgeOperation, CONFERENCE_ANNOUNCEMENT_PLAYBACK_WINDOW, CallFeatureError,
+    CallFeatureProvider, CallId, CallMetadata, CallTransition, CallTransitionProgress,
+    ChannelAllocationError, ChannelMetadataError, Codec, ConferenceAnnouncement,
+    ConferenceAnnouncementOperation, ConferenceId, ConferenceTaskCancellation,
+    ControlProviderError, DeviceId, DirectMediaCall, DriverEffect, Duration, EffectExecutionError,
+    HandsetEffect, HashSet, Instant, LogLevel, MAX_RESTORE_ATTEMPTS, MediaAnchorReason,
+    MediaEndpoint, MutexExt, NonNull, PARKING_NOTIFICATION_TIME, ParkingOperation,
+    PartyUpdateError, PbxBackendError, PbxBridgeId, PbxCallId, PbxEffect, PbxServiceCapabilities,
+    PendingParkingNotification, PhoneCallState, PhoneCommand, PhoneCommandAction, PickupOperation,
+    RecordingError, RedirectReasonCode, RedirectingUpdate, RemoteHangupPlan,
+    RuntimeCallSignalDeliveryError, RuntimeCallSignalDeliveryResult, Shared, Weak,
+    allocate_announcement_generation, announcement_generation_is_current, ast_log, audio_framing,
+    c_string, cancel_no_answer_timer, configured_audio_processing, configured_audio_traffic_class,
+    configured_dtmf_mode, controller_step, direct_media_call, execute_backend_cleanup_effects,
+    handset_effect_call_id, local_media_endpoint, native_bridging, native_channel,
+    publish_ami_event, publish_line, redirected_call_update, remove_channel,
+    replacement_anchor_plan, restore_attempts_exhausted, restore_redirecting_update,
+    show_conference_list, start_announcement, take_pending_retrieval_by_pbx,
+    validate_native_channel_metadata, validate_redirecting_update, with_channel,
+};
+use super::{
+    AsteriskRecording, BridgeBackend, CString, CallDirection, CallInfo, CallServiceBackend,
+    ChannelAllocationOwner, ChannelBackend, ChannelBinding, ConferenceDestinationOperation,
+    ConferenceTaskStartError, ForwardingOperation, ForwardingRouteReason, IpAddr, IpAddressType,
+    Ipv4Addr, LineBinding, LineInstance, MANAGER_CONTROL_DELIVERY_TIMEOUT, ManagementBackend,
+    ManagementEvent, MediaBackend, MediaEndpointAddress, MultimediaReceiveDescriptor,
+    MultimediaTransmitControl, MultimediaTransmitDescriptor, NORMAL_CLEARING, PbxVideoFormat,
+    PickupOutcome, ProtocolVersion, RecordingCallback, RecordingDirection, RecordingProvider,
+    RecordingSession, RecordingSessionControl, RecordingState, SupplementaryBackend,
+    TransferCompletion, VoicemailOperation, allocate_channel, call_event,
+    configured_video_traffic_class, native_pickup_result, prepare_channel_allocation_text, ptr,
+    with_channels, with_two_channels,
+};
 use crate::media::encryption::LocalEncryptionCapabilities;
+use crate::runtime::backend::PbxBackend as _;
 use crate::runtime::controller::VideoPlan;
 use sccp_protocol::SessionGeneration;
+
+mod bridge_effects;
+mod call_service;
+mod channel;
+mod handset;
+mod management_effects;
+mod media_effects;
+mod recording;
+mod supplementary;
+pub use handset::{execute_handset_effect, send_handset_call_state};
+pub use recording::AsteriskRecordingService;
+pub(super) use recording::{
+    AnchoredRecordingSession, ConfirmedRecordingAnchor, PendingRecordingAnchor,
+};
 
 impl ConferenceTaskCancellation for native_bridging::ConferenceApplicationCancellation {
     fn cancel(self) {
@@ -218,25 +269,6 @@ pub struct AsteriskBackend<'a> {
     pub call_features: AsteriskCallFeatures,
 }
 
-pub struct AsteriskRecordingService<'a> {
-    pub access: &'a Access,
-}
-
-pub(super) struct AnchoredRecordingSession {
-    inner: RecordingSession,
-    anchor: ConfirmedRecordingAnchor,
-    stopped: bool,
-}
-
-pub(super) struct PendingRecordingAnchor {
-    lease: MediaAnchorLease,
-    retarget_call: Option<DirectMediaCall>,
-}
-
-pub(super) struct ConfirmedRecordingAnchor {
-    lease: MediaAnchorLease,
-}
-
 pub struct ActiveConferenceAnnouncement {
     generation: AnnouncementGeneration,
     call_ids: Vec<PbxCallId>,
@@ -252,7 +284,7 @@ impl AnnouncementCall for DirectMediaCall {
     }
 }
 
-struct MediaAnchorLease {
+pub(super) struct MediaAnchorLease {
     shared: Weak<Shared>,
     call_id: PbxCallId,
     reason: MediaAnchorReason,
@@ -334,245 +366,62 @@ impl Drop for MediaAnchorLease {
     }
 }
 
-impl PendingRecordingAnchor {
-    pub(super) fn acquire(
-        access: &Access,
-        call_id: PbxCallId,
-        mutation: &MediaAnchorMutation<'_>,
-    ) -> Result<Self, AsteriskRecordingServiceError> {
-        with_channel(access, call_id, |channel| {
-            let channel = NonNull::new(channel)
-                .ok_or(AsteriskRecordingServiceError::CallUnavailable(call_id))?;
-            let retarget_call = direct_media_call(access, channel.as_ptr());
-            if let Some(call) = &retarget_call {
-                access
-                    .shared
-                    .media_anchor_restores
-                    .lock_unpoisoned()
-                    .remember(call_id, call.clone());
-            }
-            Ok(Self {
-                lease: MediaAnchorLease::acquire(
-                    &access.shared,
-                    call_id,
-                    MediaAnchorReason::Recording,
-                    mutation,
-                ),
-                retarget_call,
-            })
-        })
-        .unwrap_or(Err(AsteriskRecordingServiceError::CallUnavailable(call_id)))
-    }
-
-    pub(super) fn direct_call(&self) -> Option<&DirectMediaCall> {
-        self.retarget_call.as_ref()
-    }
-
-    pub(super) fn confirm(self) -> ConfirmedRecordingAnchor {
-        ConfirmedRecordingAnchor { lease: self.lease }
-    }
-}
-
-impl ConfirmedRecordingAnchor {
-    pub(super) fn restore_call(&self) -> Option<DirectMediaCall> {
-        if !self.lease.is_last() {
-            return None;
-        }
-        self.lease
-            .shared
-            .upgrade()?
-            .media_anchor_restores
-            .lock_unpoisoned()
-            .get(self.lease.call_id)
-            .cloned()
-    }
-
-    pub(super) fn release(&mut self) {
-        self.lease.release();
-    }
-}
-
-impl AnchoredRecordingSession {
-    pub(super) fn new(inner: RecordingSession, anchor: ConfirmedRecordingAnchor) -> Self {
-        Self {
-            inner,
-            anchor,
-            stopped: false,
-        }
-    }
-
-    pub(super) fn release_anchor(&mut self) {
-        self.anchor.release();
-    }
-
-    pub(super) fn anchor_mut(&mut self) -> &mut ConfirmedRecordingAnchor {
-        &mut self.anchor
-    }
-
-    pub(super) fn stop_native(&mut self) -> Result<(), RecordingError> {
-        if self.stopped || matches!(self.inner.state(), Ok(RecordingState::Stopped)) {
-            self.stopped = true;
-            return Ok(());
-        }
-        self.inner.stop()?;
-        self.stopped = true;
-        Ok(())
-    }
-}
-
-impl RecordingSessionControl for AnchoredRecordingSession {
-    type Error = RecordingError;
-
-    fn id(&self) -> Result<String, Self::Error> {
-        self.inner.id()
-    }
-
-    fn state(&self) -> Result<RecordingState, Self::Error> {
-        self.inner.state()
-    }
-
-    fn stop(&mut self) -> Result<(), Self::Error> {
-        self.stop_native()
-    }
-
-    fn set_muted(
-        &mut self,
-        direction: RecordingDirection,
-        muted: bool,
-    ) -> Result<usize, Self::Error> {
-        self.inner.set_muted(direction, muted)
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AsteriskBackendError {
+    #[error("{operation} failed for PBX call {calls}")]
     Failed {
         operation: &'static str,
         calls: String,
     },
+    #[error("PBX call {} is unavailable for {operation}", call_id.0)]
     CallUnavailable {
         operation: &'static str,
         call_id: PbxCallId,
     },
+    #[error("PBX call {} metadata update failed: {source}", call_id.0)]
     ChannelMetadata {
         call_id: PbxCallId,
         source: ChannelMetadataError,
     },
+    #[error("PBX call {} channel allocation failed: {source}", call_id.0)]
+    ChannelAllocation {
+        call_id: PbxCallId,
+        #[source]
+        source: ChannelAllocationError,
+    },
+    #[error("PBX call {} redirecting update failed: {source}", call_id.0)]
     PartyUpdate {
         call_id: PbxCallId,
         source: PartyUpdateError,
     },
+    #[error("PBX call {} has invalid native text for {operation}: {source}", call_id.0)]
+    NativeText {
+        operation: &'static str,
+        call_id: PbxCallId,
+        source: crate::asterisk::boundary::NativeTextError,
+    },
+    #[error(
+        "PBX call {} redirect failed ({cause}) and rollback diverged at {restores}",
+        call_id.0,
+        restores = .failed_restores.join(", ")
+    )]
     RedirectRollback {
         call_id: PbxCallId,
+        #[source]
         cause: Box<AsteriskBackendError>,
         failed_restores: Vec<&'static str>,
     },
+    #[error("PBX bridge {} is unavailable for {operation}", bridge_id.0)]
     BridgeUnavailable {
         operation: &'static str,
         bridge_id: PbxBridgeId,
     },
-    BridgeConflict {
-        bridge_id: PbxBridgeId,
-    },
+    #[error("PBX bridge {} already exists", bridge_id.0)]
+    BridgeConflict { bridge_id: PbxBridgeId },
+    #[error(transparent)]
     Management(AmiEventError),
+    #[error(transparent)]
     CallFeature(CallFeatureError),
-}
-
-impl std::fmt::Display for AsteriskBackendError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Failed { operation, calls } => {
-                write!(formatter, "{operation} failed for PBX call {calls}")
-            }
-            Self::CallUnavailable { operation, call_id } => {
-                write!(
-                    formatter,
-                    "PBX call {} is unavailable for {operation}",
-                    call_id.0
-                )
-            }
-            Self::ChannelMetadata { call_id, source } => {
-                write!(
-                    formatter,
-                    "PBX call {} metadata update failed: {source}",
-                    call_id.0
-                )
-            }
-            Self::PartyUpdate { call_id, source } => {
-                write!(
-                    formatter,
-                    "PBX call {} redirecting update failed: {source}",
-                    call_id.0
-                )
-            }
-            Self::RedirectRollback {
-                call_id,
-                cause,
-                failed_restores,
-            } => write!(
-                formatter,
-                "PBX call {} redirect failed ({cause}) and rollback diverged at {}",
-                call_id.0,
-                failed_restores.join(", ")
-            ),
-            Self::BridgeUnavailable {
-                operation,
-                bridge_id,
-            } => write!(
-                formatter,
-                "PBX bridge {} is unavailable for {operation}",
-                bridge_id.0
-            ),
-            Self::BridgeConflict { bridge_id } => {
-                write!(formatter, "PBX bridge {} already exists", bridge_id.0)
-            }
-            Self::Management(error) => error.fmt(formatter),
-            Self::CallFeature(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for AsteriskBackendError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ChannelMetadata { source, .. } => Some(source),
-            Self::PartyUpdate { source, .. } => Some(source),
-            Self::RedirectRollback { cause, .. } => Some(cause.as_ref()),
-            Self::Management(error) => Some(error),
-            Self::CallFeature(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum AsteriskRecordingServiceError {
-    CallUnavailable(PbxCallId),
-    Recording(RecordingError),
-}
-
-impl std::fmt::Display for AsteriskRecordingServiceError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CallUnavailable(call_id) => {
-                write!(
-                    formatter,
-                    "PBX call {} is unavailable for recording",
-                    call_id.0
-                )
-            }
-            Self::Recording(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for AsteriskRecordingServiceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::CallUnavailable(_) => None,
-            Self::Recording(error) => Some(error),
-        }
-    }
 }
 
 impl AsteriskBackend<'_> {
@@ -690,8 +539,17 @@ impl AsteriskBackend<'_> {
             operation: "snapshot redirect metadata",
             call_id,
         })?;
-        let context = c_string(context);
-        let destination_c = c_string(destination);
+        let context = c_string(context).map_err(|source| AsteriskBackendError::NativeText {
+            operation: "redirect call context",
+            call_id,
+            source,
+        })?;
+        let destination_c =
+            c_string(destination).map_err(|source| AsteriskBackendError::NativeText {
+                operation: "redirect call destination",
+                call_id,
+                source,
+            })?;
         with_channel(self.access, call_id, |channel| {
             let channel = unsafe { AsteriskChannel::from_raw(channel.cast()) }.map_err(|_| {
                 AsteriskBackendError::CallUnavailable {
@@ -815,28 +673,6 @@ impl AsteriskBackend<'_> {
     }
 }
 
-impl RecordingProvider for AsteriskRecordingService<'_> {
-    type Session = RecordingSession;
-    type StartError = AsteriskRecordingServiceError;
-
-    fn start_recording(
-        &self,
-        call_id: PbxCallId,
-        filename: &str,
-        options: &str,
-        callback: RecordingCallback,
-    ) -> Result<Self::Session, Self::StartError> {
-        with_channel(self.access, call_id, |channel| {
-            let channel = unsafe { AsteriskChannel::from_raw(channel.cast()) }
-                .map_err(|_| AsteriskRecordingServiceError::CallUnavailable(call_id))?;
-            AsteriskRecording::new()
-                .start(&channel, filename, options, move |event| callback(event))
-                .map_err(AsteriskRecordingServiceError::Recording)
-        })
-        .unwrap_or(Err(AsteriskRecordingServiceError::CallUnavailable(call_id)))
-    }
-}
-
 impl<'a> PbxServiceCapabilities for AsteriskBackend<'a> {
     type Persistence = AsteriskDatabase;
     type Hints = AsteriskHints;
@@ -857,1397 +693,6 @@ impl<'a> PbxServiceCapabilities for AsteriskBackend<'a> {
 
 impl PbxBackendError for AsteriskBackend<'_> {
     type Error = AsteriskBackendError;
-}
-
-impl ChannelBackend for AsteriskBackend<'_> {
-    fn create_channel(
-        &self,
-        handset_call_id: CallId,
-        call_id: PbxCallId,
-        binding: &LineBinding,
-        codec: Codec,
-    ) -> Result<(), Self::Error> {
-        if allocate_channel(
-            self.access,
-            handset_call_id,
-            call_id,
-            binding,
-            codec,
-            &PbxVideoFormat::ALL,
-            ptr::null(),
-            ptr::null(),
-            None,
-            ChannelAllocationOwner::Module,
-        ) {
-            Ok(())
-        } else {
-            Err(AsteriskBackendError::Failed {
-                operation: "create channel",
-                calls: call_id.0.to_string(),
-            })
-        }
-    }
-
-    fn create_consultation_channel(
-        &self,
-        source_call_id: PbxCallId,
-        handset_call_id: CallId,
-        call_id: PbxCallId,
-        binding: &LineBinding,
-        codec: Codec,
-    ) -> Result<(), Self::Error> {
-        let created = with_channel(self.access, source_call_id, |source| {
-            allocate_channel(
-                self.access,
-                handset_call_id,
-                call_id,
-                binding,
-                codec,
-                &PbxVideoFormat::ALL,
-                ptr::null(),
-                source.cast_const(),
-                None,
-                ChannelAllocationOwner::Module,
-            )
-        })
-        .unwrap_or(false);
-        if created {
-            Ok(())
-        } else {
-            Err(AsteriskBackendError::Failed {
-                operation: "create consultation channel",
-                calls: format!("{} from {}", call_id.0, source_call_id.0),
-            })
-        }
-    }
-
-    fn start_routing(
-        &self,
-        call_id: PbxCallId,
-        context: &str,
-        destination: &str,
-    ) -> Result<(), Self::Error> {
-        let mut metadata = controller_step(&self.access.shared.controller, |controller| {
-            controller.call_metadata(call_id).cloned()
-        })
-        .ok_or(AsteriskBackendError::CallUnavailable {
-            operation: "set dialed number",
-            call_id,
-        })?;
-        metadata.dnid = Some(destination.to_owned());
-        metadata
-            .validate()
-            .map_err(|source| AsteriskBackendError::ChannelMetadata {
-                call_id,
-                source: source.into(),
-            })?;
-        with_channel(self.access, call_id, |channel| {
-            let channel = unsafe { AsteriskChannel::from_raw(channel.cast()) }.map_err(|_| {
-                AsteriskBackendError::CallUnavailable {
-                    operation: "set dialed number",
-                    call_id,
-                }
-            })?;
-            AsteriskChannelMetadata::new()
-                .apply(&channel, &metadata)
-                .map_err(|source| AsteriskBackendError::ChannelMetadata { call_id, source })
-        })
-        .unwrap_or(Err(AsteriskBackendError::CallUnavailable {
-            operation: "set dialed number",
-            call_id,
-        }))?;
-        if !matches!(
-            controller_step(&self.access.shared.controller, |controller| {
-                controller.set_call_metadata(call_id, metadata)
-            }),
-            Ok(true)
-        ) {
-            return Err(AsteriskBackendError::CallUnavailable {
-                operation: "commit dialed number",
-                call_id,
-            });
-        }
-        let context = c_string(context);
-        let destination = c_string(destination);
-        let result = with_channel(self.access, call_id, |channel| {
-            NonNull::new(channel).ok_or(()).and_then(|channel| unsafe {
-                native_channel::start_dialplan(channel, &context, &destination).map_err(|_| ())
-            })
-        });
-        Self::typed_operation_result("start routing", call_id, result)
-    }
-
-    fn answer(&self, call_id: PbxCallId) -> Result<(), Self::Error> {
-        let result = with_channel(self.access, call_id, |channel| {
-            NonNull::new(channel).ok_or(()).and_then(|channel| unsafe {
-                native_channel::queue_control(channel, native_channel::ChannelControl::Answer)
-                    .map_err(|_| ())
-            })
-        });
-        Self::typed_operation_result("answer", call_id, result)
-    }
-
-    fn hangup(&self, call_id: PbxCallId) -> Result<(), Self::Error> {
-        let result = with_channel(self.access, call_id, |channel| {
-            NonNull::new(channel).ok_or(()).and_then(|channel| unsafe {
-                native_channel::hangup(channel, NORMAL_CLEARING).map_err(|_| ())
-            })
-        });
-        Self::typed_operation_result("hangup", call_id, result)
-    }
-
-    fn send_digit(&self, call_id: PbxCallId, digit: char) -> Result<(), Self::Error> {
-        let result = with_channel(self.access, call_id, |channel| {
-            u8::try_from(digit).map_err(|_| ()).and_then(|digit| {
-                NonNull::new(channel).ok_or(()).and_then(|channel| unsafe {
-                    native_channel::queue_digit(channel, digit, 100).map_err(|_| ())
-                })
-            })
-        });
-        Self::typed_operation_result("send digit", call_id, result)
-    }
-
-    fn hold(&self, call_id: PbxCallId) -> Result<(), Self::Error> {
-        let result = with_channel(self.access, call_id, |channel| {
-            NonNull::new(channel).ok_or(()).and_then(|channel| unsafe {
-                native_channel::queue_control(channel, native_channel::ChannelControl::Hold)
-                    .map_err(|_| ())
-            })
-        });
-        Self::typed_operation_result("hold", call_id, result)
-    }
-
-    fn resume(&self, call_id: PbxCallId) -> Result<(), Self::Error> {
-        let result = with_channel(self.access, call_id, |channel| {
-            NonNull::new(channel).ok_or(()).and_then(|channel| unsafe {
-                native_channel::queue_control(channel, native_channel::ChannelControl::Unhold)
-                    .map_err(|_| ())
-            })
-        });
-        Self::typed_operation_result("resume", call_id, result)
-    }
-}
-
-impl SupplementaryBackend for AsteriskBackend<'_> {
-    fn forward(&self, operation: &ForwardingOperation) -> Result<(), Self::Error> {
-        let reason = match operation.reason {
-            ForwardingRouteReason::Unconditional => RedirectReasonCode::UNCONDITIONAL,
-            ForwardingRouteReason::Busy => RedirectReasonCode::USER_BUSY,
-            ForwardingRouteReason::NoAnswer => RedirectReasonCode::NO_ANSWER,
-        };
-        self.redirect_and_route(
-            operation.call_id,
-            operation.context.as_str(),
-            operation.destination.as_str(),
-            reason,
-        )
-    }
-
-    fn voicemail(&self, operation: &VoicemailOperation) -> Result<(), Self::Error> {
-        self.redirect_and_route(
-            operation.pbx_call_id,
-            operation.target.context(),
-            operation.target.destination(),
-            RedirectReasonCode::SEND_TO_VOICEMAIL,
-        )
-    }
-
-    fn start_conference_destination(
-        &self,
-        operation: &ConferenceDestinationOperation,
-    ) -> Result<(), Self::Error> {
-        let arguments = if operation.application_options.is_empty() {
-            operation.destination.clone()
-        } else {
-            format!(
-                "{},{}",
-                operation.destination, operation.application_options
-            )
-        };
-        let (application, cancellation) = self.with_call_feature_channel(
-            "start conference destination",
-            operation.call_id,
-            |channel| {
-                native_bridging::prepare_conference_destination(channel, &arguments)
-                    .map_err(AsteriskBackendError::CallFeature)
-            },
-        )?;
-        let runtime = self.access.handle.clone();
-        let blocking_runtime = runtime.clone();
-        let cleanup_runtime = runtime.clone();
-        let phone = self.access.phone.clone();
-        let shared = Arc::downgrade(&self.access.shared);
-        let call_id = operation.call_id;
-        let handset_call_id = operation.handset_call_id;
-        let held_calls = operation.held_calls.clone();
-        let mutation = operation.mutation;
-        self.access
-            .shared
-            .conference_destination_tasks
-            .lock_unpoisoned()
-            .start(&runtime, call_id, cancellation, move |token| async move {
-                let result = blocking_runtime
-                    .spawn_blocking(move || application.run())
-                    .await;
-                let failed = match result {
-                    Ok(Ok(())) => false,
-                    Ok(Err(error)) => {
-                        ast_log(
-                            LogLevel::Warning,
-                            &format!("conference destination ended with an error: {error}"),
-                        );
-                        true
-                    }
-                    Err(error) => {
-                        ast_log(
-                            LogLevel::Warning,
-                            &format!("conference destination task failed: {error}"),
-                        );
-                        true
-                    }
-                };
-                if let Some(shared) = shared.upgrade() {
-                    let completed = shared
-                        .conference_destination_tasks
-                        .lock_unpoisoned()
-                        .complete(token);
-                    if completed {
-                        if failed {
-                            let cleanup = controller_step(&shared.controller, |controller| {
-                                controller.conference_destination_failed(
-                                    mutation,
-                                    handset_call_id,
-                                    &held_calls,
-                                    &held_calls,
-                                )
-                            });
-                            let access = Access {
-                                handle: cleanup_runtime,
-                                phone,
-                                shared,
-                            };
-                            execute_cleanup_effects(&access, cleanup).await;
-                        } else {
-                            controller_step(&shared.controller, |controller| {
-                                controller.complete_conference_mutation(mutation)
-                            });
-                        }
-                    }
-                }
-            })
-            .map(|_| ())
-            .map_err(|error| match error {
-                ConferenceTaskStartError::AlreadyRunning => {
-                    AsteriskBackendError::CallFeature(CallFeatureError::Conflict {
-                        operation: "start conference destination",
-                    })
-                }
-                ConferenceTaskStartError::ShuttingDown => {
-                    AsteriskBackendError::CallFeature(CallFeatureError::Unavailable {
-                        operation: "start conference destination",
-                    })
-                }
-                ConferenceTaskStartError::GenerationExhausted => {
-                    AsteriskBackendError::CallFeature(CallFeatureError::NativeFailure {
-                        operation: "start conference destination",
-                    })
-                }
-            })
-    }
-}
-
-impl MediaBackend for AsteriskBackend<'_> {
-    fn audio_encryption_capabilities(&self) -> LocalEncryptionCapabilities {
-        // The adapter must not report a profile until it can install and own
-        // both directions of the protected stream.
-        LocalEncryptionCapabilities::default()
-    }
-
-    fn configure_media(
-        &self,
-        call_id: PbxCallId,
-        remote: MediaEndpoint,
-        codec: Codec,
-    ) -> Result<MediaEndpoint, Self::Error> {
-        let endpoint = std::net::SocketAddr::new(remote.address, remote.rtp_port);
-        let result = with_channel(self.access, call_id, |channel| {
-            NonNull::new(channel).ok_or(()).and_then(|channel| unsafe {
-                native_channel::set_remote_media(channel, endpoint).map_err(|_| ())
-            })
-        });
-        Self::typed_operation_result("set remote media", call_id, result)?;
-        local_media_endpoint(self.access, call_id, codec).ok_or_else(|| {
-            AsteriskBackendError::Failed {
-                operation: "get local media",
-                calls: call_id.0.to_string(),
-            }
-        })
-    }
-}
-
-impl BridgeBackend for AsteriskBackend<'_> {
-    fn transfer(&self, operation: &TransferCompletion) -> Result<(), Self::Error> {
-        let first = operation.source.pbx_call_id;
-        let second = operation.consultation.pbx_call_id;
-        let result = with_two_channels(self.access, first, second, |first, second| {
-            NonNull::new(first)
-                .zip(NonNull::new(second))
-                .ok_or(())
-                .and_then(|(first, second)| {
-                    match unsafe { native_channel::attended_transfer(first, second) } {
-                        native_channel::AttendedTransferResult::Success => Ok(()),
-                        _ => Err(()),
-                    }
-                })
-        });
-        if result == Some(Ok(())) {
-            Ok(())
-        } else {
-            Err(AsteriskBackendError::Failed {
-                operation: "bridge transfer",
-                calls: format!("{} and {}", first.0, second.0),
-            })
-        }
-    }
-
-    fn bridge(&self, operation: &BridgeOperation) -> Result<(), Self::Error> {
-        match operation {
-            BridgeOperation::Create { bridge_id } => {
-                let mut bridges = self.access.shared.bridges.lock_unpoisoned();
-                if bridges.contains_key(bridge_id) {
-                    return Err(AsteriskBackendError::BridgeConflict {
-                        bridge_id: *bridge_id,
-                    });
-                }
-                let bridge = self
-                    .call_features
-                    .create_bridge(*bridge_id)
-                    .map_err(AsteriskBackendError::CallFeature)?;
-                bridges.insert(*bridge_id, bridge);
-                Ok(())
-            }
-            BridgeOperation::Destroy { bridge_id } => {
-                let bridge = self
-                    .access
-                    .shared
-                    .bridges
-                    .lock_unpoisoned()
-                    .remove(bridge_id)
-                    .ok_or(AsteriskBackendError::BridgeUnavailable {
-                        operation: "destroy bridge",
-                        bridge_id: *bridge_id,
-                    })?;
-                bridge.destroy().map_err(AsteriskBackendError::CallFeature)
-            }
-            BridgeOperation::AddParticipant { bridge_id, call_id } => self
-                .with_call_feature_channel("add bridge participant", *call_id, |channel| {
-                    self.access
-                        .shared
-                        .bridges
-                        .lock_unpoisoned()
-                        .get_mut(bridge_id)
-                        .ok_or(AsteriskBackendError::BridgeUnavailable {
-                            operation: "add participant",
-                            bridge_id: *bridge_id,
-                        })?
-                        .add(channel)
-                        .map_err(AsteriskBackendError::CallFeature)
-                }),
-            BridgeOperation::RemoveParticipant { bridge_id, call_id } => self
-                .with_call_feature_channel("remove bridge participant", *call_id, |channel| {
-                    self.access
-                        .shared
-                        .bridges
-                        .lock_unpoisoned()
-                        .get_mut(bridge_id)
-                        .ok_or(AsteriskBackendError::BridgeUnavailable {
-                            operation: "remove participant",
-                            bridge_id: *bridge_id,
-                        })?
-                        .remove(channel)
-                        .map_err(AsteriskBackendError::CallFeature)
-                }),
-            BridgeOperation::MergeConsultation {
-                bridge_id,
-                original_call_id,
-                consultation_call_id,
-            } => {
-                let mut bridge = self
-                    .access
-                    .shared
-                    .bridges
-                    .lock_unpoisoned()
-                    .remove(bridge_id)
-                    .ok_or(AsteriskBackendError::BridgeUnavailable {
-                        operation: "merge conference consultation",
-                        bridge_id: *bridge_id,
-                    })?;
-                let result = with_two_channels(
-                    self.access,
-                    *original_call_id,
-                    *consultation_call_id,
-                    |original, consultation| {
-                        let original = unsafe { AsteriskChannel::from_raw(original.cast()) }
-                            .map_err(|_| AsteriskBackendError::CallUnavailable {
-                                operation: "merge conference consultation",
-                                call_id: *original_call_id,
-                            })?;
-                        let consultation =
-                            unsafe { AsteriskChannel::from_raw(consultation.cast()) }.map_err(
-                                |_| AsteriskBackendError::CallUnavailable {
-                                    operation: "merge conference consultation",
-                                    call_id: *consultation_call_id,
-                                },
-                            )?;
-                        bridge
-                            .merge_consultation(&original, &consultation)
-                            .map_err(AsteriskBackendError::CallFeature)
-                    },
-                )
-                .unwrap_or(Err(AsteriskBackendError::CallUnavailable {
-                    operation: "merge conference consultation",
-                    call_id: *consultation_call_id,
-                }));
-                self.access
-                    .shared
-                    .bridges
-                    .lock_unpoisoned()
-                    .insert(*bridge_id, bridge);
-                result
-            }
-            BridgeOperation::MergeCalls {
-                bridge_id,
-                call_ids,
-            } => {
-                let mut bridge = self
-                    .access
-                    .shared
-                    .bridges
-                    .lock_unpoisoned()
-                    .remove(bridge_id)
-                    .ok_or(AsteriskBackendError::BridgeUnavailable {
-                        operation: "merge selected conference calls",
-                        bridge_id: *bridge_id,
-                    })?;
-                let result = with_channels(self.access, call_ids, |channels| {
-                    let channels: Result<Vec<_>, _> = channels
-                        .iter()
-                        .zip(call_ids)
-                        .map(|(channel, call_id)| unsafe {
-                            AsteriskChannel::from_raw(channel.cast()).map_err(|_| {
-                                AsteriskBackendError::CallUnavailable {
-                                    operation: "merge selected conference calls",
-                                    call_id: *call_id,
-                                }
-                            })
-                        })
-                        .collect();
-                    bridge
-                        .merge_calls(&channels?)
-                        .map_err(AsteriskBackendError::CallFeature)
-                })
-                .unwrap_or_else(|| {
-                    Err(AsteriskBackendError::Failed {
-                        operation: "merge selected conference calls",
-                        calls: call_ids
-                            .iter()
-                            .map(|call_id| call_id.0.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    })
-                });
-                self.access
-                    .shared
-                    .bridges
-                    .lock_unpoisoned()
-                    .insert(*bridge_id, bridge);
-                result
-            }
-            BridgeOperation::MergeParticipant { bridge_id, call_id } => {
-                let mut bridge = self
-                    .access
-                    .shared
-                    .bridges
-                    .lock_unpoisoned()
-                    .remove(bridge_id)
-                    .ok_or(AsteriskBackendError::BridgeUnavailable {
-                        operation: "merge conference participant",
-                        bridge_id: *bridge_id,
-                    })?;
-                let result =
-                    with_channel(self.access, *call_id, |channel| {
-                        let channel = unsafe { AsteriskChannel::from_raw(channel.cast()) }
-                            .map_err(|_| AsteriskBackendError::CallUnavailable {
-                                operation: "merge conference participant",
-                                call_id: *call_id,
-                            })?;
-                        bridge
-                            .merge_participant(&channel)
-                            .map_err(AsteriskBackendError::CallFeature)
-                    })
-                    .unwrap_or(Err(AsteriskBackendError::CallUnavailable {
-                        operation: "merge conference participant",
-                        call_id: *call_id,
-                    }));
-                self.access
-                    .shared
-                    .bridges
-                    .lock_unpoisoned()
-                    .insert(*bridge_id, bridge);
-                result
-            }
-            BridgeOperation::SetParticipantMuted {
-                bridge_id,
-                participant_id: _,
-                call_id,
-                muted,
-            } => self.with_call_feature_channel(
-                "set conference participant mute",
-                *call_id,
-                |channel| {
-                    self.access
-                        .shared
-                        .bridges
-                        .lock_unpoisoned()
-                        .get_mut(bridge_id)
-                        .ok_or(AsteriskBackendError::BridgeUnavailable {
-                            operation: "set participant mute",
-                            bridge_id: *bridge_id,
-                        })?
-                        .set_participant_muted(channel, *muted)
-                        .map_err(AsteriskBackendError::CallFeature)
-                },
-            ),
-            BridgeOperation::SetParticipantMusicOnHold {
-                bridge_id,
-                participant_id: _,
-                call_id,
-                class,
-                enabled,
-            } => self.with_call_feature_channel(
-                "set conference participant music on hold",
-                *call_id,
-                |channel| {
-                    self.access
-                        .shared
-                        .bridges
-                        .lock_unpoisoned()
-                        .get_mut(bridge_id)
-                        .ok_or(AsteriskBackendError::BridgeUnavailable {
-                            operation: "set participant music on hold",
-                            bridge_id: *bridge_id,
-                        })?
-                        .set_participant_music_on_hold(channel, class, *enabled)
-                        .map_err(AsteriskBackendError::CallFeature)
-                },
-            ),
-            BridgeOperation::RemoveConferenceParticipant {
-                bridge_id,
-                participant_id: _,
-                call_id,
-            } => self.with_call_feature_channel(
-                "remove conference participant",
-                *call_id,
-                |channel| {
-                    self.access
-                        .shared
-                        .bridges
-                        .lock_unpoisoned()
-                        .get_mut(bridge_id)
-                        .ok_or(AsteriskBackendError::BridgeUnavailable {
-                            operation: "remove conference participant",
-                            bridge_id: *bridge_id,
-                        })?
-                        .remove_participant_and_hangup(channel)
-                        .map_err(AsteriskBackendError::CallFeature)
-                },
-            ),
-        }
-    }
-
-    fn barge(&self, operation: &BargeOperation) -> Result<(), Self::Error> {
-        match operation {
-            BargeOperation::Join {
-                bridge_id,
-                target_call_id,
-                barger_call_id,
-            } => {
-                let exists = self
-                    .access
-                    .shared
-                    .barge_bridges
-                    .lock_unpoisoned()
-                    .contains_key(bridge_id);
-                if exists {
-                    return self.with_call_feature_channel(
-                        "add barge participant",
-                        *barger_call_id,
-                        |channel| {
-                            self.access
-                                .shared
-                                .barge_bridges
-                                .lock_unpoisoned()
-                                .get_mut(bridge_id)
-                                .ok_or(AsteriskBackendError::BridgeUnavailable {
-                                    operation: "add barge participant",
-                                    bridge_id: *bridge_id,
-                                })?
-                                .add(channel)
-                                .map_err(AsteriskBackendError::CallFeature)
-                        },
-                    );
-                }
-
-                let mut bridge = self.with_call_feature_channel(
-                    "acquire barge bridge",
-                    *target_call_id,
-                    |channel| {
-                        self.call_features
-                            .acquire_barge_bridge(*bridge_id, channel)
-                            .map_err(AsteriskBackendError::CallFeature)
-                    },
-                )?;
-                if let Err(error) = self.with_call_feature_channel(
-                    "add barge participant",
-                    *barger_call_id,
-                    |channel| {
-                        bridge
-                            .add(channel)
-                            .map_err(AsteriskBackendError::CallFeature)
-                    },
-                ) {
-                    let _ = bridge.release();
-                    return Err(error);
-                }
-                let replaced = self
-                    .access
-                    .shared
-                    .barge_bridges
-                    .lock_unpoisoned()
-                    .insert(*bridge_id, bridge);
-                if replaced.is_some() {
-                    return Err(AsteriskBackendError::BridgeConflict {
-                        bridge_id: *bridge_id,
-                    });
-                }
-                Ok(())
-            }
-            BargeOperation::Leave {
-                bridge_id,
-                barger_call_id,
-                last_participant,
-            } => {
-                let removal = self.with_call_feature_channel(
-                    "remove barge participant",
-                    *barger_call_id,
-                    |channel| {
-                        self.access
-                            .shared
-                            .barge_bridges
-                            .lock_unpoisoned()
-                            .get_mut(bridge_id)
-                            .ok_or(AsteriskBackendError::BridgeUnavailable {
-                                operation: "remove barge participant",
-                                bridge_id: *bridge_id,
-                            })?
-                            .remove(channel)
-                            .map_err(AsteriskBackendError::CallFeature)
-                    },
-                );
-                let release = if *last_participant {
-                    self.access
-                        .shared
-                        .barge_bridges
-                        .lock_unpoisoned()
-                        .remove(bridge_id)
-                        .ok_or(AsteriskBackendError::BridgeUnavailable {
-                            operation: "release barge bridge",
-                            bridge_id: *bridge_id,
-                        })?
-                        .release()
-                        .map_err(AsteriskBackendError::CallFeature)
-                } else {
-                    Ok(())
-                };
-                removal.and(release)
-            }
-        }
-    }
-
-    fn announce(&self, operation: &ConferenceAnnouncementOperation) -> Result<(), Self::Error> {
-        play_conference_announcement(self.access, operation)
-    }
-}
-
-impl CallServiceBackend for AsteriskBackend<'_> {
-    fn pickup(&self, operation: &PickupOperation) -> Result<PickupOutcome, Self::Error> {
-        let (call_id, result) = match operation {
-            PickupOperation::Group {
-                call_id, answer, ..
-            } => (
-                *call_id,
-                self.with_call_feature_channel("group pickup", *call_id, |channel| {
-                    self.call_features
-                        .group_pickup(channel, *answer)
-                        .map_err(AsteriskBackendError::CallFeature)
-                })?,
-            ),
-            PickupOperation::Directed {
-                call_id,
-                extension,
-                context,
-                answer,
-                ..
-            } => (
-                *call_id,
-                self.with_call_feature_channel("directed pickup", *call_id, |channel| {
-                    self.call_features
-                        .directed_pickup(channel, extension, context, *answer)
-                        .map_err(AsteriskBackendError::CallFeature)
-                })?,
-            ),
-        };
-        let (replacement, parties) =
-            native_pickup_result(result).map_err(AsteriskBackendError::CallFeature)?;
-        let replaced = self
-            .access
-            .shared
-            .channels
-            .lock_unpoisoned()
-            .insert(call_id, ChannelBinding::new(replacement));
-        if let Some(replaced) = replaced {
-            drop(replaced.close());
-        }
-        Ok(parties)
-    }
-
-    fn parking(&self, operation: &ParkingOperation) -> Result<(), Self::Error> {
-        match operation {
-            ParkingOperation::Park { call_id, lot } => {
-                self.with_call_feature_channel("park call", *call_id, |channel| {
-                    let unique_id = native_bridging::parking_peer_uniqueid(channel)
-                        .map_err(AsteriskBackendError::CallFeature)?;
-                    if let Some(unique_id) = unique_id {
-                        let mut pending = self.access.shared.pending_parks.lock_unpoisoned();
-                        if let Some(attempt) = pending
-                            .values_mut()
-                            .find(|attempt| attempt.pbx_id == *call_id)
-                        {
-                            attempt.parkee_unique_id = Some(unique_id);
-                        }
-                    }
-                    self.call_features
-                        .park(channel, lot.as_deref())
-                        .map_err(AsteriskBackendError::CallFeature)
-                })
-            }
-            ParkingOperation::Retrieve { call_id, lot, slot } => {
-                self.with_call_feature_channel("retrieve parked call", *call_id, |channel| {
-                    self.call_features
-                        .retrieve(channel, lot.as_deref(), slot)
-                        .map_err(AsteriskBackendError::CallFeature)
-                })
-            }
-        }
-    }
-}
-
-impl ManagementBackend for AsteriskBackend<'_> {
-    fn publish_management_event(&self, event: &ManagementEvent) -> Result<(), Self::Error> {
-        self.access
-            .shared
-            .ami_events
-            .publish(event)
-            .map(|_| ())
-            .map_err(AsteriskBackendError::Management)
-    }
-}
-
-pub async fn send_handset_call_state(
-    access: &Access,
-    device_id: DeviceId,
-    call_id: CallId,
-    state: PhoneCallState,
-) -> Result<(), String> {
-    let privacy = controller_step(&access.shared.controller, |controller| {
-        controller.call_privacy(call_id).unwrap_or(true)
-    });
-    access
-        .phone
-        .send_confirmed(PhoneCommand::new(
-            device_id.clone(),
-            PhoneCommandAction::SetCallState { call_id, state },
-        ))
-        .await
-        .map_err(|error| error.to_string())?;
-    publish_ami_event(access, &call_event(&device_id, call_id, state, privacy));
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum VideoEffectDirection {
-    Receive,
-    Transmit,
-}
-
-fn video_plan_for_effect(
-    access: &Access,
-    device_id: &DeviceId,
-    session_generation: SessionGeneration,
-    call_id: CallId,
-    direction: VideoEffectDirection,
-) -> Result<VideoPlan, String> {
-    controller_step(&access.shared.controller, |controller| match direction {
-        VideoEffectDirection::Receive => controller
-            .opening_video_receive_plan_for_device(device_id, session_generation, call_id)
-            .cloned(),
-        VideoEffectDirection::Transmit => controller
-            .opening_video_transmit_plan_for_device(device_id, session_generation, call_id)
-            .cloned(),
-    })
-    .ok_or_else(|| format!("call {call_id:?} has no current video plan for {device_id}"))
-}
-
-fn video_conference_id(call_id: CallId) -> Result<ConferenceId, String> {
-    u32::try_from(call_id.get())
-        .map(ConferenceId::new)
-        .map_err(|_| format!("call {call_id:?} exceeds the video conference identity space"))
-}
-
-fn endpoint_address_type(endpoint: MediaEndpointAddress) -> IpAddressType {
-    if endpoint.address.is_ipv4() {
-        IpAddressType::Ipv4
-    } else {
-        IpAddressType::Ipv6
-    }
-}
-
-fn video_receive_descriptor(
-    call_id: CallId,
-    plan: &VideoPlan,
-) -> Result<MultimediaReceiveDescriptor, String> {
-    let (source, requested_address_type) = if plan.protocol < ProtocolVersion::V12 {
-        (
-            MediaEndpointAddress {
-                address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                port: 0,
-            },
-            IpAddressType::Ipv4,
-        )
-    } else {
-        (
-            plan.local_endpoint,
-            endpoint_address_type(plan.local_endpoint),
-        )
-    };
-    MultimediaReceiveDescriptor {
-        conference_id: video_conference_id(call_id)?,
-        payload: plan.payload.clone(),
-        conference_creator: false,
-        encryption: None,
-        stream_passthrough_id: 0,
-        associated_stream_id: 0,
-        source,
-        requested_address_type,
-    }
-    .validate()
-    .map_err(|error| error.to_string())
-}
-
-fn video_transmit_descriptor(
-    access: &Access,
-    device_id: &DeviceId,
-    call_id: CallId,
-    plan: &VideoPlan,
-) -> Result<MultimediaTransmitDescriptor, String> {
-    let traffic_class = configured_video_traffic_class(access, device_id)
-        .ok_or_else(|| format!("invalid video traffic class for {device_id}"))?;
-    MultimediaTransmitDescriptor {
-        conference_id: video_conference_id(call_id)?,
-        endpoint: plan.local_endpoint,
-        payload: plan.payload.clone(),
-        traffic_class,
-        encryption: None,
-        stream_passthrough_id: 0,
-        associated_stream_id: 0,
-    }
-    .validate()
-    .map_err(|error| error.to_string())
-}
-
-pub async fn execute_handset_effect(access: &Access, effect: HandsetEffect) -> Result<(), String> {
-    match effect {
-        HandsetEffect::BeginCall {
-            device_id,
-            line_instance,
-            call_id,
-            codec,
-        } => access
-            .phone
-            .send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::BeginCall {
-                    line_instance: LineInstance::new(line_instance),
-                    call_id,
-                    codec,
-                },
-            ))
-            .await
-            .map_err(|error| error.to_string()),
-        HandsetEffect::BeginTransfer {
-            device_id,
-            source_call_id,
-            consultation_call_id,
-            consultation_line_instance,
-            codec,
-        } => access
-            .phone
-            .send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::BeginTransfer {
-                    source_call_id,
-                    consultation_line_instance: LineInstance::new(consultation_line_instance),
-                    consultation_call_id,
-                    codec,
-                },
-            ))
-            .await
-            .map_err(|error| error.to_string()),
-        HandsetEffect::StartTone {
-            device_id,
-            call_id,
-            tone,
-        } => access
-            .phone
-            .send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::StartTone { call_id, tone },
-            ))
-            .await
-            .map_err(|error| error.to_string()),
-        HandsetEffect::CommitOutboundCall {
-            device_id,
-            call_id,
-            info,
-        } => access
-            .phone
-            .send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::CommitOutboundCall { call_id, info },
-            ))
-            .await
-            .map_err(|error| error.to_string()),
-        HandsetEffect::PresentOutboundProceeding {
-            device_id,
-            call_id,
-            info,
-        } => access
-            .phone
-            .send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::PresentOutboundProceeding { call_id, info },
-            ))
-            .await
-            .map_err(|error| error.to_string()),
-        HandsetEffect::PresentOutboundRinging {
-            device_id,
-            call_id,
-            info,
-        } => access
-            .phone
-            .send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::PresentOutboundRinging { call_id, info },
-            ))
-            .await
-            .map_err(|error| error.to_string()),
-        HandsetEffect::SetCallInfo {
-            device_id,
-            call_id,
-            info,
-        } => access
-            .phone
-            .send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::SetCallInfo { call_id, info },
-            ))
-            .await
-            .map_err(|error| error.to_string()),
-        HandsetEffect::BeginMedia {
-            device_id,
-            call_id,
-            codec,
-        } => {
-            begin_handset_media(access, device_id, call_id, codec, PhoneCallState::Connected).await
-        }
-        HandsetEffect::BeginAnswerMedia {
-            device_id,
-            call_id,
-            codec,
-        } => begin_answer_media(access, device_id, call_id, codec).await,
-        HandsetEffect::BeginOutboundMedia {
-            device_id,
-            call_id,
-            codec,
-        } => begin_outbound_media(access, device_id, call_id, codec).await,
-        HandsetEffect::BeginOneWayMedia {
-            device_id,
-            call_id,
-            codec,
-        } => {
-            begin_handset_media(
-                access,
-                device_id,
-                call_id,
-                codec,
-                PhoneCallState::IntercomOneWay,
-            )
-            .await
-        }
-        HandsetEffect::BeginEarlyMedia {
-            device_id,
-            call_id,
-            codec,
-        } => begin_handset_media(access, device_id, call_id, codec, PhoneCallState::Proceed).await,
-        HandsetEffect::OpenVideoReceive {
-            device_id,
-            call_id,
-            session_generation,
-        } => {
-            let plan = video_plan_for_effect(
-                access,
-                &device_id,
-                session_generation,
-                call_id,
-                VideoEffectDirection::Receive,
-            )?;
-            let descriptor = video_receive_descriptor(call_id, &plan)?;
-            access
-                .phone
-                .send_confirmed(PhoneCommand::new(
-                    device_id,
-                    PhoneCommandAction::OpenMultimediaReceiveChannel {
-                        call_id,
-                        descriptor,
-                    },
-                ))
-                .await
-                .map_err(|error| error.to_string())
-        }
-        HandsetEffect::StartVideoTransmit {
-            device_id,
-            call_id,
-            session_generation,
-        } => {
-            let plan = video_plan_for_effect(
-                access,
-                &device_id,
-                session_generation,
-                call_id,
-                VideoEffectDirection::Transmit,
-            )?;
-            let descriptor = video_transmit_descriptor(access, &device_id, call_id, &plan)?;
-            access
-                .phone
-                .send_confirmed(PhoneCommand::new(
-                    device_id,
-                    PhoneCommandAction::StartMultimediaTransmission {
-                        call_id,
-                        descriptor,
-                    },
-                ))
-                .await
-                .map_err(|error| error.to_string())
-        }
-        HandsetEffect::RefreshVideo {
-            device_id,
-            call_id,
-            session_generation,
-            passthrough_party_id,
-        } => {
-            if !controller_step(&access.shared.controller, |controller| {
-                controller.video_refresh_is_current(
-                    &device_id,
-                    session_generation,
-                    call_id,
-                    passthrough_party_id,
-                )
-            }) {
-                return Ok(());
-            }
-            access
-                .phone
-                .send_confirmed(PhoneCommand::new(
-                    device_id,
-                    PhoneCommandAction::ControlMultimediaTransmission {
-                        call_id,
-                        passthrough_party_id,
-                        control: MultimediaTransmitControl::FastPictureUpdate {
-                            first_gob: 0,
-                            gob_count: 0,
-                        },
-                    },
-                ))
-                .await
-                .map_err(|error| error.to_string())
-        }
-        HandsetEffect::StopVideo {
-            device_id,
-            call_id,
-            session_generation,
-        } => {
-            if !controller_step(&access.shared.controller, |controller| {
-                controller.session_is_current(&device_id, session_generation)
-            }) {
-                return Ok(());
-            }
-            let close = access
-                .phone
-                .send_confirmed(PhoneCommand::new(
-                    device_id.clone(),
-                    PhoneCommandAction::CloseMultimediaReceiveChannel { call_id },
-                ))
-                .await
-                .map_err(|error| error.to_string());
-            let stop = access
-                .phone
-                .send_confirmed(PhoneCommand::new(
-                    device_id,
-                    PhoneCommandAction::StopMultimediaTransmission { call_id },
-                ))
-                .await
-                .map_err(|error| error.to_string());
-            close.and(stop)
-        }
-        HandsetEffect::StartMedia {
-            device_id,
-            call_id,
-            mut endpoint,
-        } => {
-            let (packet_ms, max_frames_per_packet) =
-                audio_framing(access, &device_id, call_id, endpoint.codec);
-            let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
-            let audio_processing = configured_audio_processing(access, &device_id, call_id);
-            let traffic_class = configured_audio_traffic_class(access, &device_id)
-                .ok_or_else(|| format!("invalid audio traffic class for {device_id}"))?;
-            endpoint.packet_ms = packet_ms;
-            endpoint.max_frames_per_packet = max_frames_per_packet;
-            access
-                .phone
-                .send_confirmed(PhoneCommand::new(
-                    device_id,
-                    PhoneCommandAction::StartMedia {
-                        call_id,
-                        endpoint,
-                        dtmf_mode,
-                        audio_processing,
-                        traffic_class,
-                    },
-                ))
-                .await
-                .map_err(|error| error.to_string())
-        }
-        HandsetEffect::PickupCompleted {
-            device_id,
-            call_id,
-            codec,
-            answer,
-            parties,
-        } => {
-            let info = controller_step(&access.shared.controller, |controller| {
-                let mut info = controller.call_info(call_id).cloned().unwrap_or(CallInfo {
-                    direction: CallDirection::Inbound,
-                    ..CallInfo::default()
-                });
-                info.direction = CallDirection::Inbound;
-                info.calling_name = parties.calling_name;
-                info.calling_number = parties.calling_number;
-                info.called_name = parties.connected_name;
-                info.called_number = parties.connected_number;
-                info.last_redirecting_name = parties.redirecting_name;
-                info.last_redirecting_number = parties.redirecting_number;
-                let _ = controller.set_call_info(call_id, info.clone());
-                info
-            });
-            access
-                .phone
-                .send_confirmed(PhoneCommand::new(
-                    device_id.clone(),
-                    PhoneCommandAction::SetCallInfo { call_id, info },
-                ))
-                .await
-                .map_err(|error| error.to_string())?;
-            if answer {
-                let (packet_ms, max_frames_per_packet) =
-                    audio_framing(access, &device_id, call_id, codec);
-                // The RTP instance remains anchored on the Asterisk channel.
-                // Do not constrain the handset's receive channel to the
-                // advertised server endpoint: SCCP's wildcard source is
-                // required when the media path traverses NAT.
-                receive_media_source(access, call_id, codec)?;
-                let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
-                let audio_processing = configured_audio_processing(access, &device_id, call_id);
-                access
-                    .phone
-                    .send_confirmed(PhoneCommand::new(
-                        device_id.clone(),
-                        PhoneCommandAction::StopRinging { call_id },
-                    ))
-                    .await
-                    .map_err(|error| error.to_string())?;
-                send_handset_call_state(
-                    access,
-                    device_id.clone(),
-                    call_id,
-                    PhoneCallState::Connected,
-                )
-                .await?;
-                access
-                    .phone
-                    .send_confirmed(PhoneCommand::new(
-                        device_id,
-                        PhoneCommandAction::OpenReceiveChannel {
-                            call_id,
-                            source: None,
-                            codec,
-                            packet_ms,
-                            max_frames_per_packet,
-                            dtmf_mode,
-                            audio_processing,
-                        },
-                    ))
-                    .await
-                    .map_err(|error| error.to_string())
-            } else {
-                access
-                    .phone
-                    .send_confirmed(PhoneCommand::new(
-                        device_id.clone(),
-                        PhoneCommandAction::StartRinging { call_id },
-                    ))
-                    .await
-                    .map_err(|error| error.to_string())?;
-                send_handset_call_state(access, device_id, call_id, PhoneCallState::RingIn).await
-            }
-        }
-        HandsetEffect::ShowConferenceList {
-            device_id,
-            call_id,
-            conference_id,
-            participants,
-        } => access
-            .phone
-            .send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::ShowConferenceList {
-                    call_id,
-                    conference_id,
-                    participants,
-                },
-            ))
-            .await
-            .map_err(|error| error.to_string()),
-        HandsetEffect::ShowConferenceParticipantActions {
-            device_id,
-            call_id,
-            conference_id,
-            participant,
-            removable,
-            demotable,
-        } => access
-            .phone
-            .send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::ShowConferenceParticipantActions {
-                    call_id,
-                    conference_id,
-                    participant,
-                    removable,
-                    demotable,
-                },
-            ))
-            .await
-            .map_err(|error| error.to_string()),
-        HandsetEffect::SetCallState {
-            device_id,
-            call_id,
-            state,
-            stop_media,
-        } => {
-            let mut first_error = None;
-            if stop_media {
-                if let Err(error) = access
-                    .phone
-                    .send_confirmed(PhoneCommand::new(
-                        device_id.clone(),
-                        PhoneCommandAction::CloseReceiveChannel { call_id },
-                    ))
-                    .await
-                {
-                    first_error = Some(error.to_string());
-                }
-                if let Err(error) = access
-                    .phone
-                    .send_confirmed(PhoneCommand::new(
-                        device_id.clone(),
-                        PhoneCommandAction::StopMedia { call_id },
-                    ))
-                    .await
-                {
-                    first_error.get_or_insert_with(|| error.to_string());
-                }
-            }
-            if state != PhoneCallState::OnHook {
-                match send_handset_call_state(access, device_id.clone(), call_id, state).await {
-                    Ok(()) => {}
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
-            if state == PhoneCallState::Connected
-                && let Some(info) = controller_step(&access.shared.controller, |controller| {
-                    controller.call_info(call_id).cloned()
-                })
-                && let Err(error) = access
-                    .phone
-                    .send_confirmed(PhoneCommand::new(
-                        device_id.clone(),
-                        PhoneCommandAction::SetCallInfo { call_id, info },
-                    ))
-                    .await
-            {
-                first_error.get_or_insert_with(|| error.to_string());
-            }
-            if state == PhoneCallState::OnHook {
-                if let Err(error) = access
-                    .phone
-                    .send_confirmed(PhoneCommand::new(
-                        device_id,
-                        PhoneCommandAction::CloseCall { call_id },
-                    ))
-                    .await
-                {
-                    first_error.get_or_insert_with(|| error.to_string());
-                }
-            }
-            first_error.map_or(Ok(()), Err)
-        }
-        HandsetEffect::SetMicrophoneMode {
-            device_id,
-            call_id: _,
-            enabled,
-        } => tokio::time::timeout(
-            MANAGER_CONTROL_DELIVERY_TIMEOUT,
-            access.phone.send_confirmed(PhoneCommand::new(
-                device_id,
-                PhoneCommandAction::SetMicrophoneMode { enabled },
-            )),
-        )
-        .await
-        .map_err(|_| "handset microphone command timed out".to_owned())?
-        .map_err(|error| error.to_string()),
-    }
 }
 
 fn conference_announcement_tone(announcement: ConferenceAnnouncement) -> native_channel::TonePair {
@@ -3299,5 +1744,43 @@ pub async fn handle_effect_error(
             let _ = backend.hangup(operation.call_id);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use std::error::Error as _;
+
+    use super::*;
+
+    #[test]
+    fn backend_error_display_and_rollback_source_chain_are_stable() {
+        let cause = AsteriskBackendError::Failed {
+            operation: "start routing",
+            calls: "42".to_owned(),
+        };
+        let error = AsteriskBackendError::RedirectRollback {
+            call_id: PbxCallId(42),
+            cause: Box::new(cause),
+            failed_restores: vec!["metadata", "redirecting"],
+        };
+        assert_eq!(
+            error.to_string(),
+            "PBX call 42 redirect failed (start routing failed for PBX call 42) and rollback diverged at metadata, redirecting"
+        );
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("start routing failed for PBX call 42")
+        );
+    }
+
+    #[test]
+    fn recording_error_is_transparent_for_management_formatting() {
+        let error = AsteriskRecordingServiceError::Recording(RecordingError::StartFailed);
+        assert_eq!(error.to_string(), "unable to start recording");
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("unable to start recording")
+        );
     }
 }

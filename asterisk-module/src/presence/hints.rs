@@ -1,17 +1,11 @@
 //! Policy-free extension-hint lookup and typed state subscriptions.
 
-#[cfg(any(test, feature = "asterisk-22", feature = "asterisk-23"))]
+use std::fmt;
 use std::sync::Arc;
 
 use thiserror::Error;
 
-/// The devices and display name configured by an extension hint.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Hint {
-    pub devices: String,
-    pub name: String,
-    pub state: ExtensionState,
-}
+use crate::config::HintTarget;
 
 /// A stable representation of Asterisk's combinable extension state flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,9 +45,8 @@ pub enum HintUpdateReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HintUpdate {
-    pub context: String,
-    pub extension: String,
+pub struct HintSnapshot {
+    pub target: HintTarget,
     pub state: ExtensionState,
     pub reason: HintUpdateReason,
     pub caller: Option<HintCaller>,
@@ -86,44 +79,42 @@ impl HintCaller {
     }
 }
 
-#[cfg(any(test, feature = "asterisk-22", feature = "asterisk-23"))]
-pub(crate) type OwnedHintCallback = Arc<dyn Fn(HintUpdate) + Send + Sync + 'static>;
+pub type HintCallback = Arc<dyn Fn(HintSnapshot) + Send + Sync + 'static>;
 
-#[cfg(any(test, feature = "asterisk-22", feature = "asterisk-23"))]
-pub(crate) trait HintBackend {
+/// Technology-opaque lookup and subscription port used by both the native
+/// adapter and the BLF lifecycle owner.
+pub trait HintProvider {
     type Subscription: Send + 'static;
+    type Error: fmt::Display;
 
-    fn lookup(&self, context: &str, extension: &str) -> Result<Option<Hint>, HintError>;
+    fn lookup(&self, target: &HintTarget) -> Result<Option<HintSnapshot>, Self::Error>;
 
     fn subscribe(
         &self,
-        context: &str,
-        extension: &str,
-        callback: OwnedHintCallback,
-    ) -> Result<Self::Subscription, HintError>;
+        target: &HintTarget,
+        callback: HintCallback,
+    ) -> Result<Self::Subscription, Self::Error>;
 }
 
 #[cfg(any(test, feature = "asterisk-22", feature = "asterisk-23"))]
 pub(crate) fn dispatch_lookup(
-    backend: &impl HintBackend,
-    context: &str,
-    extension: &str,
-) -> Result<Option<Hint>, HintError> {
-    validate_hint_key("context", context)?;
-    validate_hint_key("extension", extension)?;
-    backend.lookup(context, extension)
+    backend: &impl HintProvider<Error = HintError>,
+    target: &HintTarget,
+) -> Result<Option<HintSnapshot>, HintError> {
+    validate_hint_key("context", target.context())?;
+    validate_hint_key("extension", target.extension())?;
+    backend.lookup(target)
 }
 
 #[cfg(any(test, feature = "asterisk-22", feature = "asterisk-23"))]
-pub(crate) fn dispatch_subscribe<Backend: HintBackend>(
+pub(crate) fn dispatch_subscribe<Backend: HintProvider<Error = HintError>>(
     backend: &Backend,
-    context: &str,
-    extension: &str,
-    callback: OwnedHintCallback,
+    target: &HintTarget,
+    callback: HintCallback,
 ) -> Result<Backend::Subscription, HintError> {
-    validate_hint_key("context", context)?;
-    validate_hint_key("extension", extension)?;
-    backend.subscribe(context, extension, callback)
+    validate_hint_key("context", target.context())?;
+    validate_hint_key("extension", target.extension())?;
+    backend.subscribe(target, callback)
 }
 
 #[derive(Debug, Error)]
@@ -157,26 +148,27 @@ mod tests {
 
     #[derive(Default)]
     struct FakeBackend {
-        callback: Mutex<Option<OwnedHintCallback>>,
+        callback: Mutex<Option<HintCallback>>,
     }
 
-    impl HintBackend for FakeBackend {
+    impl HintProvider for FakeBackend {
         type Subscription = ();
+        type Error = HintError;
 
-        fn lookup(&self, context: &str, extension: &str) -> Result<Option<Hint>, HintError> {
-            assert_eq!((context, extension), ("internal", "1000"));
-            Ok(Some(Hint {
-                devices: "PJSIP/1000".into(),
-                name: "Desk".into(),
+        fn lookup(&self, target: &HintTarget) -> Result<Option<HintSnapshot>, HintError> {
+            assert_eq!((target.context(), target.extension()), ("internal", "1000"));
+            Ok(Some(HintSnapshot {
+                target: target.clone(),
                 state: ExtensionState::IN_USE,
+                reason: HintUpdateReason::Device,
+                caller: None,
             }))
         }
 
         fn subscribe(
             &self,
-            _context: &str,
-            _extension: &str,
-            callback: OwnedHintCallback,
+            _target: &HintTarget,
+            callback: HintCallback,
         ) -> Result<Self::Subscription, HintError> {
             *self.callback.lock().unwrap() = Some(callback);
             Ok(())
@@ -188,16 +180,15 @@ mod tests {
         let backend = FakeBackend::default();
         let received = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&received);
+        let target = HintTarget::parse("1000@internal").unwrap();
         dispatch_subscribe(
             &backend,
-            "internal",
-            "1000",
+            &target,
             Arc::new(move |update| *capture.lock().unwrap() = Some(update)),
         )
         .unwrap();
-        backend.callback.lock().unwrap().as_ref().unwrap()(HintUpdate {
-            context: "internal".into(),
-            extension: "1000".into(),
+        backend.callback.lock().unwrap().as_ref().unwrap()(HintSnapshot {
+            target: target.clone(),
             state: ExtensionState::RINGING,
             reason: HintUpdateReason::Device,
             caller: None,
@@ -207,11 +198,8 @@ mod tests {
             ExtensionState::RINGING
         );
         assert_eq!(
-            dispatch_lookup(&backend, "internal", "1000")
-                .unwrap()
-                .unwrap()
-                .name,
-            "Desk"
+            dispatch_lookup(&backend, &target).unwrap().unwrap().target,
+            target
         );
     }
 

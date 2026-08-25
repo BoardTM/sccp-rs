@@ -1,6 +1,20 @@
-use super::super::*;
+use super::{
+    Access, Arc, AsteriskCallCompletion, AsteriskCallFeatures, AsteriskChannel,
+    AsteriskChannelMetadata, CString, CallFeatureError, CallId, CallMetadata, ChannelBinding,
+    ChannelOperationPermit, ChannelState, Codec, ConferenceTaskCancellation,
+    ConfiguredChannelMetadata, DeviceId, HandsetEffect, LineBinding, LogLevel,
+    MediaEndpointAddress, ModuleConfig, MutexExt as _, NatMode, NonNull, PbxAudioFormat, PbxCallId,
+    PbxVideoFormat, PendingRetrieval, REQUESTED_CHANNEL_UNAVAILABLE, ReceiveTransmit,
+    StationMediaCapabilities, StationTransport, VideoMode, ast_log, c_string,
+    clear_no_answer_route, compose_channel_metadata, controller_step, format_for,
+    local_video_endpoint, native_audio_format, native_channel, negotiate_audio, pbx_audio_format,
+    pbx_audio_format_from_native, raw, station_nat_active, sys,
+};
+use crate::asterisk::raw::handles::ChannelRef;
 use crate::media::formats::{OwnedNegotiatedVideo, negotiate_video_owned};
+use crate::pbx::operations::CallFeatureProvider as _;
 use crate::runtime::controller::{VideoFallbackReason, VideoPlan, VideoPlanReadiness};
+use sccp_protocol::message::MediaCapability;
 use sccp_protocol::{
     IpAddressType, MultimediaPayload, ProtocolVersion, RtpPayloadNumber, SessionGeneration,
 };
@@ -248,6 +262,57 @@ pub enum ChannelAllocationOwner {
     Module,
 }
 
+pub struct ChannelAllocationText {
+    line: CString,
+    context: CString,
+    caller_number: CString,
+    caller_name: CString,
+    media_bind_address: CString,
+    assigned_uniqueid: Option<CString>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelAllocationError {
+    #[error("invalid native text in {field}: {source}")]
+    NativeText {
+        field: &'static str,
+        #[source]
+        source: crate::asterisk::boundary::NativeTextError,
+    },
+    #[error("native channel allocation failed")]
+    Failed,
+}
+
+fn allocation_text(field: &'static str, value: &str) -> Result<CString, ChannelAllocationError> {
+    c_string(value).map_err(|source| ChannelAllocationError::NativeText { field, source })
+}
+
+pub fn prepare_channel_allocation_text(
+    access: &Access,
+    binding: &LineBinding,
+    pbx_id: PbxCallId,
+) -> Result<ChannelAllocationText, ChannelAllocationError> {
+    let config = access.config();
+    let assigned_uniqueid = access
+        .shared
+        .assigned_channel_ids
+        .lock_unpoisoned()
+        .get(&pbx_id)
+        .map(|uniqueid| allocation_text("assigned unique ID", uniqueid))
+        .transpose()?;
+    Ok(ChannelAllocationText {
+        line: allocation_text("line", &binding.line.number)?,
+        context: allocation_text("context", &binding.line.context)?,
+        caller_number: allocation_text("caller number", &binding.line.caller_number)?,
+        caller_name: allocation_text("caller name", &binding.line.caller_name)?,
+        media_bind_address: allocation_text(
+            "media bind address",
+            &config.general.bind.ip().to_string(),
+        )?,
+        assigned_uniqueid,
+    })
+}
+
 pub fn allocate_channel(
     access: &Access,
     sccp_id: CallId,
@@ -258,27 +323,31 @@ pub fn allocate_channel(
     assigned_ids: *const sys::ast_assigned_ids,
     requestor: *const sys::ast_channel,
     metadata: Option<CallMetadata>,
+    text: ChannelAllocationText,
     owner: ChannelAllocationOwner,
-) -> bool {
+) -> Result<(), ChannelAllocationError> {
     let Some(format) = format_for(codec) else {
-        return false;
+        return Err(ChannelAllocationError::Failed);
     };
-    let line = c_string(&binding.line.number);
-    let context = c_string(&binding.line.context);
-    let caller_number = c_string(&binding.line.caller_number);
-    let caller_name = c_string(&binding.line.caller_name);
+    let ChannelAllocationText {
+        line,
+        context,
+        caller_number,
+        caller_name,
+        media_bind_address,
+        assigned_uniqueid,
+    } = text;
     let config = access.config();
     let metadata = match metadata {
         Some(metadata) => metadata,
         None => {
             let Some(metadata) = configured_channel_metadata(access, &config, binding, pbx_id)
             else {
-                return false;
+                return Err(ChannelAllocationError::Failed);
             };
             metadata
         }
     };
-    let media_bind_address = c_string(&config.general.bind.ip().to_string());
     let network = config.network_for_device(&binding.device_id);
     let audio_qos = network
         .map(|network| network.qos.audio)
@@ -301,13 +370,6 @@ pub fn allocate_channel(
             .registered_device(&binding.device_id)
             .is_some_and(|device| device.registration.transport == StationTransport::Secure)
     });
-    let assigned_uniqueid = access
-        .shared
-        .assigned_channel_ids
-        .lock_unpoisoned()
-        .get(&pbx_id)
-        .cloned()
-        .map(|uniqueid| c_string(&uniqueid));
     let allocation = unsafe {
         native_channel::allocate_channel(native_channel::ChannelAllocation {
             line: &line,
@@ -344,7 +406,7 @@ pub fn allocate_channel(
         })
     };
     let Ok(allocation) = allocation else {
-        return false;
+        return Err(ChannelAllocationError::Failed);
     };
     for failure in allocation.qos.failures() {
         ast_log(
@@ -375,7 +437,7 @@ pub fn allocate_channel(
     let channel_metadata = AsteriskChannelMetadata::new();
     let Ok(channel_borrow) = (unsafe { AsteriskChannel::from_raw(channel.cast()) }) else {
         unsafe { queue_unavailable(channel) };
-        return false;
+        return Err(ChannelAllocationError::Failed);
     };
     if let Err(error) = AsteriskCallCompletion::new().configure(&channel_borrow) {
         ast_log(
@@ -388,7 +450,7 @@ pub fn allocate_channel(
             (unsafe { AsteriskChannel::from_raw((requestor as *mut sys::ast_channel).cast()) })
         else {
             unsafe { queue_unavailable(channel) };
-            return false;
+            return Err(ChannelAllocationError::Failed);
         };
         if let Err(error) = channel_metadata.inherit_variables(&requestor_borrow, &channel_borrow) {
             ast_log(
@@ -396,7 +458,7 @@ pub fn allocate_channel(
                 &format!("unable to inherit PBX channel variables: {error}"),
             );
             unsafe { queue_unavailable(channel) };
-            return false;
+            return Err(ChannelAllocationError::Failed);
         }
     }
     if let Err(error) = channel_metadata.apply(&channel_borrow, &metadata) {
@@ -405,7 +467,7 @@ pub fn allocate_channel(
             &format!("unable to apply PBX channel metadata: {error}"),
         );
         unsafe { queue_unavailable(channel) };
-        return false;
+        return Err(ChannelAllocationError::Failed);
     }
     let media = config.media_for_binding(binding);
     let jitter = config.general.jitter_buffer;
@@ -422,7 +484,7 @@ pub fn allocate_channel(
         .is_err()
         {
             unsafe { queue_unavailable(channel) };
-            return false;
+            return Err(ChannelAllocationError::Failed);
         }
     }
     let private_call = controller_step(&access.shared.controller, |controller| {
@@ -430,7 +492,7 @@ pub fn allocate_channel(
     });
     if configure_pickup_policy(access, binding, channel, private_call).is_err() {
         unsafe { queue_unavailable(channel) };
-        return false;
+        return Err(ChannelAllocationError::Failed);
     }
     let parking_lot = access
         .config()
@@ -439,12 +501,12 @@ pub fn allocate_channel(
     if let Some(parking_lot) = parking_lot {
         if raw::bridge::set_channel_parking_lot(&channel_borrow, &parking_lot).is_err() {
             unsafe { queue_unavailable(channel) };
-            return false;
+            return Err(ChannelAllocationError::Failed);
         }
     }
     let Some(retained) = (unsafe { ChannelRef::acquire(channel) }) else {
         unsafe { queue_unavailable(channel) };
-        return false;
+        return Err(ChannelAllocationError::Failed);
     };
     access
         .shared
@@ -537,7 +599,7 @@ pub fn allocate_channel(
             drop(binding.close());
         }
         unsafe { queue_unavailable(channel) };
-        return false;
+        return Err(ChannelAllocationError::Failed);
     }
     if owner == ChannelAllocationOwner::Asterisk
         && (unsafe { native_channel::handoff_channel_to_asterisk(NonNull::new_unchecked(channel)) })
@@ -548,9 +610,9 @@ pub fn allocate_channel(
             drop(binding.close());
         }
         unsafe { queue_unavailable(channel) };
-        return false;
+        return Err(ChannelAllocationError::Failed);
     }
-    true
+    Ok(())
 }
 
 pub fn configured_channel_metadata(
@@ -642,6 +704,32 @@ pub fn configure_pickup_policy(
         &named_pickup_groups,
         private_call,
     )
+}
+
+#[cfg(test)]
+mod allocation_text_tests {
+    use super::*;
+
+    #[test]
+    fn every_native_channel_text_family_rejects_interior_nul() {
+        for field in [
+            "line",
+            "context",
+            "caller number",
+            "caller name",
+            "media bind address",
+            "assigned unique ID",
+        ] {
+            let error = allocation_text(field, "safe\0suffix").unwrap_err();
+            assert!(matches!(
+                error,
+                ChannelAllocationError::NativeText {
+                    field: actual,
+                    ..
+                } if actual == field
+            ));
+        }
+    }
 }
 
 pub fn remove_channel(access: &Access, pbx_id: PbxCallId) {

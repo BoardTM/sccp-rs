@@ -205,6 +205,25 @@ pub enum RequestFieldsError {
     ActionMismatch,
 }
 
+/// Implements the common manager-field validation translation while allowing
+/// each action family to retain its public response wording.
+macro_rules! impl_request_fields_error {
+    ($error:ty) => {
+        impl From<$crate::ami::manager::RequestFieldsError> for $error {
+            fn from(error: $crate::ami::manager::RequestFieldsError) -> Self {
+                match error {
+                    $crate::ami::manager::RequestFieldsError::Sensitive => Self::SensitiveField,
+                    $crate::ami::manager::RequestFieldsError::Duplicate => Self::DuplicateField,
+                    $crate::ami::manager::RequestFieldsError::Unknown => Self::UnknownField,
+                    $crate::ami::manager::RequestFieldsError::ActionMismatch => Self::UnknownAction,
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use impl_request_fields_error;
+
 /// A policy-aware view over one manager request.
 ///
 /// Action handlers retain their own required-field and value policy while
@@ -391,6 +410,56 @@ pub trait ManagerBackend: Clone + Send + Sync + 'static {
     fn publish(&self, event: &ManagerEvent, limits: ManagerLimits) -> Result<(), ManagerError>;
 }
 
+/// Complete registration record for one member of an AMI action group.
+pub(crate) trait ActionDefinition<P>: Copy {
+    fn name(self) -> &'static str;
+    fn synopsis(self) -> &'static str;
+    fn description(self) -> &'static str;
+    fn privileges(self) -> ManagerPrivilege;
+    fn limits(self) -> ManagerLimits;
+    fn handle(self, provider: &P, request: ManagerRequest) -> ManagerResponse;
+
+    fn handler(
+        self,
+        provider: std::sync::Arc<P>,
+    ) -> Box<dyn Fn(ManagerRequest) -> ManagerResponse + Send + Sync + 'static>
+    where
+        P: Send + Sync + 'static,
+        Self: Send + Sync + 'static,
+    {
+        Box::new(move |request| self.handle(provider.as_ref(), request))
+    }
+}
+
+/// Registers a metadata-driven group with one shared provider allocation.
+/// Dropping the partially built vector rolls back earlier registrations when
+/// any later action fails.
+pub(crate) fn register_action_group<P, M, A>(
+    provider: P,
+    manager: M,
+    actions: &[A],
+) -> Result<Vec<M::Registration>, ManagerError>
+where
+    P: Send + Sync + 'static,
+    M: ManagerBackend,
+    A: ActionDefinition<P> + Send + Sync + 'static,
+{
+    let provider = std::sync::Arc::new(provider);
+    let mut registrations = Vec::with_capacity(actions.len());
+    for &action in actions {
+        let handler = action.handler(std::sync::Arc::clone(&provider));
+        registrations.push(manager.register_action(
+            action.name(),
+            action.privileges(),
+            action.synopsis(),
+            action.description(),
+            action.limits(),
+            handler,
+        )?);
+    }
+    Ok(registrations)
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct UnavailableManager;
@@ -416,6 +485,90 @@ impl ManagerBackend for UnavailableManager {
 
     fn publish(&self, _event: &ManagerEvent, _limits: ManagerLimits) -> Result<(), ManagerError> {
         Err(ManagerError::Unavailable)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RollbackManager {
+    state: std::sync::Arc<RollbackState>,
+    fail_on: usize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RollbackState {
+    attempts: std::sync::atomic::AtomicUsize,
+    drops: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+pub(crate) struct RollbackRegistration {
+    state: std::sync::Arc<RollbackState>,
+}
+
+#[cfg(test)]
+impl Drop for RollbackRegistration {
+    fn drop(&mut self) {
+        self.state
+            .drops
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl RollbackManager {
+    pub(crate) fn fail_on(fail_on: usize) -> Self {
+        Self {
+            state: std::sync::Arc::new(RollbackState::default()),
+            fail_on,
+        }
+    }
+
+    pub(crate) fn assert_partial_rollback(&self, attempts: usize, drops: usize) {
+        assert_eq!(
+            self.state
+                .attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            attempts
+        );
+        assert_eq!(
+            self.state.drops.load(std::sync::atomic::Ordering::SeqCst),
+            drops
+        );
+    }
+}
+
+#[cfg(test)]
+impl ManagerBackend for RollbackManager {
+    type Registration = RollbackRegistration;
+
+    fn register_action<F>(
+        &self,
+        _action: &str,
+        _authority: ManagerPrivilege,
+        _synopsis: &str,
+        _description: &str,
+        _limits: ManagerLimits,
+        _handler: F,
+    ) -> Result<Self::Registration, ManagerError>
+    where
+        F: Fn(ManagerRequest) -> ManagerResponse + Send + Sync + 'static,
+    {
+        let attempt = self
+            .state
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt == self.fail_on {
+            return Err(ManagerError::RegistrationFailed);
+        }
+        Ok(RollbackRegistration {
+            state: std::sync::Arc::clone(&self.state),
+        })
+    }
+
+    fn publish(&self, _event: &ManagerEvent, _limits: ManagerLimits) -> Result<(), ManagerError> {
+        Ok(())
     }
 }
 

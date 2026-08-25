@@ -15,7 +15,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 
 use sccp_protocol::{
     CallId, ConferenceId, DeviceId, MediaEndpoint, MediaStatisticsSnapshot, ParticipantId,
@@ -24,8 +23,8 @@ use thiserror::Error;
 
 use crate::ami::inventory::InventoryValue;
 use crate::ami::manager::{
-    ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege, ManagerRequest,
-    ManagerResponse, RequestFields, RequestFieldsError,
+    ActionDefinition, ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege,
+    ManagerRequest, ManagerResponse, RequestFields, register_action_group,
 };
 use crate::pbx::query::channel::{
     ChannelDirectionSummary, ChannelMediaStateSummary, ChannelStateSummary,
@@ -338,25 +337,38 @@ impl RuntimeAction {
     }
 }
 
+impl<P: RuntimeStatusProvider> ActionDefinition<P> for RuntimeAction {
+    fn name(self) -> &'static str {
+        self.name()
+    }
+
+    fn synopsis(self) -> &'static str {
+        self.synopsis()
+    }
+
+    fn description(self) -> &'static str {
+        self.description()
+    }
+
+    fn privileges(self) -> ManagerPrivilege {
+        RUNTIME_PRIVILEGES
+    }
+
+    fn limits(self) -> ManagerLimits {
+        RUNTIME_LIMITS
+    }
+
+    fn handle(self, provider: &P, request: ManagerRequest) -> ManagerResponse {
+        handle_runtime_status_request(provider, request)
+    }
+}
+
 /// Register every live-status action as one RAII-owned lifecycle group.
 pub fn register_runtime_status_actions<P: RuntimeStatusProvider, M: ManagerBackend>(
     provider: P,
     manager: M,
 ) -> Result<Vec<M::Registration>, ManagerError> {
-    let provider = Arc::new(provider);
-    let mut registrations = Vec::with_capacity(RuntimeAction::ALL.len());
-    for action in RuntimeAction::ALL {
-        let provider = Arc::clone(&provider);
-        registrations.push(manager.register_action(
-            action.name(),
-            RUNTIME_PRIVILEGES,
-            action.synopsis(),
-            action.description(),
-            RUNTIME_LIMITS,
-            move |request| handle_runtime_status_request(provider.as_ref(), request),
-        )?);
-    }
-    Ok(registrations)
+    register_action_group(provider, manager, &RuntimeAction::ALL)
 }
 
 pub fn handle_runtime_status_request<P: RuntimeStatusProvider + ?Sized>(
@@ -395,6 +407,8 @@ enum RuntimeActionError {
     #[error(transparent)]
     Provider(#[from] RuntimeStatusProviderError),
 }
+
+crate::ami::manager::impl_request_fields_error!(RuntimeActionError);
 
 impl RuntimeActionError {
     const fn response_message(self) -> &'static str {
@@ -625,12 +639,7 @@ fn parse_selectors(
 ) -> Result<BTreeMap<String, String>, RuntimeActionError> {
     RequestFields::new(request)
         .collect(allowed, &[])
-        .map_err(|error| match error {
-            RequestFieldsError::Sensitive => RuntimeActionError::SensitiveField,
-            RequestFieldsError::Duplicate => RuntimeActionError::DuplicateField,
-            RequestFieldsError::Unknown => RuntimeActionError::UnknownField,
-            RequestFieldsError::ActionMismatch => RuntimeActionError::UnknownAction,
-        })
+        .map_err(Into::into)
 }
 
 fn selector<'a>(
@@ -1693,5 +1702,11 @@ mod tests {
             register_runtime_status_actions(provider(), crate::ami::manager::UnavailableManager),
             Err(ManagerError::Unavailable)
         ));
+        let manager = crate::ami::manager::RollbackManager::fail_on(2);
+        assert!(matches!(
+            register_runtime_status_actions(provider(), manager.clone()),
+            Err(ManagerError::RegistrationFailed)
+        ));
+        manager.assert_partial_rollback(3, 2);
     }
 }

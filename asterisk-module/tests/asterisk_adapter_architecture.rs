@@ -1,5 +1,14 @@
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+
+use syn::visit::Visit;
+
+mod support;
+use support::{
+    crate_root, docker_stage, path_source, rust_attribute_count, rust_extern_c_functions,
+    rust_item, rust_modules, rust_region, rust_repr_c_types, rust_sources, rust_token_count,
+    source, workspace_source,
+};
 
 const RUST_NATIVE_MODULES: &[&str] = &[
     "bridge/mod.rs",
@@ -29,24 +38,121 @@ const RUST_NATIVE_MODULES: &[&str] = &[
     "system.rs",
 ];
 
-fn crate_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+#[derive(Default)]
+struct ProductionImportViolations {
+    wildcard_imports: usize,
+    prelude_modules: usize,
 }
 
-fn source(relative: &str) -> String {
-    fs::read_to_string(crate_root().join(relative))
-        .unwrap_or_else(|error| panic!("unable to read {relative}: {error}"))
+impl<'ast> Visit<'ast> for ProductionImportViolations {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if has_test_cfg(&item.attrs) {
+            return;
+        }
+        if item.ident == "prelude" {
+            self.prelude_modules += 1;
+        }
+        syn::visit::visit_item_mod(self, item);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if has_test_cfg(&item.attrs) {
+            return;
+        }
+        if use_tree_has_glob(&item.tree) {
+            self.wildcard_imports += 1;
+        }
+        syn::visit::visit_item_use(self, item);
+    }
 }
 
-fn rust_sources(directory: &std::path::Path, output: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(directory).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            rust_sources(&path, output);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            output.push(path);
+fn has_test_cfg(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        let syn::Meta::List(configuration) = &attribute.meta else {
+            return false;
+        };
+        attribute.path().is_ident("cfg") && configuration.tokens.to_string() == "test"
+    })
+}
+
+fn use_tree_has_glob(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Glob(_) => true,
+        syn::UseTree::Group(group) => group.items.iter().any(use_tree_has_glob),
+        syn::UseTree::Path(path) => use_tree_has_glob(&path.tree),
+        syn::UseTree::Name(_) | syn::UseTree::Rename(_) => false,
+    }
+}
+
+fn production_import_violations(source: &str) -> ProductionImportViolations {
+    let syntax = syn::parse_file(source).expect("import contract fixture must parse");
+    let mut violations = ProductionImportViolations::default();
+    violations.visit_file(&syntax);
+    violations
+}
+
+#[test]
+fn asterisk_production_imports_are_explicit_without_preludes() {
+    let asterisk_root = crate_root().join("src/asterisk");
+    let mut files = Vec::new();
+    rust_sources(&asterisk_root, &mut files);
+    files.sort();
+
+    let mut violations = Vec::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(&asterisk_root)
+            .expect("Asterisk source must remain below its module root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if path.file_name().is_some_and(|name| name == "prelude.rs") {
+            violations.push(format!("{relative}: prelude source file"));
+        }
+
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("unable to read {}: {error}", path.display()));
+        let source_violations = production_import_violations(&source);
+        if source_violations.wildcard_imports != 0 {
+            violations.push(format!(
+                "{relative}: {} production wildcard import(s)",
+                source_violations.wildcard_imports
+            ));
+        }
+        if source_violations.prelude_modules != 0 {
+            violations.push(format!(
+                "{relative}: {} production prelude module(s)",
+                source_violations.prelude_modules
+            ));
         }
     }
+
+    assert!(
+        violations.is_empty(),
+        "Asterisk production imports must stay explicit:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn production_import_guard_allows_only_test_scoped_wildcards() {
+    let allowed = production_import_violations(
+        r#"
+        use crate::{first, second};
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+        }
+        "#,
+    );
+    assert_eq!(allowed.wildcard_imports, 0);
+    assert_eq!(allowed.prelude_modules, 0);
+
+    let production_wildcard = production_import_violations("use super::*;");
+    assert_eq!(production_wildcard.wildcard_imports, 1);
+
+    let production_prelude = production_import_violations("mod prelude;");
+    assert_eq!(production_prelude.prelude_modules, 1);
 }
 
 #[test]
@@ -64,7 +170,7 @@ fn domain_layers_do_not_depend_on_asterisk_bindings() {
         let mut files = Vec::new();
         rust_sources(&crate_root().join(directory), &mut files);
         for path in files {
-            let contents = fs::read_to_string(&path).unwrap();
+            let contents = path_source(&path);
             assert!(
                 !contents.contains("crate::asterisk"),
                 "domain module imports Asterisk integration details: {}",
@@ -91,7 +197,7 @@ fn asterisk_visibility_is_scoped_to_its_owning_module() {
     let mut files = Vec::new();
     rust_sources(&crate_root().join("src/asterisk"), &mut files);
     for path in files {
-        let contents = fs::read_to_string(&path).unwrap();
+        let contents = path_source(&path);
         assert!(
             !contents.contains("pub(crate)"),
             "broad crate visibility escaped the Asterisk hierarchy: {}",
@@ -110,19 +216,23 @@ fn project_owned_internal_c_records_are_absent() {
     let mut files = Vec::new();
     rust_sources(&crate_root().join("src/asterisk"), &mut files);
     for path in files {
-        let contents = fs::read_to_string(&path).unwrap();
+        let contents = path_source(&path);
         let relative = path
             .strip_prefix(crate_root().join("src/asterisk"))
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let count = contents.matches("#[repr(C)]").count();
+        let records = rust_repr_c_types(&contents);
         if relative == "native/http.rs" {
-            assert_eq!(count, 1, "HTTP may define only its opaque libc FILE");
-            assert!(contents.contains("#[repr(C)]\nstruct File"));
+            assert_eq!(
+                records,
+                ["File"],
+                "HTTP may define only its opaque libc FILE"
+            );
         } else {
             assert_eq!(
-                count, 0,
+                records,
+                Vec::<String>::new(),
                 "project-owned C-shaped record returned in {relative}"
             );
         }
@@ -134,7 +244,7 @@ fn rust_does_not_call_rust_through_legacy_c_named_functions() {
     let mut files = Vec::new();
     rust_sources(&crate_root().join("src/asterisk"), &mut files);
     for path in files {
-        let contents = fs::read_to_string(&path).unwrap();
+        let contents = path_source(&path);
         for legacy in ["rust_sccp_", "sccp_ast_"] {
             assert!(
                 !contents.contains(legacy),
@@ -149,65 +259,77 @@ fn rust_does_not_call_rust_through_legacy_c_named_functions() {
 fn every_rust_defined_c_callback_is_an_actual_asterisk_entrypoint() {
     let mut files = Vec::new();
     rust_sources(&crate_root().join("src/asterisk"), &mut files);
-    let allowed_native = [
-        ("direct/channel_driver.rs", "requester"),
-        ("direct/channel_driver.rs", "call"),
-        ("direct/channel_driver.rs", "hangup"),
-        ("direct/channel_driver.rs", "answer"),
-        ("direct/channel_driver.rs", "read"),
-        ("direct/channel_driver.rs", "write"),
-        ("direct/channel_driver.rs", "get_rtp_info"),
-        ("direct/channel_driver.rs", "get_vrtp_info"),
-        ("direct/channel_driver.rs", "update_peer"),
-        ("direct/channel_driver.rs", "get_codec"),
-        ("direct/channel_driver.rs", "indicate"),
-        ("direct/channel_driver.rs", "send_digit_begin"),
-        ("direct/channel_driver.rs", "send_digit_end"),
-        ("direct/channel_driver.rs", "send_text"),
-        ("direct/channel_driver.rs", "set_option"),
-        ("direct/channel_driver.rs", "query_option"),
-        ("direct/channel_driver.rs", "fixup"),
-        ("direct/channel_driver.rs", "device_state"),
-        ("direct/channel_driver.rs", "call_completion"),
-        ("direct/channel_driver.rs", "$name"),
-        ("direct/channel_driver.rs", "cli_reload"),
-        ("direct/channel_driver.rs", "cli_forwarding"),
-        ("direct/module_info.rs", "load"),
-        ("direct/module_info.rs", "unload"),
-        ("direct/module_info.rs", "reload"),
-        ("direct/module_info.rs", "register_module"),
-        ("direct/module_info.rs", "unregister_module"),
-        ("direct/module_info.rs", "__internal_chan_sccp2_self"),
-        ("native/bridge/parking.rs", "async_application_thread"),
-        ("native/bridge/parking.rs", "parking_event"),
-        ("native/dialplan.rs", "function_read"),
-        ("native/dialplan.rs", "function_write"),
-        ("native/dialplan.rs", "application_execute"),
-        ("native/http.rs", "callback"),
-        ("native/manager.rs", "manager_action"),
-        ("native/presence/hints.rs", "hint_update"),
-        ("native/presence/hints.rs", "hint_watcher_destroy"),
-        ("native/presence/mwi.rs", "mwi_event"),
-    ];
+    let allowed_native = BTreeSet::from(
+        [
+            ("direct/channel_driver.rs", "requester_with_stream_topology"),
+            ("direct/channel_driver.rs", "call"),
+            ("direct/channel_driver.rs", "hangup"),
+            ("direct/channel_driver.rs", "answer"),
+            ("direct/channel_driver.rs", "read"),
+            ("direct/channel_driver.rs", "write"),
+            ("direct/channel_driver.rs", "get_rtp_info"),
+            ("direct/channel_driver.rs", "get_vrtp_info"),
+            ("direct/channel_driver.rs", "update_peer"),
+            ("direct/channel_driver.rs", "get_codec"),
+            ("direct/channel_driver.rs", "indicate"),
+            ("direct/channel_driver.rs", "send_digit_begin"),
+            ("direct/channel_driver.rs", "send_digit_end"),
+            ("direct/channel_driver.rs", "send_text"),
+            ("direct/channel_driver.rs", "set_option"),
+            ("direct/channel_driver.rs", "query_option"),
+            ("direct/channel_driver.rs", "fixup"),
+            ("direct/channel_driver.rs", "device_state"),
+            ("direct/channel_driver.rs", "call_completion"),
+            ("direct/cli.rs", "cli_reload"),
+            ("direct/cli.rs", "cli_forwarding"),
+            ("direct/cli.rs", "cli_devices"),
+            ("direct/cli.rs", "cli_lines"),
+            ("direct/cli.rs", "cli_channels"),
+            ("direct/cli.rs", "cli_media"),
+            ("direct/cli.rs", "cli_media_statistics"),
+            ("direct/cli.rs", "cli_sessions"),
+            ("direct/cli.rs", "cli_reset"),
+            ("direct/cli.rs", "cli_restart"),
+            ("direct/cli.rs", "cli_dnd"),
+            ("direct/cli.rs", "cli_message"),
+            ("direct/cli.rs", "cli_answer"),
+            ("direct/cli.rs", "cli_end"),
+            ("direct/cli.rs", "cli_originate"),
+            ("direct/module_info.rs", "load"),
+            ("direct/module_info.rs", "unload"),
+            ("direct/module_info.rs", "reload"),
+            ("direct/module_info.rs", "register_module"),
+            ("direct/module_info.rs", "unregister_module"),
+            ("direct/module_info.rs", "__internal_chan_sccp2_self"),
+            ("native/bridge/parking.rs", "async_application_thread"),
+            ("native/bridge/parking.rs", "parking_event"),
+            ("native/dialplan.rs", "function_read"),
+            ("native/dialplan.rs", "function_write"),
+            ("native/dialplan.rs", "application_execute"),
+            ("native/http.rs", "callback"),
+            ("native/manager.rs", "manager_action"),
+            ("native/presence/hints.rs", "hint_update"),
+            ("native/presence/hints.rs", "hint_watcher_destroy"),
+            ("native/presence/mwi.rs", "mwi_event"),
+        ]
+        .map(|(file, name)| (file.to_owned(), name.to_owned())),
+    );
+    let mut actual = BTreeSet::new();
     for path in files {
         let relative = path
             .strip_prefix(crate_root().join("src/asterisk"))
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let contents = fs::read_to_string(&path).unwrap();
-        for line in contents
-            .lines()
-            .filter(|line| line.contains("unsafe extern \"C\" fn "))
-        {
-            assert!(
-                allowed_native
-                    .iter()
-                    .any(|(file, name)| relative == *file && line.contains(name)),
-                "un-inventoried C callback in {relative}: {line}"
-            );
+        let contents = path_source(&path);
+        for name in rust_extern_c_functions(&contents) {
+            actual.insert((relative.clone(), name));
         }
     }
+    assert_eq!(
+        actual, allowed_native,
+        "the Asterisk C callback inventory changed"
+    );
 }
 
 #[test]
@@ -219,17 +341,11 @@ fn conference_destination_work_is_owned_by_the_rust_runtime() {
     assert!(native.contains("pub struct ConferenceApplicationCancellation"));
 
     let runtime = source("src/asterisk/runtime/backend.rs");
-    assert!(runtime.contains("conference_destination_tasks"));
-    assert!(runtime.contains("spawn_blocking"));
+    let supplementary = source("src/asterisk/runtime/backend/supplementary.rs");
+    assert!(supplementary.contains("conference_destination_tasks"));
+    assert!(supplementary.contains("spawn_blocking"));
     assert!(runtime.contains("begin_shutdown"));
-    let start = runtime
-        .find("fn start_conference_destination")
-        .expect("conference destination backend");
-    let end = runtime[start..]
-        .find("impl MediaBackend")
-        .map(|offset| start + offset)
-        .expect("conference destination backend boundary");
-    let destination = &runtime[start..end];
+    let destination = rust_item(&supplementary, "fn start_conference_destination");
     assert!(destination.contains("conference_destination_failed("));
     assert!(destination.contains("complete_conference_mutation(mutation)"));
 }
@@ -240,10 +356,11 @@ fn native_adapter_is_split_into_rust_owned_domains() {
     for module in RUST_NATIVE_MODULES {
         let contents = source(&format!("src/asterisk/native/{module}"));
         assert!(
-            contents.lines().count() < 1_500,
+            rust_token_count(&contents) < 16_000,
             "src/asterisk/native/{module} has regrown into a monolith"
         );
     }
+    let native_modules = rust_modules(&native).into_iter().collect::<BTreeSet<_>>();
     for module in [
         "bridge",
         "channel",
@@ -257,14 +374,15 @@ fn native_adapter_is_split_into_rust_owned_domains() {
         "registry",
     ] {
         assert!(
-            native.contains(&format!("mod {module};")),
+            native_modules.contains(module),
             "native module root does not compile {module}"
         );
     }
     let bridge = source("src/asterisk/native/bridge/mod.rs");
+    let bridge_modules = rust_modules(&bridge).into_iter().collect::<BTreeSet<_>>();
     for module in ["conference", "parking", "pickup"] {
         assert!(
-            bridge.contains(&format!("mod {module};")),
+            bridge_modules.contains(module),
             "bridge module root does not compile {module}"
         );
     }
@@ -282,18 +400,16 @@ fn native_adapter_is_split_into_rust_owned_domains() {
 #[test]
 fn attended_transfer_runs_off_the_serial_handset_event_loop() {
     let calls = source("src/asterisk/phone/calls.rs");
-    let start = calls
-        .find("pub(super) async fn execute_transfer_completion")
-        .expect("transfer completion entrypoint");
-    let end = calls[start..]
-        .find("pub(super) async fn cancel_transfer")
-        .map(|offset| start + offset)
-        .expect("transfer completion boundary");
-    let completion = &calls[start..end];
+    let transfer = source("src/asterisk/phone/transfer.rs");
+    let completion = rust_item(&transfer, "pub(super) async fn execute_transfer_completion");
     assert!(completion.contains("tokio::task::spawn_blocking"));
     assert!(completion.contains("access.handle.spawn"));
     assert!(completion.contains("retain_two_channels"));
-    assert!(completion.contains("Transfer in progress") || calls.contains("Transfer in progress"));
+    assert!(
+        completion.contains_literal("Transfer in progress")
+            || transfer.contains_literal("Transfer in progress")
+            || calls.contains_literal("Transfer in progress")
+    );
 }
 
 #[test]
@@ -302,9 +418,9 @@ fn build_uses_one_upstream_binding_surface_and_compiles_no_repository_c() {
     let manifest = source("Cargo.toml");
     let sys = source("src/asterisk/sys.rs");
 
-    assert!(build.contains("sccp_asterisk_sys.h"));
-    assert!(build.contains("asterisk_sys.rs"));
-    assert!(sys.contains("/asterisk_sys.rs"));
+    assert!(build.contains_literal("sccp_asterisk_sys.h"));
+    assert!(build.contains_literal("asterisk_sys.rs"));
+    assert!(sys.contains_literal("/asterisk_sys.rs"));
     for retired in [
         "cc::Build",
         "NATIVE_SOURCES",
@@ -313,22 +429,20 @@ fn build_uses_one_upstream_binding_surface_and_compiles_no_repository_c() {
         "asterisk_raw.rs",
     ] {
         assert!(
-            !build.contains(retired),
+            !build.contains(retired) && !build.contains_literal(retired),
             "build.rs restored retired native path {retired}"
         );
     }
     assert!(
-        !manifest
-            .lines()
-            .any(|line| line.trim_start().starts_with("cc =")),
+        !manifest.contains("cc ="),
         "the retired C compiler dependency returned"
     );
     assert!(
         !crate_root().join("src/asterisk/ffi.rs").exists(),
         "the retired flat FFI re-export facade returned"
     );
-    assert!(!sys.contains("asterisk_shim.rs"));
-    assert!(!sys.contains("asterisk_raw.rs"));
+    assert!(!sys.contains_literal("asterisk_shim.rs"));
+    assert!(!sys.contains_literal("asterisk_raw.rs"));
 
     let legacy_native = crate_root().join("native");
     if legacy_native.exists() {
@@ -363,12 +477,12 @@ fn only_the_asterisk_module_self_hook_is_exported_explicitly() {
     rust_sources(&crate_root().join("src"), &mut files);
     let mut exports = Vec::new();
     for path in files {
-        let contents = fs::read_to_string(&path).unwrap();
-        for _ in contents.match_indices("no_mangle") {
+        let contents = path_source(&path);
+        for _ in 0..rust_attribute_count(&contents, "no_mangle") {
             exports.push(path.clone());
         }
         assert!(
-            !contents.contains("export_name"),
+            rust_attribute_count(&contents, "export_name") == 0,
             "unexpected explicit export name in {}",
             path.display()
         );
@@ -379,17 +493,18 @@ fn only_the_asterisk_module_self_hook_is_exported_explicitly() {
         "only Asterisk's module-self hook may be exported"
     );
     assert!(exports[0].ends_with("asterisk/direct/module_info.rs"));
-    let module_info = fs::read_to_string(&exports[0]).unwrap();
+    let module_info = path_source(&exports[0]);
     assert!(module_info.contains("fn __internal_chan_sccp2_self("));
 }
 
 #[test]
 fn rust_asterisk_root_remains_a_small_composition_root() {
     let root = source("src/asterisk/mod.rs");
-    assert!(root.lines().count() < 300);
+    assert!(rust_token_count(&root) < 4_000);
+    let modules = rust_modules(&root).into_iter().collect::<BTreeSet<_>>();
     for module in ["adapters", "boundary", "direct", "raw", "runtime", "sys"] {
         assert!(
-            root.contains(&format!("mod {module};")),
+            modules.contains(module),
             "composition root lost {module} module"
         );
     }
@@ -457,10 +572,7 @@ fn http_unlink_cannot_free_a_descriptor_selected_by_asterisk() {
             "HTTP callback/unlink ownership lost {required}"
         );
     }
-    let unregister = http
-        .split_once("fn unregister_http")
-        .expect("HTTP unregister implementation")
-        .1;
+    let unregister = rust_item(&http, "fn unregister_http");
     let close = unregister
         .find("close_and_drain_readers")
         .expect("close URI admission");
@@ -484,63 +596,41 @@ fn proceeding_control_is_typed_at_the_actual_asterisk_callback() {
 
 #[test]
 fn native_call_indications_use_one_ordered_rust_queue() {
-    let exports = fs::read_to_string(crate_root().join("src/asterisk/exports.rs")).unwrap();
-    let answer_and_indicate = exports
-        .split_once("fn answer_channel")
-        .expect("answer callback")
-        .1
-        .split_once("fn send_digit_begin_to_channel")
-        .expect("end of indication callbacks")
-        .0;
+    let exports = source("src/asterisk/exports.rs");
+    let answer_and_indicate = rust_region(
+        &exports,
+        "fn answer_channel",
+        "fn send_digit_begin_to_channel",
+    );
     assert!(answer_and_indicate.contains("enqueue_call_signal"));
     assert!(answer_and_indicate.contains("RuntimeCallSignalKind::Proceeding"));
     assert!(!answer_and_indicate.contains(".spawn("));
-    let hangup = exports
-        .split_once("fn hangup_channel")
-        .expect("hangup callback")
-        .1
-        .split_once("fn answer_channel")
-        .expect("end of hangup callback")
-        .0;
+    let hangup = rust_item(&exports, "fn hangup_channel");
     assert!(hangup.contains("RuntimeCallSignalKind::Hangup"));
     assert!(hangup.contains("if !access.enqueue_call_signal"));
     assert!(hangup.contains("handle_runtime_hangup_signal"));
 
-    let management =
-        fs::read_to_string(crate_root().join("src/asterisk/runtime/management.rs")).unwrap();
+    let management = source("src/asterisk/runtime/management.rs");
     assert!(management.contains("Mutex<RuntimeCallSignalQueue>"));
-    let lifecycle =
-        fs::read_to_string(crate_root().join("src/asterisk/runtime/lifecycle.rs")).unwrap();
+    let lifecycle = source("src/asterisk/runtime/lifecycle.rs");
     assert!(lifecycle.contains("checked_add(1)"));
     assert!(lifecycle.contains("queue.sender.send(signal)"));
 
-    let services =
-        fs::read_to_string(crate_root().join("src/asterisk/runtime/services.rs")).unwrap();
+    let services = source("src/asterisk/runtime/services.rs");
     assert!(services.contains("signal.sequence <= last_sequence"));
     assert!(services.contains("HashMap::<PbxCallId, mpsc::UnboundedSender<RuntimeCallSignal>>"));
     assert!(services.contains("handle_runtime_call_signal(&lane_access, signal).await"));
     assert!(services.contains("controller.pbx_progress_with_media_mode"));
 
-    let backend = fs::read_to_string(crate_root().join("src/asterisk/runtime/backend.rs")).unwrap();
-    assert!(backend.contains("PhoneCommandAction::SetCallState"));
-    assert!(backend.contains("PhoneCommandAction::CommitOutboundCall"));
-    assert!(backend.contains("PhoneCommandAction::PresentOutboundRinging"));
+    let backend = source("src/asterisk/runtime/backend.rs");
+    let handset = source("src/asterisk/runtime/backend/handset.rs");
+    assert!(handset.contains("PhoneCommandAction::SetCallState"));
+    assert!(handset.contains("PhoneCommandAction::CommitOutboundCall"));
+    assert!(handset.contains("PhoneCommandAction::PresentOutboundRinging"));
     assert!(backend.contains("PhoneCommandAction::OpenOutboundMedia"));
-    let handset_failure = backend
-        .split_once("EffectExecutionError::Handset { effect, .. } =>")
-        .expect("handset failure handling")
-        .1
-        .split_once("match *effect")
-        .expect("end of handset failure handling")
-        .0;
+    let handset_failure = rust_item(&backend, "fn handle_effect_error");
     assert!(handset_failure.contains("terminate_failed_pbx_call"));
-    let outbound_media = backend
-        .split_once("async fn begin_outbound_media")
-        .expect("coupled outbound media implementation")
-        .1
-        .split_once("fn receive_media_source")
-        .expect("end of coupled outbound media implementation")
-        .0;
+    let outbound_media = rust_item(&backend, "async fn begin_outbound_media");
     let open = outbound_media
         .find("PhoneCommandAction::OpenOutboundMedia")
         .expect("coupled open command");
@@ -550,25 +640,23 @@ fn native_call_indications_use_one_ordered_rust_queue() {
     assert!(open < progress);
     assert!(outbound_media.contains("\"Call Progress\".into()"));
 
-    let terminal_state = backend
-        .split_once("HandsetEffect::SetCallState")
-        .expect("handset state executor")
-        .1
-        .split_once("HandsetEffect::SetMicrophoneMode")
-        .expect("end of handset state executor")
-        .0;
-    assert!(terminal_state.contains("state != PhoneCallState::OnHook"));
-    assert!(terminal_state.contains("PhoneCommandAction::CloseCall"));
+    let handset_executor = rust_item(&handset, "async fn execute_handset_effect");
+    assert!(handset_executor.contains_between(
+        "HandsetEffect::SetCallState",
+        "HandsetEffect::SetMicrophoneMode",
+        "state != PhoneCallState::OnHook",
+    ));
+    assert!(handset_executor.contains_between(
+        "HandsetEffect::SetCallState",
+        "HandsetEffect::SetMicrophoneMode",
+        "PhoneCommandAction::CloseCall",
+    ));
 }
 
 #[test]
 fn unload_keeps_active_calls_subscriptions_and_conferences_in_one_ordered_drain() {
-    let lifecycle =
-        fs::read_to_string(crate_root().join("src/asterisk/runtime/lifecycle.rs")).unwrap();
-    let stop = lifecycle
-        .split_once("fn stop(mut self)")
-        .expect("module stop implementation")
-        .1;
+    let lifecycle = source("src/asterisk/runtime/lifecycle.rs");
+    let stop = rust_item(&lifecycle, "fn stop");
     let ordered = [
         "manager_registrations",
         "http_registrations",
@@ -583,22 +671,13 @@ fn unload_keeps_active_calls_subscriptions_and_conferences_in_one_ordered_drain(
         "self.parking_subscription.unsubscribe()",
         "self.runtime.shutdown_timeout",
     ];
-    let mut offset = 0;
-    for phase in ordered {
-        let relative = stop[offset..]
-            .find(phase)
-            .unwrap_or_else(|| panic!("module unload lost phase {phase}"));
-        offset += relative + phase.len();
-    }
+    assert!(stop.contains_in_order(&ordered));
 
-    let backend = fs::read_to_string(crate_root().join("src/asterisk/runtime/backend.rs")).unwrap();
-    let conference_shutdown = backend
-        .split_once("async fn shutdown_conferences")
-        .expect("conference shutdown implementation")
-        .1;
+    let backend = source("src/asterisk/runtime/backend.rs");
+    let conference_shutdown = rust_item(&backend, "async fn shutdown_conferences");
     for required in [
         "drain_conferences_for_shutdown",
-        "cancel_conference_announcement",
+        "cancel_conference_announcement_locked",
         "execute_cleanup_effects",
         "remaining_bridges",
         "remaining_barge_bridges",
@@ -611,29 +690,21 @@ fn unload_keeps_active_calls_subscriptions_and_conferences_in_one_ordered_drain(
         );
     }
 
-    let presence =
-        fs::read_to_string(crate_root().join("src/asterisk/runtime/presence.rs")).unwrap();
-    let blf_shutdown = presence
-        .split_once("fn uninstall_blf")
-        .expect("BLF shutdown implementation")
-        .1;
+    let presence = source("src/asterisk/runtime/presence.rs");
+    let blf_shutdown = rust_item(&presence, "fn uninstall_blf");
     assert!(blf_shutdown.contains(".clear();"));
 
-    let exports = fs::read_to_string(crate_root().join("src/asterisk/exports.rs")).unwrap();
-    let unload = exports
-        .split_once("fn stop_module")
-        .expect("module unload export")
-        .1;
+    let exports = source("src/asterisk/exports.rs");
+    let unload = rust_item(&exports, "fn stop_module");
     assert!(unload.contains(".take()"));
     assert!(unload.contains("module.stop()"));
 }
 
 #[test]
 fn conference_announcements_are_generated_by_owned_pbx_channels() {
-    let controller = fs::read_to_string(crate_root().join("src/runtime/controller.rs")).unwrap();
-    let backend = fs::read_to_string(crate_root().join("src/asterisk/runtime/backend.rs")).unwrap();
-    let native =
-        fs::read_to_string(crate_root().join("src/asterisk/native/channel/control.rs")).unwrap();
+    let controller = source("src/runtime/controller/domains/conference.rs");
+    let backend = source("src/asterisk/runtime/backend.rs");
+    let native = source("src/asterisk/native/channel/control.rs");
 
     assert!(controller.contains("PbxEffect::ConferenceAnnouncement"));
     assert!(!controller.contains("HandsetEffect::ConferenceAnnouncement"));
@@ -648,9 +719,8 @@ fn conference_announcements_are_generated_by_owned_pbx_channels() {
 
 #[test]
 fn monitor_soft_key_uses_the_owned_recording_transaction() {
-    let calls = fs::read_to_string(crate_root().join("src/asterisk/phone/calls.rs")).unwrap();
-    let services =
-        fs::read_to_string(crate_root().join("src/asterisk/runtime/services.rs")).unwrap();
+    let calls = source("src/asterisk/phone/calls/call_control.rs");
+    let services = source("src/asterisk/runtime/services/recording.rs");
 
     assert!(calls.contains("soft_key: SoftKey::Monitor"));
     assert!(calls.contains("toggle_monitor_recording(access, recordings"));
@@ -660,8 +730,55 @@ fn monitor_soft_key_uses_the_owned_recording_transaction() {
 }
 
 #[test]
+fn phone_events_dispatch_through_bounded_exhaustive_families() {
+    let dispatcher = source("src/asterisk/phone/calls.rs");
+    for family in [
+        "session::handle_session_event",
+        "call_control::handle_call_control_event",
+        "media_events::handle_media_event",
+        "telemetry::handle_telemetry_event",
+    ] {
+        assert!(dispatcher.contains(family), "dispatcher lost {family}");
+    }
+    assert!(dispatcher.contains("fn phone_event_family("));
+    assert!(dispatcher.contains("PhoneDeviceEventKind::Registered(_)"));
+    assert!(dispatcher.contains("PhoneDeviceEventKind::UnhandledMessage { .. }"));
+
+    let session = source("src/asterisk/phone/calls/session.rs");
+    let call_control = source("src/asterisk/phone/calls/call_control.rs");
+    let media = source("src/asterisk/phone/calls/media_events.rs");
+    let telemetry = source("src/asterisk/phone/calls/telemetry.rs");
+    assert!(session.contains("PhoneDeviceEventKind::Registered(registration)"));
+    assert!(call_control.contains("PhoneDeviceEventKind::OffHook"));
+    assert!(media.contains("PhoneDeviceEventKind::ReceiveChannelOpened"));
+    assert!(telemetry.contains("PhoneDeviceEventKind::Alarm"));
+}
+
+#[test]
+fn device_state_publication_and_channel_callback_share_one_mapping() {
+    let system = source("src/asterisk/native/system.rs");
+    let driver = source("src/asterisk/direct/channel_driver.rs");
+    assert!(system.contains("pub const fn device_state_raw("));
+    assert!(system.contains("let mapped = device_state_raw(state)"));
+    assert!(driver.contains("device_state_raw(line_device_state(&line))"));
+    assert!(!driver.contains("AST_DEVICE_NOT_INUSE =>"));
+}
+
+#[test]
+fn recording_callback_owner_precedes_channel_owner_in_actual_session_layout() {
+    let recording = source("src/asterisk/native/recording.rs");
+    let session = rust_item(&recording, "pub struct NativeRecordingSession");
+    let callback = session.find("callback: CallbackOwner").unwrap();
+    let channel = session.find("channel: ChannelRef").unwrap();
+    assert!(callback < channel);
+    let callback_owner = rust_item(&recording, "struct CallbackOwner");
+    assert!(callback_owner.contains("callback: RecordingCallback"));
+    assert!(!callback_owner.contains("Option<RecordingCallback>"));
+}
+
+#[test]
 fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
-    let script = fs::read_to_string(crate_root().join("test-native-lifecycle.sh")).unwrap();
+    let script = source("test-native-lifecycle.sh");
     for required in [
         "module load chan_sccp2.so",
         "module unload chan_sccp2.so",
@@ -683,21 +800,17 @@ fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
     assert!(script.contains("autoload = no"));
     assert!(!script.contains("autoload = yes"));
 
-    let docker = fs::read_to_string(crate_root().join("Dockerfile.linux")).unwrap();
-    assert!(docker.contains("make include/asterisk/buildopts.h"));
-    assert!(!docker.contains("make -j"));
-    assert!(!docker.contains("make install"));
-    assert!(!docker.contains("make basic-pbx"));
-    assert!(!docker.contains("test-native-lifecycle.sh"));
-    assert!(docker.contains("rust_sccp_|sccp_ast_"));
+    let docker = source("Dockerfile");
+    let artifact_source = docker_stage(&docker, "asterisk-source");
+    let artifact_build = docker_stage(&docker, "artifact-build");
+    assert!(artifact_source.contains("make include/asterisk/buildopts.h"));
+    assert!(!artifact_source.contains("make -j"));
+    assert!(!artifact_source.contains("make install"));
+    assert!(!artifact_source.contains("make basic-pbx"));
+    assert!(!artifact_build.contains("test-native-lifecycle.sh"));
+    assert!(artifact_build.contains("rust_sccp_|sccp_ast_"));
 
-    let workflow = fs::read_to_string(
-        crate_root()
-            .parent()
-            .unwrap()
-            .join(".github/workflows/asterisk-module.yml"),
-    )
-    .unwrap();
+    let workflow = workspace_source(".github/workflows/asterisk-module.yml");
     for version in ["22.7.0", "23.4.1"] {
         assert!(workflow.contains(version));
     }
@@ -711,12 +824,12 @@ fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
 
 #[test]
 fn release_artifacts_are_named_for_the_oldest_compatible_abi_baseline() {
-    let script = fs::read_to_string(crate_root().join("build-linux-x86_64.sh")).unwrap();
+    let script = source("build-linux-x86_64.sh");
     assert!(script.contains("asterisk_abi=${asterisk_version%%.*}"));
     assert!(script.contains("chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"));
     assert!(!script.contains("chan_sccp2-asterisk-${asterisk_version}-linux-x86_64.so"));
 
-    let docker = fs::read_to_string(crate_root().join("Dockerfile.linux")).unwrap();
+    let docker = source("Dockerfile");
     assert!(docker.contains("ASTERISK_ARTIFACT_LANE"));
     assert!(docker.contains("artifact_lane=\"${ASTERISK_ARTIFACT_LANE:-"));
     assert!(docker.contains("amd64) artifact_arch=x86_64"));
@@ -724,13 +837,8 @@ fn release_artifacts_are_named_for_the_oldest_compatible_abi_baseline() {
     assert!(docker.contains("chan_sccp2-asterisk-${artifact_lane}-linux-${artifact_arch}.so"));
     assert!(!docker.contains("chan_sccp2-asterisk-${ASTERISK_VERSION}-linux-"));
 
-    let crate_directory = crate_root();
-    let repository = crate_directory.parent().unwrap();
-    let release =
-        fs::read_to_string(repository.join(".github/workflows/asterisk-module.yml")).unwrap();
-    let compatibility =
-        fs::read_to_string(repository.join(".github/workflows/asterisk-distro-compatibility.yml"))
-            .unwrap();
+    let release = workspace_source(".github/workflows/asterisk-module.yml");
+    let compatibility = workspace_source(".github/workflows/asterisk-distro-compatibility.yml");
     for architecture in ["x86_64", "aarch64"] {
         let artifact = format!("chan_sccp2-asterisk-22plus-linux-{architecture}");
         assert!(release.contains(&artifact));
@@ -758,13 +866,13 @@ fn release_artifacts_are_named_for_the_oldest_compatible_abi_baseline() {
     assert!(release.contains("--verify-tag"));
     assert!(!release.contains("release_tag=\"build-${GITHUB_SHA}\""));
 
-    let manifest = fs::read_to_string(crate_root().join("Cargo.toml")).unwrap();
-    assert!(manifest.contains(&format!("version = \"{}\"", env!("CARGO_PKG_VERSION"))));
+    let manifest = source("Cargo.toml");
+    assert!(manifest.contains(format!("version = \"{}\"", env!("CARGO_PKG_VERSION"))));
     assert!(manifest.contains("[package.metadata.release]"));
     assert!(manifest.contains("allow-branch = [\"master\"]"));
     assert!(manifest.contains("tag-name = \"v{{version}}\""));
     assert!(manifest.contains("publish = false"));
 
-    let build = fs::read_to_string(crate_root().join("build.rs")).unwrap();
+    let build = source("build.rs");
     assert!(build.contains("\"x86_64\" | \"aarch64\""));
 }

@@ -231,11 +231,13 @@ impl FrameDecoder {
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, CodecError> {
         self.buffer.extend_from_slice(bytes);
         let mut frames = Vec::new();
+        let mut consumed = 0_usize;
         loop {
-            if self.buffer.len() < HEADER_SIZE {
+            let retained = &self.buffer[consumed..];
+            if retained.len() < HEADER_SIZE {
                 break;
             }
-            let header = WireHeader::read(&mut Cursor::new(&self.buffer[..HEADER_SIZE]))
+            let header = WireHeader::read(&mut Cursor::new(&retained[..HEADER_SIZE]))
                 .map_err(|error| CodecError::wire("decode header for", 0, &error))?;
             let length = header.wire_len;
             if length < 4 {
@@ -246,16 +248,22 @@ impl FrameDecoder {
             if total > MAX_FRAME_SIZE {
                 return Err(CodecError::FrameTooLarge(total));
             }
-            if self.buffer.len() < total {
+            if retained.len() < total {
                 break;
             }
-            let payload = self.buffer[HEADER_SIZE..total].to_vec();
-            self.buffer.drain(..total);
+            let payload = retained[HEADER_SIZE..total].to_vec();
+            consumed += total;
             frames.push(Frame {
                 protocol_version: header.protocol_version,
                 message_id: header.message_id,
                 payload,
             });
+        }
+        // Compact once per input chunk. Draining after every decoded frame
+        // repeatedly shifted the retained coalesced stream and made a chunk
+        // containing many small frames quadratic in its byte length.
+        if consumed != 0 {
+            self.buffer.drain(..consumed);
         }
         debug_assert!(self.buffer.len() < MAX_FRAME_SIZE);
         Ok(frames)
@@ -313,6 +321,23 @@ mod tests {
         );
         assert_eq!(frames[1], frames[3], "duplicate frames changed in transit");
         assert_eq!(frames[0], frames[2], "reordered frames changed in transit");
+    }
+
+    #[test]
+    fn decoder_retains_only_the_incomplete_tail_after_many_frames() {
+        let complete = Frame::new(22, 0x0100, vec![1, 2, 3, 4]).encode().unwrap();
+        let tail = Frame::new(22, 0x0101, vec![5; 32]).encode().unwrap();
+        let split = tail.len() - 7;
+        let mut chunk = complete.repeat(1_000);
+        chunk.extend_from_slice(&tail[..split]);
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(decoder.push(&chunk).unwrap().len(), 1_000);
+        assert_eq!(decoder.buffered_len(), split);
+        let frames = decoder.push(&tail[split..]).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].message_id, 0x0101);
+        assert_eq!(decoder.buffered_len(), 0);
     }
 
     #[test]

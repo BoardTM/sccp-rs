@@ -51,7 +51,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: asterisk-module/realtime/Dockerfile
+          file: asterisk-module/Dockerfile
+          target: realtime-test
           cache-from: type=gha,scope=asterisk-ci-22.7.0
           cache-to: type=gha,mode=max,scope=asterisk-ci-22.7.0
           pull: true
@@ -172,8 +173,9 @@ jobs:
             --build-arg "ASTERISK_ARTIFACT_LANE=${{ matrix.abi }}" \
             --cache-from "type=gha,scope=asterisk-arm64-${{ matrix.abi }}" \
             --cache-to "type=gha,mode=max,scope=asterisk-arm64-${{ matrix.abi }}" \
+            --target artifact \
             --output type=local,dest=dist \
-            --file asterisk-module/Dockerfile.linux \
+            --file asterisk-module/Dockerfile \
             .
 
       - uses: actions/upload-artifact@v4

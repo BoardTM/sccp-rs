@@ -8,6 +8,7 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
+use crate::asterisk::boundary::{CondvarExt as _, MutexExt as _};
 use crate::asterisk::sys;
 use crate::http::{
     HttpField, HttpFramingError, HttpLimits, HttpMethod, HttpMethodSet, HttpRequest, HttpResponse,
@@ -113,10 +114,7 @@ impl HttpRouteGate {
 
     fn leave(&self) {
         if self.readers.fetch_sub(1, Ordering::SeqCst) == 1 && self.closing.load(Ordering::SeqCst) {
-            let _guard = self
-                .wait_lock
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let _guard = self.wait_lock.lock_unpoisoned();
             self.wait.notify_all();
         }
     }
@@ -125,15 +123,9 @@ impl HttpRouteGate {
         if self.closing.swap(true, Ordering::SeqCst) {
             return false;
         }
-        let mut guard = self
-            .wait_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut guard = self.wait_lock.lock_unpoisoned();
         while self.readers.load(Ordering::SeqCst) != 0 {
-            guard = self
-                .wait
-                .wait(guard)
-                .unwrap_or_else(|error| error.into_inner());
+            guard = self.wait.wait_unpoisoned(guard);
         }
         true
     }

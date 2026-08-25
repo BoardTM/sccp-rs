@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+module_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$module_dir/test-support/asterisk-sandbox.sh"
+
 WARMUP_CYCLES=${SCCP_LIFECYCLE_WARMUP_CYCLES:-4}
 BATCH_CYCLES=${SCCP_LIFECYCLE_BATCH_CYCLES:-12}
 RSS_TOLERANCE_KB=${SCCP_LIFECYCLE_RSS_TOLERANCE_KB:-1024}
@@ -50,80 +53,39 @@ if ! command -v "$asterisk_bin" >/dev/null 2>&1; then
 	exit 2
 fi
 
-test_root=$(mktemp -d /tmp/chan-sccp2-lifecycle.XXXXXX)
+test_root=
 asterisk_pid=
-diagnostics="$test_root/lifecycle.tsv"
-asterisk_log="$test_root/asterisk.log"
-cli_log="$test_root/cli.log"
+diagnostics=
+asterisk_log=
+cli_log=
 
 finish() {
 	status=$1
 	trap - EXIT HUP INT TERM
-	if [ -n "$asterisk_pid" ] && kill -0 "$asterisk_pid" 2>/dev/null; then
-		kill "$asterisk_pid" 2>/dev/null || true
-		wait "$asterisk_pid" 2>/dev/null || true
-	fi
+	sccp_sandbox_stop
 	if [ "$status" -ne 0 ]; then
-		printf '\nNative lifecycle diagnostics:\n' >&2
-		if [ -f "$diagnostics" ]; then
-			cat "$diagnostics" >&2
-		fi
-		printf '\nAsterisk CLI transcript:\n' >&2
-		if [ -f "$cli_log" ]; then
-			cat "$cli_log" >&2
-		fi
-		printf '\nAsterisk log:\n' >&2
-		if [ -f "$asterisk_log" ]; then
-			cat "$asterisk_log" >&2
-		fi
+		sccp_sandbox_diagnostics "$diagnostics" "$cli_log" "$asterisk_log"
 	fi
-	rm -rf "$test_root"
+	sccp_sandbox_cleanup
 	exit "$status"
 }
 trap 'finish $?' EXIT
 trap 'exit 130' HUP INT TERM
 
-mkdir -p \
-	"$test_root/etc" \
-	"$test_root/modules" \
-	"$test_root/var/lib" \
-	"$test_root/var/lib/moh" \
-	"$test_root/var/db" \
-	"$test_root/var/key" \
-	"$test_root/var/spool" \
-	"$test_root/var/run" \
-	"$test_root/var/log"
+sccp_sandbox_create chan-sccp2-lifecycle "$module_path" \
+	"$native_module_dir" "$native_data_dir"
+test_root=$SCCP_SANDBOX_ROOT
+asterisk_pid=$SCCP_SANDBOX_PID
+diagnostics="$test_root/lifecycle.tsv"
+asterisk_log="$test_root/asterisk.log"
+cli_log="$test_root/cli.log"
+
+mkdir -p "$test_root/var/lib/moh"
 
 if [ -d /etc/asterisk ]; then
 	cp -R /etc/asterisk/. "$test_root/etc/"
 fi
-for installed_module in "$native_module_dir"/*.so; do
-	if [ -f "$installed_module" ]; then
-		ln -s "$installed_module" "$test_root/modules/$(basename "$installed_module")"
-	fi
-done
-cp "$module_path" "$test_root/modules/chan_sccp2.so"
-
-cat >"$test_root/etc/asterisk.conf" <<EOF
-[directories]
-astetcdir => $test_root/etc
-astmoddir => $test_root/modules
-astvarlibdir => $test_root/var/lib
-astdbdir => $test_root/var/db
-astkeydir => $test_root/var/key
-astdatadir => $native_data_dir
-astagidir => $test_root/var/lib/agi-bin
-astspooldir => $test_root/var/spool
-astrundir => $test_root/var/run
-astlogdir => $test_root/var/log
-astsbindir => /usr/sbin
-
-[options]
-verbose = 0
-debug = 0
-nocolor = yes
-documentation_language = en_US
-EOF
+sccp_sandbox_write_config "$native_data_dir"
 
 cat >"$test_root/etc/modules.conf" <<'EOF'
 [modules]
@@ -175,13 +137,11 @@ label = Lifecycle
 context = default
 EOF
 
-SCCP_CONFIG="$test_root/etc/sccp.conf" \
-	"$asterisk_bin" -C "$test_root/etc/asterisk.conf" -f -g -q \
-	>"$asterisk_log" 2>&1 &
-asterisk_pid=$!
+sccp_sandbox_start "$asterisk_bin" "$test_root/etc/sccp.conf" "$asterisk_log"
+asterisk_pid=$SCCP_SANDBOX_PID
 
 cli() {
-	"$asterisk_bin" -C "$test_root/etc/asterisk.conf" -rx "$1"
+	sccp_sandbox_cli "$asterisk_bin" "$1"
 }
 
 capture_cli() {
@@ -195,22 +155,13 @@ capture_cli() {
 	fi
 }
 
-ready=0
-attempt=0
-while [ "$attempt" -lt 100 ]; do
-	if ! kill -0 "$asterisk_pid" 2>/dev/null; then
-		printf 'Asterisk exited during startup\n' >&2
-		exit 1
+if ! sccp_sandbox_wait_ready "$asterisk_bin"; then
+	if [ "$SCCP_SANDBOX_READY_FAILURE" = exited ]; then
+		printf 'Asterisk exited during startup (status %s)\n' \
+			"$SCCP_SANDBOX_EXIT_STATUS" >&2
+	else
+		printf 'Asterisk did not become ready within 10 seconds\n' >&2
 	fi
-	if cli 'core show uptime' >/dev/null 2>&1; then
-		ready=1
-		break
-	fi
-	attempt=$((attempt + 1))
-	sleep 0.1
-done
-if [ "$ready" -ne 1 ]; then
-	printf 'Asterisk did not become ready within 10 seconds\n' >&2
 	exit 1
 fi
 
@@ -359,6 +310,7 @@ fi
 cli 'core stop now' >/dev/null
 wait "$asterisk_pid"
 asterisk_pid=
+SCCP_SANDBOX_PID=
 printf 'Native lifecycle gate passed: %s warmup + %s measured load/unload cycles\n' \
 	"$WARMUP_CYCLES" "$((BATCH_CYCLES * 3))"
 if [ "$LIVE_BRIDGES" -eq 1 ]; then

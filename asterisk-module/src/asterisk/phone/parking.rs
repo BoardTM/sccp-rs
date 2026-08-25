@@ -1,6 +1,15 @@
 //! Handset pickup, parking, and retrieval interactions.
 
-use super::*;
+use super::{
+    Access, CallDirection, CallId, CallInfo, CallState, DeviceId, Instant, LineInstance,
+    MutexExt as _, PARKING_CONFIRM_TIMEOUT, PARKING_MENU_MAX_ITEMS, PARKING_NOTIFICATION_TIME,
+    ParkedCall, ParkingEvent, ParkingEventKind, ParkingMenuEntry, ParkingRejection,
+    ParkingRetrievalBehavior, PbxAudioFormat, PendingPark, PendingParkingNotification,
+    PendingRetrieval, PhoneCommand, PhoneCommandAction, PickupRejection, ServiceProviderError,
+    TransactionId, controller_step, execute_cleanup_effects, execute_effects,
+    execute_service_effects, handset_call_id_from_channel, parking_service_error, preferred_codec,
+    send_confirmed_service,
+};
 
 pub(super) async fn handle_pickup_soft_key(
     access: &Access,
@@ -236,17 +245,7 @@ pub(super) async fn show_parking_menu(
     lot: &str,
     calls: &[ParkedCall],
 ) {
-    let calls = calls
-        .iter()
-        .take(PARKING_MENU_MAX_ITEMS)
-        .map(|call| ParkingMenuEntry {
-            slot: call.slot,
-            caller_name: call.caller_name.clone(),
-            caller_number: call.caller_number.clone(),
-            connected_name: call.connected_name.clone(),
-            connected_number: call.connected_number.clone(),
-        })
-        .collect();
+    let calls = parking_menu_entries(calls);
     let _ = access
         .phone
         .send(PhoneCommand::new(
@@ -259,6 +258,35 @@ pub(super) async fn show_parking_menu(
             },
         ))
         .await;
+}
+
+fn parking_menu_entries(calls: &[ParkedCall]) -> Vec<ParkingMenuEntry> {
+    calls
+        .iter()
+        .take(PARKING_MENU_MAX_ITEMS)
+        .map(|call| ParkingMenuEntry {
+            slot: call.slot,
+            caller_name: call.caller_name.clone(),
+            caller_number: call.caller_number.clone(),
+            connected_name: call.connected_name.clone(),
+            connected_number: call.connected_number.clone(),
+        })
+        .collect()
+}
+
+fn parking_retrieval_call_info(call: ParkedCall) -> CallInfo {
+    CallInfo {
+        direction: CallDirection::Inbound,
+        calling_name: call.caller_name,
+        calling_number: call.caller_number,
+        called_name: if call.connected_name.is_empty() {
+            format!("Parked call {}", call.slot)
+        } else {
+            call.connected_name
+        },
+        called_number: call.slot.to_string(),
+        ..CallInfo::default()
+    }
 }
 
 pub async fn begin_parking_retrieval(
@@ -326,18 +354,7 @@ pub async fn begin_parking_retrieval(
             .release_claim(&lot, slot, call_id);
         return Err(ServiceProviderError::Delivery);
     }
-    let info = CallInfo {
-        direction: CallDirection::Inbound,
-        calling_name: call.caller_name,
-        calling_number: call.caller_number,
-        called_name: if call.connected_name.is_empty() {
-            format!("Parked call {slot}")
-        } else {
-            call.connected_name
-        },
-        called_number: slot.to_string(),
-        ..CallInfo::default()
-    };
+    let info = parking_retrieval_call_info(call);
     let result = controller_step(&access.shared.controller, |controller| {
         let effects = controller.begin_parking_retrieval(
             call_id,
@@ -603,5 +620,44 @@ pub async fn expire_parking_attempts(access: &Access, now: Instant) {
                 },
             ))
             .await;
+    }
+}
+
+#[cfg(test)]
+mod parking_projection_tests {
+    use super::*;
+
+    fn parked(caller_name: &str, caller_number: &str, connected_name: &str) -> ParkedCall {
+        ParkedCall {
+            lot: "default".into(),
+            slot: 701,
+            timeout_seconds: 30,
+            duration_seconds: 2,
+            parker_dial_string: String::new(),
+            parkee_channel: "SCCP/1001".into(),
+            parkee_unique_id: "id".into(),
+            caller_name: caller_name.into(),
+            caller_number: caller_number.into(),
+            connected_name: connected_name.into(),
+            connected_number: String::new(),
+        }
+    }
+
+    #[test]
+    fn parking_ui_projection_preserves_redaction() {
+        let entries = parking_menu_entries(&[parked("", "", "")]);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].caller_name.is_empty());
+        assert!(entries[0].caller_number.is_empty());
+        assert!(entries[0].connected_name.is_empty());
+        assert!(entries[0].connected_number.is_empty());
+    }
+
+    #[test]
+    fn retrieval_projection_never_reconstructs_redacted_identity() {
+        let info = parking_retrieval_call_info(parked("", "", ""));
+        assert!(info.calling_name.is_empty());
+        assert!(info.calling_number.is_empty());
+        assert_eq!(info.called_name, "Parked call 701");
     }
 }

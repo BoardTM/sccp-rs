@@ -1,25 +1,15 @@
-use std::fs;
-use std::path::PathBuf;
-
-fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
+mod support;
+use support::{source, workspace_source};
 
 #[test]
 fn live_bridge_gate_is_feature_scoped_and_separate_from_artifact_builds() {
-    let manifest = fs::read_to_string(root().join("Cargo.toml")).unwrap();
-    let module = fs::read_to_string(root().join("src/asterisk/mod.rs")).unwrap();
-    let native = fs::read_to_string(root().join("src/asterisk/native/mod.rs")).unwrap();
-    let driver = fs::read_to_string(root().join("src/asterisk/direct/channel_driver.rs")).unwrap();
-    let artifact = fs::read_to_string(root().join("build-linux-x86_64.sh")).unwrap();
-    let live = fs::read_to_string(root().join("live-tests/test-bridges.sh")).unwrap();
-    let workflow = fs::read_to_string(
-        root()
-            .parent()
-            .unwrap()
-            .join(".github/workflows/asterisk-live-bridges.yml"),
-    )
-    .unwrap();
+    let manifest = source("Cargo.toml");
+    let module = source("src/asterisk/mod.rs");
+    let native = source("src/asterisk/native/mod.rs");
+    let driver = source("src/asterisk/direct/cli.rs");
+    let artifact = source("build-linux-x86_64.sh");
+    let live = source("live-tests/test-bridges.sh");
+    let workflow = workspace_source(".github/workflows/asterisk-live-bridges.yml");
 
     assert!(manifest.contains("live-asterisk-tests = []"));
     assert!(module.contains("mod raw;"));
@@ -31,14 +21,14 @@ fn live_bridge_gate_is_feature_scoped_and_separate_from_artifact_builds() {
     assert!(!artifact.contains("test-bridges.sh"));
     assert!(workflow.contains("22.7.0"));
     assert!(workflow.contains("23.4.1"));
-    assert!(workflow.contains("live-tests/Dockerfile"));
+    assert!(workflow.contains("asterisk-module/Dockerfile"));
+    assert!(workflow.contains("target: bridge-test"));
 }
 
 #[test]
 fn live_bridge_gate_uses_real_owned_native_boundaries() {
-    let harness = fs::read_to_string(root().join("live-tests/bridge.rs")).unwrap();
-    let bridge =
-        fs::read_to_string(root().join("src/asterisk/native/bridge/conference.rs")).unwrap();
+    let harness = source("live-tests/bridge.rs");
+    let bridge = source("src/asterisk/native/bridge/conference.rs");
 
     for required in [
         "__ast_channel_alloc(",

@@ -1,19 +1,8 @@
-use std::fs;
-use std::path::PathBuf;
+mod support;
+use support::{SourceContract, rust_region, source};
 
-fn source(relative: &str) -> String {
-    fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
-        .unwrap_or_else(|error| panic!("unable to read {relative}: {error}"))
-}
-
-fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    source
-        .split_once(start)
-        .unwrap_or_else(|| panic!("missing {start:?}"))
-        .1
-        .split_once(end)
-        .unwrap_or_else(|| panic!("missing {end:?}"))
-        .0
+fn between(source: &str, start: &str, end: &str) -> SourceContract {
+    rust_region(source, start, end)
 }
 
 #[test]
@@ -48,7 +37,7 @@ fn targeted_reload_guards_one_complete_candidate_before_the_shared_transaction()
 
 #[test]
 fn targeted_reload_cli_keeps_native_work_bounded_and_rust_owned() {
-    let driver = source("src/asterisk/direct/channel_driver.rs");
+    let driver = source("src/asterisk/direct/cli.rs");
     let exports = source("src/asterisk/exports.rs");
     let adapter = between(&driver, "struct CliArgs<'a>", "fn cli_completion(");
     let callback = between(
@@ -81,7 +70,7 @@ fn targeted_reload_cli_keeps_native_work_bounded_and_rust_owned() {
 
 #[test]
 fn cli_argument_pointer_work_is_confined_to_the_lifetime_bound_adapter() {
-    let driver = source("src/asterisk/direct/channel_driver.rs");
+    let driver = source("src/asterisk/direct/cli.rs");
     let adapter = between(&driver, "struct CliArgs<'a>", "fn cli_completion(");
     let handlers = between(&driver, "unsafe fn run_reload_cli(", "fn cli_entry(");
 

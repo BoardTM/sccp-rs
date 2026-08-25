@@ -16,15 +16,14 @@ use std::collections::BTreeMap;
 #[cfg(any(test, feature = "asterisk-22", feature = "asterisk-23"))]
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Arc;
 
 use sccp_protocol::DeviceId;
 use thiserror::Error;
 
 use crate::ami::controls::MAX_DEVICE_SELECTOR_BYTES;
 use crate::ami::manager::{
-    ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege, ManagerRequest,
-    ManagerResponse, RequestFields, RequestFieldsError,
+    ActionDefinition, ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege,
+    ManagerRequest, ManagerResponse, RequestFields, register_action_group,
 };
 use crate::call::forwarding::ForwardingDestination;
 pub use crate::call::forwarding::ForwardingKind;
@@ -233,25 +232,38 @@ impl FeatureAction {
     }
 }
 
+impl<P: FeatureControlProvider> ActionDefinition<P> for FeatureAction {
+    fn name(self) -> &'static str {
+        self.name()
+    }
+
+    fn synopsis(self) -> &'static str {
+        self.synopsis()
+    }
+
+    fn description(self) -> &'static str {
+        self.description()
+    }
+
+    fn privileges(self) -> ManagerPrivilege {
+        ACTION_PRIVILEGES
+    }
+
+    fn limits(self) -> ManagerLimits {
+        ACTION_LIMITS
+    }
+
+    fn handle(self, provider: &P, request: ManagerRequest) -> ManagerResponse {
+        handle_feature_control_request(provider, request)
+    }
+}
+
 /// Register both mutable-feature actions as one RAII-owned lifecycle group.
 pub fn register_feature_control_actions<P: FeatureControlProvider, M: ManagerBackend>(
     provider: P,
     manager: M,
 ) -> Result<Vec<M::Registration>, ManagerError> {
-    let provider = Arc::new(provider);
-    let mut registrations = Vec::with_capacity(FeatureAction::ALL.len());
-    for action in FeatureAction::ALL {
-        let provider = Arc::clone(&provider);
-        registrations.push(manager.register_action(
-            action.name(),
-            ACTION_PRIVILEGES,
-            action.synopsis(),
-            action.description(),
-            ACTION_LIMITS,
-            move |request| handle_feature_control_request(provider.as_ref(), request),
-        )?);
-    }
-    Ok(registrations)
+    register_action_group(provider, manager, &FeatureAction::ALL)
 }
 
 pub fn handle_feature_control_request<P: FeatureControlProvider + ?Sized>(
@@ -310,6 +322,8 @@ enum FeatureActionError {
     #[error(transparent)]
     Provider(#[from] FeatureControlProviderError),
 }
+
+crate::ami::manager::impl_request_fields_error!(FeatureActionError);
 
 impl FeatureActionError {
     const fn response_message(self) -> &'static str {
@@ -405,12 +419,7 @@ fn parse_fields(
 ) -> Result<BTreeMap<String, String>, FeatureActionError> {
     RequestFields::new(request)
         .collect(allowed, &[])
-        .map_err(|error| match error {
-            RequestFieldsError::Sensitive => FeatureActionError::SensitiveField,
-            RequestFieldsError::Duplicate => FeatureActionError::DuplicateField,
-            RequestFieldsError::Unknown => FeatureActionError::UnknownField,
-            RequestFieldsError::ActionMismatch => FeatureActionError::UnknownAction,
-        })
+        .map_err(Into::into)
 }
 
 fn required<'a>(
@@ -939,5 +948,11 @@ mod tests {
             ),
             Err(ManagerError::Unavailable)
         ));
+        let manager = crate::ami::manager::RollbackManager::fail_on(1);
+        assert!(matches!(
+            register_feature_control_actions(FakeProvider::default(), manager.clone()),
+            Err(ManagerError::RegistrationFailed)
+        ));
+        manager.assert_partial_rollback(2, 1);
     }
 }

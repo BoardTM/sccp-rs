@@ -10,6 +10,7 @@ pub mod http;
 #[path = "../../../live-tests/bridge.rs"]
 mod live_bridge_tests;
 pub mod manager;
+mod ownership;
 pub mod presence;
 pub mod realtime;
 pub mod recording;

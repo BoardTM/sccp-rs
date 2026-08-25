@@ -3,62 +3,115 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Clone, Copy)]
+struct FeatureLane {
+    major: u32,
+}
+
+impl FeatureLane {
+    fn selected() -> Option<Self> {
+        let lane_22 = env::var_os("CARGO_FEATURE_ASTERISK_22").is_some();
+        let lane_23 = env::var_os("CARGO_FEATURE_ASTERISK_23").is_some();
+        if !lane_22 && !lane_23 {
+            return None;
+        }
+        assert_ne!(
+            lane_22, lane_23,
+            "select exactly one of the asterisk-22 or asterisk-23 features"
+        );
+        Some(Self {
+            major: if lane_22 { 22 } else { 23 },
+        })
+    }
+}
+
+struct BuildPaths {
+    source: PathBuf,
+    build: PathBuf,
+}
+
+impl BuildPaths {
+    fn discover() -> Self {
+        let crate_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+        let source = absolute(
+            env::var_os("ASTERISK_SOURCE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| crate_dir.join("asterisk")),
+        );
+        let build = absolute(
+            env::var_os("ASTERISK_BUILD_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| source.clone()),
+        );
+        Self { source, build }
+    }
+
+    fn validate(&self) {
+        require_file(
+            &self.build.join("include/asterisk.h"),
+            "ASTERISK_BUILD_DIR must point at a configured Asterisk build tree",
+        );
+        require_file(
+            &self.build.join("include/asterisk/autoconfig.h"),
+            "run Asterisk ./configure before building the SCCP module",
+        );
+        require_file(
+            &self.build.join("include/asterisk/buildopts.h"),
+            "generate Asterisk build headers before building the SCCP module",
+        );
+        require_file(
+            &self.source.join("include/asterisk/channel.h"),
+            "ASTERISK_SOURCE_DIR must point at an Asterisk source tree",
+        );
+    }
+
+    fn include_dirs(&self) -> [PathBuf; 2] {
+        [self.build.join("include"), self.source.join("include")]
+    }
+}
+
 fn main() {
+    emit_rerun_contract();
+
+    let Some(lane) = FeatureLane::selected() else {
+        return;
+    };
+    let target_os = validate_target();
+    let paths = BuildPaths::discover();
+    paths.validate();
+    let version = validate_version(&paths.source, lane);
+    emit_build_identity(&paths.build, &version, lane);
+    generate_bindings(&paths);
+
+    // Cargo always prefixes Unix cdylibs with `lib`; packaging installs the
+    // resulting ELF object as chan_sccp2.so. The soname records that load name.
+    if target_os == "linux" {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,chan_sccp2.so");
+    }
+}
+
+fn emit_rerun_contract() {
     println!("cargo:rerun-if-env-changed=ASTERISK_SOURCE_DIR");
     println!("cargo:rerun-if-env-changed=ASTERISK_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=ASTERISK_VERSION");
     println!("cargo:rerun-if-env-changed=SCCP_ALLOW_UNSUPPORTED_TARGET");
+}
 
-    let lane_22 = env::var_os("CARGO_FEATURE_ASTERISK_22").is_some();
-    let lane_23 = env::var_os("CARGO_FEATURE_ASTERISK_23").is_some();
-    if !lane_22 && !lane_23 {
-        return;
-    }
-    if lane_22 == lane_23 {
-        panic!("select exactly one of the asterisk-22 or asterisk-23 features");
-    }
-
+fn validate_target() -> String {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    if (target_os != "linux" || !matches!(target_arch.as_str(), "x86_64" | "aarch64"))
-        && env::var_os("SCCP_ALLOW_UNSUPPORTED_TARGET").is_none()
-    {
-        panic!(
-            "supported module targets are Linux x86_64 and aarch64, got {target_os} {target_arch}"
-        );
-    }
+    let supported = target_os == "linux" && matches!(target_arch.as_str(), "x86_64" | "aarch64");
+    assert!(
+        supported || env::var_os("SCCP_ALLOW_UNSUPPORTED_TARGET").is_some(),
+        "supported module targets are Linux x86_64 and aarch64, got {target_os} {target_arch}"
+    );
+    target_os
+}
 
-    let crate_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let source_dir = absolute(
-        env::var_os("ASTERISK_SOURCE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| crate_dir.join("asterisk")),
-    );
-    let build_dir = absolute(
-        env::var_os("ASTERISK_BUILD_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| source_dir.clone()),
-    );
-    require_file(
-        &build_dir.join("include/asterisk.h"),
-        "ASTERISK_BUILD_DIR must point at a configured Asterisk build tree",
-    );
-    require_file(
-        &build_dir.join("include/asterisk/autoconfig.h"),
-        "run Asterisk ./configure before building the SCCP module",
-    );
-    require_file(
-        &build_dir.join("include/asterisk/buildopts.h"),
-        "generate Asterisk build headers before building the SCCP module",
-    );
-    require_file(
-        &source_dir.join("include/asterisk/channel.h"),
-        "ASTERISK_SOURCE_DIR must point at an Asterisk source tree",
-    );
-
+fn validate_version(source_dir: &Path, lane: FeatureLane) -> String {
     let version = env::var("ASTERISK_VERSION")
         .ok()
-        .or_else(|| detect_version(&source_dir))
+        .or_else(|| detect_version(source_dir))
         .unwrap_or_else(|| {
             panic!(
                 "unable to determine the Asterisk version; set ASTERISK_VERSION to the exact release"
@@ -66,23 +119,29 @@ fn main() {
         });
     let major = numeric_major(&version)
         .unwrap_or_else(|| panic!("unable to extract an Asterisk major version from {version:?}"));
-    let expected = if lane_22 { 22 } else { 23 };
-    if major != expected {
-        panic!("selected asterisk-{expected}, but ASTERISK_SOURCE_DIR reports Asterisk {version}");
-    }
+    assert_eq!(
+        major, lane.major,
+        "selected asterisk-{}, but ASTERISK_SOURCE_DIR reports Asterisk {version}",
+        lane.major
+    );
+    version
+}
 
+fn emit_build_identity(build_dir: &Path, version: &str, lane: FeatureLane) {
     let buildopts = fs::read_to_string(build_dir.join("include/asterisk/buildopts.h"))
         .ok()
         .and_then(|contents| quoted_define(&contents, "AST_BUILDOPT_SUM"))
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=SCCP_ASTERISK_VERSION={version}");
     println!("cargo:rustc-env=SCCP_ASTERISK_BUILDOPT_SUM={buildopts}");
-    println!("cargo:rustc-env=SCCP_ASTERISK_LANE={expected}");
+    println!("cargo:rustc-env=SCCP_ASTERISK_LANE={}", lane.major);
+}
 
+fn generate_bindings(paths: &BuildPaths) {
     // Keep Asterisk's namespace rooted at `include`. Adding
     // `include/asterisk` itself would make its `features.h` shadow glibc's
     // system header of the same name on Linux.
-    let include_dirs = [build_dir.join("include"), source_dir.join("include")];
+    let include_dirs = paths.include_dirs();
 
     // Generate the sole native ABI surface from the exact configured Asterisk
     // headers. Repository-owned records and callbacks are implemented in
@@ -173,12 +232,6 @@ fn main() {
         .unwrap_or_else(|error| panic!("unable to generate direct Asterisk ABI bindings: {error}"))
         .write_to_file(output_dir.join("asterisk_sys.rs"))
         .expect("unable to write direct Asterisk ABI bindings");
-
-    // Cargo always prefixes Unix cdylibs with `lib`; packaging installs the
-    // resulting ELF object as chan_sccp2.so. The soname records that load name.
-    if target_os == "linux" {
-        println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,chan_sccp2.so");
-    }
 }
 
 fn absolute(path: PathBuf) -> PathBuf {
@@ -190,9 +243,7 @@ fn absolute(path: PathBuf) -> PathBuf {
 }
 
 fn require_file(path: &Path, help: &str) {
-    if !path.is_file() {
-        panic!("{} is missing: {help}", path.display());
-    }
+    assert!(path.is_file(), "{} is missing: {help}", path.display());
 }
 
 fn detect_version(source_dir: &Path) -> Option<String> {

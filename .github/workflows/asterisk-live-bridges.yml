@@ -56,7 +56,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: asterisk-module/live-tests/Dockerfile
+          file: asterisk-module/Dockerfile
+          target: bridge-test
           build-args: |
             ASTERISK_VERSION=${{ matrix.asterisk }}
             ASTERISK_FEATURE=${{ matrix.feature }}

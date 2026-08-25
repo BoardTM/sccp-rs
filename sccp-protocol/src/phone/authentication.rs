@@ -24,77 +24,55 @@ pub const PHONE_AUTHENTICATION_MAX_RESPONSE_BYTES: usize = 256;
 const AUTHORIZED: &[u8] = b"AUTHORIZED";
 const UNAUTHORIZED: &[u8] = b"UN-AUTHORIZED";
 
-/// User identifier forwarded by the phone to its authentication service.
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct PhoneAuthenticationUserId(String);
+macro_rules! redacted_authentication_value {
+    ($(#[$meta:meta])* $name:ident, $kind:literal, $maximum:expr) => {
+        $(#[$meta])*
+        #[derive(Clone, Eq, Hash, PartialEq)]
+        pub struct $name(String);
 
-impl PhoneAuthenticationUserId {
-    /// Validates and wraps an identifier without exposing it through diagnostics.
-    pub fn new(value: impl Into<String>) -> Result<Self, PhoneAuthenticationError> {
-        let value = value.into();
-        validate_credential(
-            "authentication user identifier",
-            &value,
-            PHONE_AUTHENTICATION_MAX_USER_ID_BYTES,
-        )?;
-        Ok(Self(value))
-    }
+        impl $name {
+            /// Validates and wraps a credential without exposing it through diagnostics.
+            pub fn new(value: impl Into<String>) -> Result<Self, PhoneAuthenticationError> {
+                let value = value.into();
+                validate_credential($kind, &value, $maximum)?;
+                Ok(Self(value))
+            }
 
-    /// Exposes the credential only to an authentication policy implementation.
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
+            /// Exposes the credential only to an authentication policy implementation.
+            pub fn expose_secret(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(concat!(stringify!($name), "(<redacted>)"))
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = PhoneAuthenticationError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+    };
 }
 
-impl fmt::Debug for PhoneAuthenticationUserId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("PhoneAuthenticationUserId(<redacted>)")
-    }
-}
+redacted_authentication_value!(
+    /// User identifier forwarded by the phone to its authentication service.
+    PhoneAuthenticationUserId,
+    "authentication user identifier",
+    PHONE_AUTHENTICATION_MAX_USER_ID_BYTES
+);
 
-impl TryFrom<String> for PhoneAuthenticationUserId {
-    type Error = PhoneAuthenticationError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-/// Password forwarded by the phone to its authentication service.
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct PhoneAuthenticationPassword(String);
-
-impl PhoneAuthenticationPassword {
-    /// Validates and wraps a password without exposing it through diagnostics.
-    pub fn new(value: impl Into<String>) -> Result<Self, PhoneAuthenticationError> {
-        let value = value.into();
-        validate_credential(
-            "authentication password",
-            &value,
-            PHONE_AUTHENTICATION_MAX_PASSWORD_BYTES,
-        )?;
-        Ok(Self(value))
-    }
-
-    /// Exposes the credential only to an authentication policy implementation.
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for PhoneAuthenticationPassword {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("PhoneAuthenticationPassword(<redacted>)")
-    }
-}
-
-impl TryFrom<String> for PhoneAuthenticationPassword {
-    type Error = PhoneAuthenticationError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
+redacted_authentication_value!(
+    /// Password forwarded by the phone to its authentication service.
+    PhoneAuthenticationPassword,
+    "authentication password",
+    PHONE_AUTHENTICATION_MAX_PASSWORD_BYTES
+);
 
 /// The three fields supplied to the configured phone authentication URL.
 ///

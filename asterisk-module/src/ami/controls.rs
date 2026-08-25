@@ -18,14 +18,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 
 use sccp_protocol::{CallId, DeviceId};
 use thiserror::Error;
 
 use crate::ami::manager::{
-    ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege, ManagerRequest,
-    ManagerResponse, RequestFields, RequestFieldsError,
+    ActionDefinition, ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege,
+    ManagerRequest, ManagerResponse, RequestFields, register_action_group,
 };
 
 pub const MESSAGE_DEVICES_ACTION: &str = "SCCPMessageDevices";
@@ -484,25 +483,38 @@ impl ControlAction {
     }
 }
 
+impl<P: ControlProvider> ActionDefinition<P> for ControlAction {
+    fn name(self) -> &'static str {
+        self.name()
+    }
+
+    fn synopsis(self) -> &'static str {
+        self.synopsis()
+    }
+
+    fn description(self) -> &'static str {
+        self.description()
+    }
+
+    fn privileges(self) -> ManagerPrivilege {
+        ACTION_PRIVILEGES
+    }
+
+    fn limits(self) -> ManagerLimits {
+        ACTION_LIMITS
+    }
+
+    fn handle(self, provider: &P, request: ManagerRequest) -> ManagerResponse {
+        handle_control_request(provider, request)
+    }
+}
+
 /// Register every call-control action as one RAII-owned lifecycle group.
 pub fn register_control_actions<P: ControlProvider, M: ManagerBackend>(
     provider: P,
     manager: M,
 ) -> Result<Vec<M::Registration>, ManagerError> {
-    let provider = Arc::new(provider);
-    let mut registrations = Vec::with_capacity(ControlAction::ALL.len());
-    for action in ControlAction::ALL {
-        let provider = Arc::clone(&provider);
-        registrations.push(manager.register_action(
-            action.name(),
-            ACTION_PRIVILEGES,
-            action.synopsis(),
-            action.description(),
-            ACTION_LIMITS,
-            move |request| handle_control_request(provider.as_ref(), request),
-        )?);
-    }
-    Ok(registrations)
+    register_action_group(provider, manager, &ControlAction::ALL)
 }
 
 pub fn handle_control_request<P: ControlProvider + ?Sized>(
@@ -553,6 +565,8 @@ enum ControlActionError {
     #[error(transparent)]
     Provider(#[from] ControlProviderError),
 }
+
+crate::ami::manager::impl_request_fields_error!(ControlActionError);
 
 impl ControlActionError {
     const fn response_message(self) -> &'static str {
@@ -701,12 +715,7 @@ fn parse_fields(
 ) -> Result<BTreeMap<String, String>, ControlActionError> {
     RequestFields::new(request)
         .collect(allowed, &[])
-        .map_err(|error| match error {
-            RequestFieldsError::Sensitive => ControlActionError::SensitiveField,
-            RequestFieldsError::Duplicate => ControlActionError::DuplicateField,
-            RequestFieldsError::Unknown => ControlActionError::UnknownField,
-            RequestFieldsError::ActionMismatch => ControlActionError::UnknownAction,
-        })
+        .map_err(Into::into)
 }
 
 fn required<'a>(
@@ -1552,5 +1561,11 @@ mod tests {
             ),
             Err(ManagerError::Unavailable)
         ));
+        let manager = crate::ami::manager::RollbackManager::fail_on(2);
+        assert!(matches!(
+            register_control_actions(FakeProvider::default(), manager.clone()),
+            Err(ManagerError::RegistrationFailed)
+        ));
+        manager.assert_partial_rollback(3, 2);
     }
 }

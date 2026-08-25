@@ -19,6 +19,8 @@ use crate::config::provider::{
     StaticConfigurationSource,
 };
 
+use super::ownership::ConfigLoad;
+
 const REQUESTOR: &CStr = c"chan_sccp2";
 
 #[derive(Clone, Debug)]
@@ -66,16 +68,6 @@ impl ConfigurationProvider for AsteriskConfigurationSource {
     }
 }
 
-struct AstConfig(*mut sys::ast_config);
-
-impl Drop for AstConfig {
-    fn drop(&mut self) {
-        if !self.0.is_null() && self.0 as isize > 0 {
-            unsafe { sys::ast_config_destroy(self.0) };
-        }
-    }
-}
-
 fn native_failure(path: &Path, message: impl Into<String>) -> ConfigurationProviderError {
     ConfigurationProviderError::unavailable(
         "Asterisk configuration parser",
@@ -113,25 +105,27 @@ fn load_effective_source(
     let flags = sys::ast_flags {
         flags: if check_unchanged { 1 << 1 } else { 0 },
     };
-    let config =
-        AstConfig(unsafe { sys::ast_config_load2(path_c.as_ptr(), REQUESTOR.as_ptr(), flags) });
-    match config.0 as isize {
-        0 => {
+    let config = match ConfigLoad::decode(unsafe {
+        sys::ast_config_load2(path_c.as_ptr(), REQUESTOR.as_ptr(), flags)
+    }) {
+        ConfigLoad::Missing => {
             return Err(native_failure(
                 path,
                 "file is missing or could not be loaded",
             ));
         }
-        -1 => return Ok(None),
-        -2 => return Err(native_failure(path, "file has invalid Asterisk syntax")),
-        _ => {}
-    }
+        ConfigLoad::Unchanged => return Ok(None),
+        ConfigLoad::Invalid => {
+            return Err(native_failure(path, "file has invalid Asterisk syntax"));
+        }
+        ConfigLoad::Loaded(config) => config,
+    };
 
     let mut output = String::new();
     let mut category = ptr::null_mut::<sys::ast_category>();
     loop {
         category = unsafe {
-            sys::ast_category_browse_filtered(config.0, ptr::null(), category, ptr::null())
+            sys::ast_category_browse_filtered(config.as_ptr(), ptr::null(), category, ptr::null())
         };
         if category.is_null() {
             break;

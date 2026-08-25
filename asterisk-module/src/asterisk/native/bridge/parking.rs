@@ -7,6 +7,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use super::{SOURCE_FILE, SOURCE_FUNCTION, ao2_ref, lock_channel};
+use crate::asterisk::boundary::nullable_lossy_c_text;
 use crate::asterisk::direct::module_info;
 use crate::asterisk::raw::handles::{ChannelRef, ModuleReference};
 use crate::asterisk::raw::registry::{
@@ -232,14 +233,28 @@ impl ParkingSubscriptionControl for NativeParkingSubscription {
     }
 }
 
-fn owned_text(value: *const c_char) -> String {
-    if value.is_null() {
-        String::new()
+unsafe fn presented_identity(
+    presentation: c_int,
+    name: *const c_char,
+    number: *const c_char,
+) -> (String, String) {
+    let allowed =
+        (presentation & sys::AST_PRES_RESTRICTION as c_int) == sys::AST_PRES_ALLOWED as c_int;
+    if allowed {
+        (unsafe { nullable_lossy_c_text(name) }, unsafe {
+            nullable_lossy_c_text(number)
+        })
     } else {
-        unsafe { CStr::from_ptr(value) }
-            .to_string_lossy()
-            .into_owned()
+        (String::new(), String::new())
     }
+}
+
+/// Asterisk 22 and 23 expose connected-party strings in this payload without
+/// the presentation bits required to authorize their disclosure. Keep that
+/// ABI family explicit and fail closed instead of treating string presence as
+/// permission.
+fn connected_identity_without_presentation() -> (String, String) {
+    (String::new(), String::new())
 }
 
 unsafe fn decode_parking_event(message: *mut sys::stasis_message) -> Option<ParkingEvent> {
@@ -255,8 +270,12 @@ unsafe fn decode_parking_event(message: *mut sys::stasis_message) -> Option<Park
     let base = unsafe { parkee.base.as_ref() }?;
     let caller = unsafe { parkee.caller.as_ref() }?;
     let connected = unsafe { parkee.connected.as_ref() }?;
-    let caller_allowed =
-        (caller.pres & sys::AST_PRES_RESTRICTION as c_int) == sys::AST_PRES_ALLOWED as c_int;
+    let (caller_name, caller_number) =
+        unsafe { presented_identity(caller.pres, caller.name, caller.number) };
+    // Asterisk 22 and 23 omit presentation metadata from the connected-party
+    // parking snapshot. Without an explicitly permitted source, fail closed.
+    let _ = connected;
+    let (connected_name, connected_number) = connected_identity_without_presentation();
     let kind = match payload.event_type as c_int {
         0 => ParkingEventKind::Parked,
         1 => ParkingEventKind::Timeout,
@@ -268,28 +287,22 @@ unsafe fn decode_parking_event(message: *mut sys::stasis_message) -> Option<Park
     };
     let retriever_channel = (unsafe { payload.retriever.as_ref() })
         .and_then(|snapshot| unsafe { snapshot.base.as_ref() })
-        .map_or_else(String::new, |snapshot| owned_text(snapshot.name));
+        .map_or_else(String::new, |snapshot| unsafe {
+            nullable_lossy_c_text(snapshot.name)
+        });
     Some(ParkingEvent {
         kind,
-        lot: owned_text(payload.parkinglot),
+        lot: unsafe { nullable_lossy_c_text(payload.parkinglot) },
         slot: payload.parkingspace,
         timeout_seconds: u64::try_from(payload.timeout).ok()?,
         duration_seconds: u64::try_from(payload.duration).ok()?,
-        parker_dial_string: owned_text(payload.parker_dial_string),
-        parkee_channel: owned_text(base.name),
-        parkee_unique_id: owned_text(base.uniqueid),
-        caller_name: if caller_allowed {
-            owned_text(caller.name)
-        } else {
-            String::new()
-        },
-        caller_number: if caller_allowed {
-            owned_text(caller.number)
-        } else {
-            String::new()
-        },
-        connected_name: owned_text(connected.name.as_ptr()),
-        connected_number: owned_text(connected.number),
+        parker_dial_string: unsafe { nullable_lossy_c_text(payload.parker_dial_string) },
+        parkee_channel: unsafe { nullable_lossy_c_text(base.name) },
+        parkee_unique_id: unsafe { nullable_lossy_c_text(base.uniqueid) },
+        caller_name,
+        caller_number,
+        connected_name,
+        connected_number,
         retriever_channel,
     })
 }
@@ -358,4 +371,38 @@ pub fn subscribe_parking(
         subscription,
         registration,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presentation_policy_applies_to_each_parking_party() {
+        let (name, number) = unsafe {
+            presented_identity(
+                sys::AST_PRES_ALLOWED as c_int,
+                c"Allowed".as_ptr(),
+                c"4000".as_ptr(),
+            )
+        };
+        assert_eq!((name.as_str(), number.as_str()), ("Allowed", "4000"));
+
+        let (name, number) = unsafe {
+            presented_identity(
+                sys::AST_PRES_RESTRICTED as c_int,
+                c"Secret".as_ptr(),
+                c"4999".as_ptr(),
+            )
+        };
+        assert!(name.is_empty());
+        assert!(number.is_empty());
+    }
+
+    #[test]
+    fn connected_snapshot_without_presentation_metadata_is_always_omitted() {
+        let (name, number) = connected_identity_without_presentation();
+        assert!(name.is_empty());
+        assert!(number.is_empty());
+    }
 }

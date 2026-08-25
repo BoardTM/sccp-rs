@@ -1,7 +1,6 @@
 //! Runtime ownership and race-safe delivery for monitored speed-dial hints.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,35 +9,9 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::config::HintTarget;
-use crate::presence::hints::{ExtensionState, HintCaller, HintUpdateReason};
+use crate::presence::hints::{ExtensionState, HintUpdateReason};
 
-/// A technology-opaque semantic snapshot of one Asterisk extension hint.
-///
-/// The target remains an extension and context even when the dialplan hint is
-/// backed by PJSIP, SIP, SCCP, Custom device state, or an aggregate of them.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HintSnapshot {
-    pub target: HintTarget,
-    pub state: ExtensionState,
-    pub reason: HintUpdateReason,
-    pub caller: Option<HintCaller>,
-}
-
-pub type HintCallback = Arc<dyn Fn(HintSnapshot) + Send + Sync + 'static>;
-
-/// Abstracts hint lookup/subscription so lifecycle and race handling can be
-/// verified without loading the native module.
-pub trait HintProvider {
-    type Subscription: Send + 'static;
-    type Error: fmt::Display;
-
-    fn lookup(&self, target: &HintTarget) -> Result<Option<HintSnapshot>, Self::Error>;
-    fn subscribe(
-        &self,
-        target: &HintTarget,
-        callback: HintCallback,
-    ) -> Result<Self::Subscription, Self::Error>;
-}
+pub use crate::presence::hints::{HintCallback, HintProvider, HintSnapshot};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct BlfKey {

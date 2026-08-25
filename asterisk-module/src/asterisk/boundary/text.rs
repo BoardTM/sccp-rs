@@ -1,6 +1,6 @@
 //! Bounded conversion of borrowed C callback arguments into owned Rust text.
 
-use std::ffi::c_char;
+use std::ffi::{CStr, CString, c_char};
 use std::str;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8,6 +8,51 @@ pub enum NativeTextError {
     Missing,
     Unterminated,
     InvalidUtf8,
+    InteriorNul { position: usize },
+}
+
+impl std::fmt::Display for NativeTextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("native text is missing"),
+            Self::Unterminated => formatter.write_str("native text is not NUL-terminated"),
+            Self::InvalidUtf8 => formatter.write_str("native text is not valid UTF-8"),
+            Self::InteriorNul { position } => {
+                write!(
+                    formatter,
+                    "text contains an interior NUL byte at offset {position}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeTextError {}
+
+/// Encode Rust text for a native call without changing its value.
+pub fn native_c_string(value: &str) -> Result<CString, NativeTextError> {
+    CString::new(value).map_err(|error| NativeTextError::InteriorNul {
+        position: error.nul_position(),
+    })
+}
+
+/// Copy nullable native display text, replacing invalid UTF-8 lossily.
+///
+/// This helper is intentionally limited to native event/callback display text;
+/// configuration and realtime adapters use strict UTF-8 conversion instead.
+///
+/// # Safety
+///
+/// `value` must be null or point to a valid NUL-terminated byte string for the
+/// duration of this call.
+pub unsafe fn nullable_lossy_c_text(value: *const c_char) -> String {
+    if value.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 /// Copy a required NUL-terminated callback argument without an unbounded scan.
@@ -90,6 +135,30 @@ mod tests {
         assert_eq!(
             unsafe { optional_c_text(c"".as_ptr(), 4) },
             Ok(Some(String::new()))
+        );
+    }
+
+    #[test]
+    fn native_output_text_rejects_interior_nuls_without_transformation() {
+        assert_eq!(
+            native_c_string("10\0evil").unwrap_err(),
+            NativeTextError::InteriorNul { position: 2 }
+        );
+        assert_eq!(native_c_string("10").unwrap().as_bytes(), b"10");
+    }
+
+    #[test]
+    fn nullable_lossy_display_text_covers_null_empty_and_invalid_utf8() {
+        assert_eq!(unsafe { nullable_lossy_c_text(std::ptr::null()) }, "");
+        assert_eq!(unsafe { nullable_lossy_c_text(c"".as_ptr()) }, "");
+        assert_eq!(
+            unsafe { nullable_lossy_c_text(c"ordinary".as_ptr()) },
+            "ordinary"
+        );
+        let invalid = [0xff_u8, 0];
+        assert_eq!(
+            unsafe { nullable_lossy_c_text(invalid.as_ptr().cast()) },
+            "\u{fffd}"
         );
     }
 }

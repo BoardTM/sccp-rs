@@ -16,14 +16,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::Arc;
 
 use sccp_protocol::{CallId, ConferenceId, DeviceId, ParticipantId};
 use thiserror::Error;
 
 use crate::ami::manager::{
-    ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege, ManagerRequest,
-    ManagerResponse, RequestFields, RequestFieldsError,
+    ActionDefinition, ManagerBackend, ManagerError, ManagerField, ManagerLimits, ManagerPrivilege,
+    ManagerRequest, ManagerResponse, RequestFields, register_action_group,
 };
 use crate::media::recording::{RecordingDirection, RecordingSessionControl};
 use crate::runtime::backend::PbxCallId;
@@ -386,31 +385,38 @@ impl ServiceAction {
     }
 }
 
+impl<P: ServiceControlProvider> ActionDefinition<P> for ServiceAction {
+    fn name(self) -> &'static str {
+        self.name()
+    }
+
+    fn synopsis(self) -> &'static str {
+        self.synopsis()
+    }
+
+    fn description(self) -> &'static str {
+        self.description()
+    }
+
+    fn privileges(self) -> ManagerPrivilege {
+        ACTION_PRIVILEGES
+    }
+
+    fn limits(self) -> ManagerLimits {
+        ACTION_LIMITS
+    }
+
+    fn handle(self, provider: &P, request: ManagerRequest) -> ManagerResponse {
+        handle_service_control_request(provider, request)
+    }
+}
+
 /// Register all service-control actions as one RAII-owned lifecycle group.
 pub fn register_service_control_actions<P: ServiceControlProvider, M: ManagerBackend>(
     provider: P,
     manager: M,
 ) -> Result<Vec<M::Registration>, ManagerError> {
-    let provider = Arc::new(provider);
-    let mut registrations = Vec::with_capacity(ServiceAction::ALL.len());
-    for action in ServiceAction::ALL {
-        let provider = Arc::clone(&provider);
-        match manager.register_action(
-            action.name(),
-            ACTION_PRIVILEGES,
-            action.synopsis(),
-            action.description(),
-            ACTION_LIMITS,
-            move |request| handle_service_control_request(provider.as_ref(), request),
-        ) {
-            Ok(registration) => registrations.push(registration),
-            Err(error) => {
-                drop(registrations);
-                return Err(error);
-            }
-        }
-    }
-    Ok(registrations)
+    register_action_group(provider, manager, &ServiceAction::ALL)
 }
 
 pub fn handle_service_control_request<P: ServiceControlProvider + ?Sized>(
@@ -451,6 +457,8 @@ enum ServiceActionError {
     #[error(transparent)]
     Provider(#[from] ServiceProviderError),
 }
+
+crate::ami::manager::impl_request_fields_error!(ServiceActionError);
 
 impl ServiceActionError {
     const fn response_message(self) -> &'static str {
@@ -650,12 +658,7 @@ fn parse_fields(
 ) -> Result<BTreeMap<String, String>, ServiceActionError> {
     RequestFields::new(request)
         .collect(allowed, &[])
-        .map_err(|error| match error {
-            RequestFieldsError::Sensitive => ServiceActionError::SensitiveField,
-            RequestFieldsError::Duplicate => ServiceActionError::DuplicateField,
-            RequestFieldsError::Unknown => ServiceActionError::UnknownField,
-            RequestFieldsError::ActionMismatch => ServiceActionError::UnknownAction,
-        })
+        .map_err(Into::into)
 }
 
 fn required<'a>(
@@ -1350,6 +1353,12 @@ mod tests {
             ),
             Err(ManagerError::Unavailable)
         ));
+        let manager = crate::ami::manager::RollbackManager::fail_on(2);
+        assert!(matches!(
+            register_service_control_actions(FakeProvider::default(), manager.clone()),
+            Err(ManagerError::RegistrationFailed)
+        ));
+        manager.assert_partial_rollback(3, 2);
     }
 
     #[test]

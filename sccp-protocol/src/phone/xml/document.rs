@@ -78,6 +78,31 @@ macro_rules! impl_phone_xml_document {
                 <$document>::validate(self)
             }
         }
+
+        impl $document {
+            /// Parses and validates this document using its schema byte limit.
+            pub fn from_xml(document: &[u8]) -> Result<Self, PhoneXmlError> {
+                <Self as PhoneXmlDocument>::parse_xml(document)
+            }
+
+            /// Parses and validates this document with a stricter byte limit.
+            pub fn from_xml_with_limit(
+                document: &[u8],
+                maximum_bytes: usize,
+            ) -> Result<Self, PhoneXmlError> {
+                <Self as PhoneXmlDocument>::parse_xml_with_limit(document, maximum_bytes)
+            }
+
+            /// Validates and serializes this document using its schema byte limit.
+            pub fn to_xml(&self) -> Result<String, PhoneXmlError> {
+                <Self as PhoneXmlDocument>::serialize_xml(self)
+            }
+
+            /// Validates and serializes this document with a stricter byte limit.
+            pub fn to_xml_with_limit(&self, maximum_bytes: usize) -> Result<String, PhoneXmlError> {
+                <Self as PhoneXmlDocument>::serialize_xml_with_limit(self, maximum_bytes)
+            }
+        }
     };
 }
 

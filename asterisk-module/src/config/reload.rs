@@ -65,7 +65,7 @@ impl ReloadSelection {
         } else if kind.eq_ignore_ascii_case("line") {
             Ok(Self::Line((*value).to_owned()))
         } else if kind.eq_ignore_ascii_case("profile") {
-            Ok(Self::SoftKeyProfile(super::canonical_profile_name(value)))
+            Ok(Self::SoftKeyProfile(super::canonical::profile_name(value)))
         } else {
             Err(ReloadSelectionError::InvalidSelector)
         }

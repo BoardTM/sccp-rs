@@ -6,5 +6,6 @@
 //! moved here before the corresponding repository-owned C source is removed.
 
 pub mod channel_driver;
+mod cli;
 pub mod handles;
 pub mod module_info;

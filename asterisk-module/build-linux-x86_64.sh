@@ -58,8 +58,9 @@ docker buildx build \
 	--progress plain \
 	--build-arg "ASTERISK_VERSION=$asterisk_version" \
 	--build-arg "ASTERISK_FEATURE=$asterisk_feature" \
+	--target artifact \
 	--output "type=local,dest=$output_dir" \
-	--file "$script_dir/Dockerfile.linux" \
+	--file "$script_dir/Dockerfile" \
 	"$repo_dir"
 
 artifact="$output_dir/chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"

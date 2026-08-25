@@ -1,0 +1,8 @@
+# Dialect-neutral schema intent. Fields are pipe-separated. Table rows end in
+# exact per-column nullability/default contracts; view rows end after family.
+table|sccp2_realtime_generations|id created_at|primary-key=1 unique=0 foreign-key=0 cascade=0 checks=1 id-positive-check|id:required:no-default created_at:required:default
+table|sccp2_realtime_active_generation|singleton generation_id|primary-key=1 unique=1 foreign-key=1 cascade=0 checks=1 singleton-check|singleton:required:default generation_id:required:no-default
+table|sccp2_realtime_sections|generation_id family name section_position|primary-key=1 unique=1 foreign-key=1 cascade=1 checks=3 family-check name-nonblank-check position-check|generation_id:required:no-default family:required:no-default name:required:no-default section_position:required:no-default
+table|sccp2_realtime_fields|generation_id family section_name field_position field_name field_value|primary-key=1 unique=0 foreign-key=1 cascade=1 checks=3 name-nonblank-check reserved-field-check delete-value-check position-check|generation_id:required:no-default family:required:no-default section_name:required:no-default field_position:required:no-default field_name:required:no-default field_value:nullable:no-default
+view|sccp_devices|_row_order _revision _metadata name _field_name _field_kind _field_value|device
+view|sccp_lines|_row_order _revision _metadata name _field_name _field_kind _field_value|line

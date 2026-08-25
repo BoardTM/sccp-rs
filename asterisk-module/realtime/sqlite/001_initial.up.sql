@@ -6,7 +6,7 @@ CREATE TABLE sccp2_realtime_generations (
 );
 
 CREATE TABLE sccp2_realtime_active_generation (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    singleton INTEGER PRIMARY KEY DEFAULT 1 CHECK (singleton = 1),
     generation_id INTEGER NOT NULL UNIQUE,
     FOREIGN KEY (generation_id) REFERENCES sccp2_realtime_generations (id)
 );

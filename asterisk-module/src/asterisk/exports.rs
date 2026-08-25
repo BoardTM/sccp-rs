@@ -1,6 +1,44 @@
 //! Typed composition API consumed by the Asterisk channel callbacks.
 
-use super::*;
+use super::boundary::MutexExt as _;
+use super::raw::handles::ChannelRef;
+use super::runtime::{
+    Access, AsteriskBackend, ChannelAllocationOwner, ChannelBinding, Module,
+    RuntimeCallSignalDeliveryError, RuntimeCallSignalDeliveryResult, RuntimeCallSignalKind,
+    RuntimeCliDiagnosticError, RuntimeCliInventoryError, allocate_channel, ast_log, audio_framing,
+    channel_binding, complete_runtime_cli_diagnostics, complete_runtime_cli_inventory, config_path,
+    configured_audio_processing, configured_dtmf_mode, device_state, direct_media_call,
+    direct_media_policy, enqueue_media_retarget, execute_answer_call_transition,
+    execute_forwarding_mutation, format_for, handle_runtime_hangup_signal, install_mwi,
+    local_media_endpoint, module_access, preferred_inbound_codec, prepare_channel_allocation_text,
+    publish_line, read_channel_metadata, read_party_snapshot, registered_device_ids, reload,
+    reload_selected, remove_channel, render_runtime_cli_diagnostics, render_runtime_cli_inventory,
+    requestor_auto_answer_mode, retarget_station_to_anchor, state_from_channel, station_nat_active,
+    take_state_from_channel, uninstall_mwi,
+};
+use super::{
+    AppearanceRingMode, Arc, AsteriskRealtime, AutoAnswerPolicy, CStr, CallDirection, CallId,
+    CallMetadata, CallState, CliControlError, Codec, ConfigurationProvider,
+    ConfiguredChannelMetadata, ControlOutcome, DeviceId, DeviceState, DirectMediaRoute, DndMode,
+    DriverEffect, Duration, FeatureControlMutation, FeatureControlOutcome, ForwardingContext,
+    ForwardingOperation, HandsetEffect, HashMap, HybridConfigurationProvider,
+    InboundCallDisposition, InboundDialRequest, InboundUnavailableReason, IncomingRing,
+    LineBinding, LineInstance, LogLevel, MAX_ASSIGNED_CHANNEL_ID_BYTES, MAX_BOOLEAN_BYTES,
+    MAX_CALL_ID_BYTES, MAX_DEVICE_SELECTOR_BYTES, MAX_DIAL_DESTINATION_BYTES, MAX_DND_MODE_BYTES,
+    MAX_LINE_SELECTOR_BYTES, MAX_MESSAGE_BYTES, MAX_TIMEOUT_BYTES, MODULE, MediaEndpoint,
+    NoAnswerPolicy, NonNull, PartySnapshot, PbxCallId, PhoneCommand, PhoneCommandAction,
+    REQUESTED_CHANNEL_UNAVAILABLE, ReloadSelection, ResetMode, RingDuration, RingerMode,
+    SharedNoAnswerRoute, USER_BUSY, c_int, canonical_ip_address, complete_cli_device,
+    complete_cli_value, compose_channel_metadata, controller_step, execute_cli_answer,
+    execute_cli_device_control, execute_cli_dnd, execute_cli_end, execute_cli_message,
+    execute_cli_originate, native_channel, parse_cli_forwarding_mutation, pbx_audio_format,
+    pbx_audio_formats_from_mask, pbx_video_formats_from_mask, plan_inbound_bindings,
+    plan_shared_no_answer_route, raw, sys,
+};
+use crate::config::provider::StaticConfigurationSource as _;
+use crate::runtime::backend::SupplementaryBackend as _;
+use std::net::IpAddr;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModuleLifecycleError;
@@ -35,6 +73,101 @@ pub struct ChannelRequest<'a> {
     pub assigned_ids: *const sys::ast_assigned_ids,
     pub requestor: *const sys::ast_channel,
     pub address: &'a CStr,
+}
+
+struct ParsedChannelRequest {
+    dial: InboundDialRequest,
+    requestor_party: Option<PartySnapshot>,
+    requestor_metadata: Option<CallMetadata>,
+}
+
+impl ParsedChannelRequest {
+    unsafe fn parse(
+        address: &CStr,
+        requestor: *const sys::ast_channel,
+    ) -> Result<Self, ChannelRequestError> {
+        let address = address.to_str().map_err(|_| ChannelRequestError {
+            cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
+        })?;
+        let mut dial = InboundDialRequest::parse(address).map_err(|error| {
+            ast_log(
+                LogLevel::Warning,
+                &format!("unable to parse SCCP channel request: {error}"),
+            );
+            ChannelRequestError {
+                cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
+            }
+        })?;
+        let requestor_mode = requestor_auto_answer_mode(requestor).map_err(|()| {
+            ast_log(
+                LogLevel::Warning,
+                "unable to parse requestor AUTO_ANSWER mode",
+            );
+            ChannelRequestError {
+                cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
+            }
+        })?;
+        dial.apply_requestor_mode(requestor_mode);
+        let requestor_party = read_party_snapshot(requestor as *mut sys::ast_channel);
+        let requestor_metadata = if requestor.is_null() {
+            None
+        } else {
+            Some(
+                read_channel_metadata(requestor as *mut sys::ast_channel).ok_or(
+                    ChannelRequestError {
+                        cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
+                    },
+                )?,
+            )
+        };
+        Ok(Self {
+            dial,
+            requestor_party,
+            requestor_metadata,
+        })
+    }
+}
+
+struct SelectedChannelPolicy {
+    primary_call_id: CallId,
+    primary_binding: LineBinding,
+    primary_codec: Codec,
+    forwarded: bool,
+    no_answer: Option<SharedNoAnswerRoute>,
+}
+
+/// Rolls back every controller/runtime/native allocation made while preparing
+/// a request unless ownership is explicitly committed to Asterisk.
+struct PreparedChannelRequest<'a> {
+    access: &'a Access,
+    pbx_id: PbxCallId,
+    committed: bool,
+}
+
+impl<'a> PreparedChannelRequest<'a> {
+    const fn new(access: &'a Access, pbx_id: PbxCallId) -> Self {
+        Self {
+            access,
+            pbx_id,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PreparedChannelRequest<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        remove_channel(self.access, self.pbx_id);
+        let _ = controller_step(&self.access.shared.controller, |controller| {
+            controller.pbx_hangup_with_effects(self.pbx_id)
+        });
+    }
 }
 
 pub struct RequestedChannel {
@@ -234,45 +367,11 @@ pub unsafe fn request_channel(
     let Some(access) = module_access() else {
         return Err(ChannelRequestError { cause: None });
     };
-    let Ok(address) = address.to_str() else {
-        return Err(ChannelRequestError { cause: None });
-    };
-    let mut dial_request = match InboundDialRequest::parse(address) {
-        Ok(request) => request,
-        Err(error) => {
-            ast_log(
-                LogLevel::Warning,
-                &format!("unable to parse SCCP channel request: {error}"),
-            );
-            return Err(ChannelRequestError {
-                cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
-            });
-        }
-    };
-    let requestor_mode = match requestor_auto_answer_mode(requestor) {
-        Ok(mode) => mode,
-        Err(()) => {
-            ast_log(
-                LogLevel::Warning,
-                "unable to parse requestor AUTO_ANSWER mode",
-            );
-            return Err(ChannelRequestError {
-                cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
-            });
-        }
-    };
-    dial_request.apply_requestor_mode(requestor_mode);
-    let requestor_party = read_party_snapshot(requestor as *mut sys::ast_channel);
-    let requestor_metadata = if requestor.is_null() {
-        None
-    } else {
-        let Some(metadata) = read_channel_metadata(requestor as *mut sys::ast_channel) else {
-            return Err(ChannelRequestError {
-                cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
-            });
-        };
-        Some(metadata)
-    };
+    let ParsedChannelRequest {
+        dial: dial_request,
+        requestor_party,
+        requestor_metadata,
+    } = unsafe { ParsedChannelRequest::parse(address, requestor) }?;
     let Some(request_capabilities) = NonNull::new(capabilities) else {
         return Err(ChannelRequestError {
             cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
@@ -336,11 +435,27 @@ pub unsafe fn request_channel(
         });
     }
     let pbx_id = PbxCallId(candidates[0].call_id.0);
+    let mut allocation_texts = candidates
+        .iter()
+        .map(|candidate| {
+            prepare_channel_allocation_text(&access, &candidate.binding, pbx_id)
+                .map(|text| (candidate.call_id, text))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|error| {
+            ast_log(
+                LogLevel::Warning,
+                &format!("unable to prepare SCCP native channel text: {error}"),
+            );
+            ChannelRequestError {
+                cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
+            }
+        })?;
+    let mut prepared = PreparedChannelRequest::new(&access, pbx_id);
     let disposition = controller_step(&access.shared.controller, |controller| {
         controller.offer_inbound_call_with_policy(pbx_id, candidates.clone())
     });
-    let (primary_call_id, primary_binding, primary_codec, forwarded, no_answer) = match disposition
-    {
+    let selected = match disposition {
         InboundCallDisposition::Offer(offers) => {
             let Some(primary_offer) = offers.first() else {
                 return Err(ChannelRequestError {
@@ -380,13 +495,13 @@ pub unsafe fn request_channel(
                     timeout_seconds: device.feature_defaults.forwarding.no_answer_timeout_seconds,
                 })
             }));
-            (
-                primary.call_id,
-                primary.binding.clone(),
-                primary.codec,
-                false,
+            SelectedChannelPolicy {
+                primary_call_id: primary.call_id,
+                primary_binding: primary.binding.clone(),
+                primary_codec: primary.codec,
+                forwarded: false,
                 no_answer,
-            )
+            }
         }
         InboundCallDisposition::Forward {
             binding,
@@ -415,7 +530,13 @@ pub unsafe fn request_channel(
                     reason,
                 },
             );
-            (primary.call_id, *binding, primary.codec, true, None)
+            SelectedChannelPolicy {
+                primary_call_id: primary.call_id,
+                primary_binding: *binding,
+                primary_codec: primary.codec,
+                forwarded: true,
+                no_answer: None,
+            }
         }
         InboundCallDisposition::Unavailable(reason) => {
             return Err(ChannelRequestError {
@@ -427,15 +548,24 @@ pub unsafe fn request_channel(
             });
         }
     };
+    let SelectedChannelPolicy {
+        primary_call_id,
+        primary_binding,
+        primary_codec,
+        forwarded,
+        no_answer,
+    } = selected;
+    let allocation_text = allocation_texts
+        .remove(&primary_call_id)
+        .ok_or(ChannelRequestError {
+            cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
+        })?;
     if !forwarded
         && let Some(request) = dial_request.auto_answer()
         && !controller_step(&access.shared.controller, |controller| {
             controller.set_auto_answer_request(pbx_id, request)
         })
     {
-        let _ = controller_step(&access.shared.controller, |controller| {
-            controller.pbx_hangup_with_effects(pbx_id)
-        });
         return Err(ChannelRequestError {
             cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
         });
@@ -454,14 +584,6 @@ pub unsafe fn request_channel(
     ) {
         Ok(metadata) => metadata,
         Err(_) => {
-            access
-                .shared
-                .forwarded_calls
-                .lock_unpoisoned()
-                .remove(&pbx_id);
-            let _ = controller_step(&access.shared.controller, |controller| {
-                controller.pbx_hangup_with_effects(pbx_id)
-            });
             return Err(ChannelRequestError {
                 cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
             });
@@ -475,14 +597,6 @@ pub unsafe fn request_channel(
             Ok(true)
         )
     {
-        access
-            .shared
-            .forwarded_calls
-            .lock_unpoisoned()
-            .remove(&pbx_id);
-        let _ = controller_step(&access.shared.controller, |controller| {
-            controller.pbx_hangup_with_effects(pbx_id)
-        });
         return Err(ChannelRequestError {
             cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
         });
@@ -510,14 +624,6 @@ pub unsafe fn request_channel(
         )
     });
     let Some(packet_ms) = packet_ms else {
-        access
-            .shared
-            .forwarded_calls
-            .lock_unpoisoned()
-            .remove(&pbx_id);
-        let _ = controller_step(&access.shared.controller, |controller| {
-            controller.pbx_hangup_with_effects(pbx_id)
-        });
         return Err(ChannelRequestError {
             cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
         });
@@ -529,7 +635,7 @@ pub unsafe fn request_channel(
             .lock_unpoisoned()
             .insert(pbx_id, route);
     }
-    if !allocate_channel(
+    if allocate_channel(
         &access,
         primary_call_id,
         pbx_id,
@@ -539,24 +645,11 @@ pub unsafe fn request_channel(
         assigned_ids,
         requestor,
         Some(metadata),
+        allocation_text,
         ChannelAllocationOwner::Asterisk,
-    ) {
-        if forwarded {
-            access
-                .shared
-                .forwarded_calls
-                .lock_unpoisoned()
-                .remove(&pbx_id);
-        } else {
-            access
-                .shared
-                .no_answer_plans
-                .lock_unpoisoned()
-                .remove(&pbx_id);
-            let _ = controller_step(&access.shared.controller, |controller| {
-                controller.pbx_hangup_with_effects(pbx_id)
-            });
-        }
+    )
+    .is_err()
+    {
         return Err(ChannelRequestError { cause: None });
     }
     access
@@ -572,6 +665,7 @@ pub unsafe fn request_channel(
         .and_then(|binding| binding.try_enter())
         .map(|channel| channel.resource().as_non_null())
         .ok_or(ChannelRequestError { cause: None })?;
+    prepared.commit();
     Ok(RequestedChannel {
         channel,
         cause: Some(cause),

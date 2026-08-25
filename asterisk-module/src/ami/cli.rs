@@ -401,18 +401,14 @@ fn validate_text_selector(value: &str) -> Result<(), CliInventoryError> {
 }
 
 fn parse_device(value: &str) -> Result<DeviceId, CliInventoryError> {
-    DeviceId::new(value).map_err(|_| CliInventoryError::InvalidSelector)
+    super::cli_support::parse_device(value, || CliInventoryError::InvalidSelector)
 }
 
 fn parse_positive<T>(value: &str) -> Result<T, CliInventoryError>
 where
     T: std::str::FromStr + Default + PartialEq,
 {
-    value
-        .parse::<T>()
-        .ok()
-        .filter(|value| *value != T::default())
-        .ok_or(CliInventoryError::InvalidSelector)
+    super::cli_support::parse_positive(value, || CliInventoryError::InvalidSelector)
 }
 
 fn parse_appearance(value: &str) -> Result<AppearanceIdentity, CliInventoryError> {

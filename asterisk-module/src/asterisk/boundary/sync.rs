@@ -1,14 +1,12 @@
-//! Explicit non-poisoning policy for the module's transactional runtime state.
-//!
-//! A panic is contained before it can cross an Asterisk callback. Runtime
-//! registries are updated through prepare/commit or generation-checked state
-//! transitions, so a poisoned standard-library lock does not make every later
-//! callback panic again. We recover the protected value centrally and let the
-//! owning transition's invariants decide whether the operation can proceed.
+// Shared poison-recovery policy for callback and runtime boundary state.
+//
+// Panics are contained before crossing Asterisk callbacks. Recovering the
+// protected value here prevents one poisoned standard-library lock from
+// turning every later callback into another panic.
 
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-pub trait MutexExt<T> {
+pub(in super::super) trait MutexExt<T> {
     fn lock_unpoisoned(&self) -> MutexGuard<'_, T>;
 }
 
@@ -18,7 +16,7 @@ impl<T> MutexExt<T> for Mutex<T> {
     }
 }
 
-pub trait RwLockExt<T> {
+pub(in super::super) trait RwLockExt<T> {
     fn read_unpoisoned(&self) -> RwLockReadGuard<'_, T>;
     fn write_unpoisoned(&self) -> RwLockWriteGuard<'_, T>;
 }
@@ -34,6 +32,17 @@ impl<T> RwLockExt<T> for RwLock<T> {
     }
 }
 
+pub(in super::super) trait CondvarExt {
+    fn wait_unpoisoned<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>;
+}
+
+impl CondvarExt for Condvar {
+    fn wait_unpoisoned<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        self.wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -41,7 +50,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_contained_panic_does_not_turn_a_runtime_mutex_into_a_panic_loop() {
+    fn mutex_recovers_after_a_contained_callback_panic() {
         let state = Mutex::new(Vec::new());
         let _ = catch_unwind(AssertUnwindSafe(|| {
             let mut state = state.lock().unwrap();
@@ -57,7 +66,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_rwlock_uses_the_same_recovery_policy() {
+    fn rwlock_uses_the_same_recovery_policy() {
         let state = RwLock::new(1);
         let _ = catch_unwind(AssertUnwindSafe(|| {
             let mut state = state.write().unwrap();

@@ -24,14 +24,7 @@ pub(super) fn decode<T>(message_id: u32, payload: &[u8]) -> Result<T, CodecError
 where
     for<'a> T: BinRead<Args<'a> = ()>,
 {
-    let mut input = Cursor::new(payload);
-    let value = T::read_options(&mut input, Endian::Little, ())
-        .map_err(|error| CodecError::wire("decode", message_id, &error))?;
-    let consumed = usize::try_from(input.position()).map_err(|_| CodecError::InvalidValue {
-        message_id,
-        field: "decoded payload position",
-        value: input.position(),
-    })?;
+    let (value, consumed) = decode_cursor(message_id, payload)?;
     if consumed != payload.len() {
         return Err(CodecError::TrailingBytes {
             message_id,
@@ -45,9 +38,7 @@ pub(super) fn decode_prefix<T>(message_id: u32, payload: &[u8]) -> Result<T, Cod
 where
     for<'a> T: BinRead<Args<'a> = ()>,
 {
-    let mut input = Cursor::new(payload);
-    T::read_options(&mut input, Endian::Little, ())
-        .map_err(|error| CodecError::wire("decode", message_id, &error))
+    decode_cursor(message_id, payload).map(|(value, _)| value)
 }
 
 pub(super) fn decode_zero_padded<T>(message_id: u32, payload: &[u8]) -> Result<T, CodecError>
@@ -60,14 +51,7 @@ where
             actual: payload.len(),
         });
     }
-    let mut input = Cursor::new(payload);
-    let value = T::read_options(&mut input, Endian::Little, ())
-        .map_err(|error| CodecError::wire("decode", message_id, &error))?;
-    let consumed = usize::try_from(input.position()).map_err(|_| CodecError::InvalidValue {
-        message_id,
-        field: "decoded payload position",
-        value: input.position(),
-    })?;
+    let (value, consumed) = decode_cursor(message_id, payload)?;
     let padding = &payload[consumed..];
     if padding.len() > 3 || padding.iter().any(|byte| *byte != 0) {
         return Err(CodecError::TrailingBytes {
@@ -76,6 +60,22 @@ where
         });
     }
     Ok(value)
+}
+
+fn decode_cursor<T>(message_id: u32, payload: &[u8]) -> Result<(T, usize), CodecError>
+where
+    for<'a> T: BinRead<Args<'a> = ()>,
+{
+    let mut input = Cursor::new(payload);
+    let value = T::read_options(&mut input, Endian::Little, ())
+        .map_err(|error| CodecError::wire("decode", message_id, &error))?;
+    let position = input.position();
+    let consumed = usize::try_from(position).map_err(|_| CodecError::InvalidValue {
+        message_id,
+        field: "decoded payload position",
+        value: position,
+    })?;
+    Ok((value, consumed))
 }
 
 pub(super) fn validate_exact_payload(

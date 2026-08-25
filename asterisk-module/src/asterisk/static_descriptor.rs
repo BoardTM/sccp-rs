@@ -6,9 +6,9 @@ use std::mem::MaybeUninit;
 /// Writable storage whose address remains stable for the loaded module's
 /// lifetime.
 #[repr(transparent)]
-pub(super) struct StaticDescriptor<T>(UnsafeCell<MaybeUninit<T>>);
+pub(super) struct StaticDescriptor<T: Copy>(UnsafeCell<MaybeUninit<T>>);
 
-impl<T> StaticDescriptor<T> {
+impl<T: Copy> StaticDescriptor<T> {
     pub(super) const fn uninit() -> Self {
         Self(UnsafeCell::new(MaybeUninit::uninit()))
     }
@@ -26,6 +26,23 @@ impl<T> StaticDescriptor<T> {
     }
 }
 
-// The descriptor is mutated only during the loader's serialized constructor
-// transition and by Asterisk according to the descriptor ABI.
-unsafe impl<T> Sync for StaticDescriptor<T> {}
+// Only descriptor POD may use this retry-overwritable storage. The descriptor
+// is mutated during the loader's serialized constructor transition and by
+// Asterisk according to the descriptor ABI.
+unsafe impl<T: Copy> Sync for StaticDescriptor<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_descriptors_may_be_rewritten_for_registration_retry() {
+        let descriptor = StaticDescriptor::uninit();
+        unsafe {
+            descriptor.write([1_u32, 2]);
+            assert_eq!(*descriptor.as_ptr(), [1, 2]);
+            descriptor.write([3_u32, 4]);
+            assert_eq!(*descriptor.as_ptr(), [3, 4]);
+        }
+    }
+}

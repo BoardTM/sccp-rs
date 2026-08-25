@@ -1,8 +1,11 @@
+mod support;
+use support::source;
+
 #[test]
 fn native_channel_tech_uses_asterisk_generic_ccss_lifecycle() {
-    let driver = include_str!("../src/asterisk/direct/channel_driver.rs");
-    let channel = include_str!("../src/asterisk/native/channel/completion.rs");
-    let adapter = include_str!("../src/asterisk/adapters/completion.rs");
+    let driver = source("src/asterisk/direct/channel_driver.rs");
+    let channel = source("src/asterisk/native/channel/completion.rs");
+    let adapter = source("src/asterisk/adapters/completion.rs");
 
     assert!(driver.contains("technology.cc_callback = Some(call_completion)"));
     assert!(driver.contains("sys::AST_CC_MONITOR_GENERIC"));
@@ -19,12 +22,12 @@ fn native_channel_tech_uses_asterisk_generic_ccss_lifecycle() {
 
 #[test]
 fn callback_soft_key_reaches_the_typed_native_request_adapter() {
-    let adapter = include_str!("../src/asterisk/phone/calls.rs");
-    let completion = include_str!("../src/call/completion.rs");
+    let adapter = source("src/asterisk/phone/calls/call_control.rs");
+    let completion = source("src/call/completion.rs");
 
     assert!(adapter.contains("soft_key: SoftKey::Callback"));
     assert!(adapter.contains("AsteriskCallCompletion::new().request_owned("));
     assert!(adapter.contains("requested_device: device_id.as_str()"));
-    assert!(adapter.contains("Callback requested"));
-    assert!(completion.contains("Callback is not available for this call"));
+    assert!(adapter.contains_literal("Callback requested"));
+    assert!(completion.contains_literal("Callback is not available for this call"));
 }

@@ -1,6 +1,10 @@
-use super::super::*;
+use super::{
+    Access, BTreeSet, BlfEvent, ButtonDefinition, CallState, DeviceId, DeviceState, DndMode,
+    HashMap, Instant, LineInstance, LogLevel, MutexExt as _, MwiSubscriptionChange, PhoneCommand,
+    PhoneCommandAction, ast_log, controller_step,
+};
 
-use crate::asterisk::raw::presence::NativeMwiSubscription;
+use crate::asterisk::raw::presence::{NativeMwiSubscription, publish_device_state, subscribe_mwi};
 
 pub fn publish_device_lines(access: &Access, device: &DeviceId) {
     let config = access.config();
@@ -43,7 +47,7 @@ pub fn publish_line(access: &Access, line: &str) {
     if !changed {
         return;
     }
-    raw::presence::publish_device_state(line, state);
+    publish_device_state(line, state);
 }
 
 pub fn install_blf(access: &Access, device_id: &DeviceId) {
@@ -166,14 +170,12 @@ impl StagedMwiSubscriptions {
         };
         for change in changes {
             let subscription =
-                raw::presence::subscribe_mwi(change.line.clone(), change.mailbox.clone()).map_err(
-                    |error| {
-                        format!(
-                            "unable to stage MWI subscription for line {}: {error}",
-                            change.line
-                        )
-                    },
-                )?;
+                subscribe_mwi(change.line.clone(), change.mailbox.clone()).map_err(|error| {
+                    format!(
+                        "unable to stage MWI subscription for line {}: {error}",
+                        change.line
+                    )
+                })?;
             staged
                 .subscriptions
                 .insert(change.line.clone(), subscription);
@@ -208,7 +210,7 @@ pub fn install_mwi(access: &Access) {
         .collect();
     let mut installed = HashMap::new();
     for (line, mailbox) in subscriptions {
-        match raw::presence::subscribe_mwi(line.clone(), mailbox.clone()) {
+        match subscribe_mwi(line.clone(), mailbox.clone()) {
             Ok(subscription) => {
                 installed.insert(line, subscription);
             }

@@ -447,7 +447,7 @@ pub struct BlfSpeedDialDefinition {
 }
 
 /// Semantic state of a monitored speed-dial target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BlfState {
     Idle,
     Ringing,
@@ -455,6 +455,7 @@ pub enum BlfState {
     Held,
     DoNotDisturb,
     Unavailable,
+    #[default]
     Unknown,
 }
 
@@ -892,6 +893,17 @@ impl DeviceDefinition {
                     self.id
                 )));
             }
+            // Every ordinary button instance is encoded into the one-byte
+            // ButtonTemplate definition field. Add-on slots are logical
+            // expansion-module positions and retain their separate u32
+            // contract; they are not emitted as template definitions.
+            if kind != ButtonNamespace::AddonModule && instance > u32::from(u8::MAX) {
+                return Err(CodecError::InvalidDefinition(format!(
+                    "device {} has a {kind} button with instance {instance}; maximum wire instance is {}",
+                    self.id,
+                    u8::MAX
+                )));
+            }
             if !instances.insert((kind, instance)) {
                 return Err(CodecError::InvalidDefinition(format!(
                     "device {} repeats {kind} button instance {instance}",
@@ -969,6 +981,20 @@ impl DeviceDefinition {
     pub fn line_count(&self) -> usize {
         self.lines().count()
     }
+
+    pub(crate) fn feature_button(&self, instance: u32) -> Option<&FeatureDefinition> {
+        self.buttons.iter().find_map(|button| match button {
+            ButtonDefinition::Feature(feature) if feature.instance == instance => Some(feature),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn blf_button(&self, instance: u32) -> Option<&BlfSpeedDialDefinition> {
+        self.buttons.iter().find_map(|button| match button {
+            ButtonDefinition::BlfSpeedDial(blf) if blf.instance == instance => Some(blf),
+            _ => None,
+        })
+    }
 }
 
 fn validate_service_definition(
@@ -1024,16 +1050,37 @@ fn validate_service_definition(
 }
 
 impl ButtonDefinition {
-    fn instance_key(&self) -> Option<(&'static str, u32)> {
+    fn instance_key(&self) -> Option<(ButtonNamespace, u32)> {
         match self {
-            Self::Line(definition) => Some(("line", definition.instance)),
-            Self::SpeedDial(definition) => Some(("speed dial", definition.instance)),
-            Self::BlfSpeedDial(definition) => Some(("feature", definition.instance)),
-            Self::Feature(definition) => Some(("feature", definition.instance)),
-            Self::Service(definition) => Some(("service URL", definition.instance)),
-            Self::AddonModule(definition) => Some(("addon module", definition.slot)),
+            Self::Line(definition) => Some((ButtonNamespace::Line, definition.instance)),
+            Self::SpeedDial(definition) => Some((ButtonNamespace::SpeedDial, definition.instance)),
+            Self::BlfSpeedDial(definition) => Some((ButtonNamespace::Feature, definition.instance)),
+            Self::Feature(definition) => Some((ButtonNamespace::Feature, definition.instance)),
+            Self::Service(definition) => Some((ButtonNamespace::Service, definition.instance)),
+            Self::AddonModule(definition) => Some((ButtonNamespace::AddonModule, definition.slot)),
             Self::Unused => None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ButtonNamespace {
+    Line,
+    SpeedDial,
+    Feature,
+    Service,
+    AddonModule,
+}
+
+impl fmt::Display for ButtonNamespace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Line => "line",
+            Self::SpeedDial => "speed dial",
+            Self::Feature => "feature",
+            Self::Service => "service URL",
+            Self::AddonModule => "addon module",
+        })
     }
 }
 
@@ -1387,6 +1434,104 @@ mod tests {
             Err(CodecError::InvalidDefinition(message))
                 if message.contains("repeats feature button instance 1")
         ));
+
+        let distinct_namespaces = DeviceDefinition {
+            id: DeviceId::new("SEP001122334455").unwrap(),
+            description: "Desk".into(),
+            transport: StationTransportRequirement::Either,
+            signaling_qos: None,
+            buttons: vec![
+                line_button(1, "1001"),
+                ButtonDefinition::SpeedDial(SpeedDialDefinition {
+                    instance: 7,
+                    number: "2001".into(),
+                    display_name: "Warehouse".into(),
+                }),
+                ButtonDefinition::BlfSpeedDial(BlfSpeedDialDefinition {
+                    instance: 7,
+                    number: "2002".into(),
+                    display_name: "Dispatch".into(),
+                }),
+            ],
+            soft_keys: SoftKeyProfile::default(),
+            ui: StationUiPolicy::default(),
+        };
+        distinct_namespaces.validate().unwrap();
+    }
+
+    #[test]
+    fn station_definition_enforces_one_byte_wire_instances_for_each_button_family() {
+        let definition_with = |button| DeviceDefinition {
+            id: DeviceId::new("SEP001122334455").unwrap(),
+            description: "Desk".into(),
+            transport: StationTransportRequirement::Either,
+            signaling_qos: None,
+            buttons: vec![line_button(1, "1001"), button],
+            soft_keys: SoftKeyProfile::default(),
+            ui: StationUiPolicy::default(),
+        };
+        let buttons = |instance| {
+            [
+                ButtonDefinition::SpeedDial(SpeedDialDefinition {
+                    instance,
+                    number: "2001".into(),
+                    display_name: "Speed".into(),
+                }),
+                ButtonDefinition::BlfSpeedDial(BlfSpeedDialDefinition {
+                    instance,
+                    number: "2002".into(),
+                    display_name: "BLF".into(),
+                }),
+                ButtonDefinition::Feature(FeatureDefinition {
+                    instance,
+                    label: "DND".into(),
+                    feature: crate::message::values::ButtonType::DoNotDisturb,
+                }),
+                ButtonDefinition::Service(ServiceDefinition {
+                    instance,
+                    label: "Directory".into(),
+                    url: "https://pbx.example/directory".into(),
+                }),
+            ]
+        };
+
+        for button in buttons(255) {
+            definition_with(button).validate().unwrap();
+        }
+        for button in buttons(256) {
+            assert!(matches!(
+                definition_with(button).validate(),
+                Err(CodecError::InvalidDefinition(message))
+                    if message.contains("maximum wire instance is 255")
+            ));
+        }
+
+        let line_255 = DeviceDefinition {
+            buttons: vec![line_button(255, "1001")],
+            ..definition_with(ButtonDefinition::Unused)
+        };
+        // Sparse line slots are valid for Extension Mobility layouts.
+        let mut line_255 = line_255;
+        line_255.buttons.insert(
+            0,
+            ButtonDefinition::Feature(FeatureDefinition {
+                instance: 1,
+                label: "Mobility".into(),
+                feature: crate::message::values::ButtonType::Mobility,
+            }),
+        );
+        line_255.validate().unwrap();
+        line_255.buttons[1] = line_button(256, "1001");
+        assert!(matches!(
+            line_255.validate(),
+            Err(CodecError::InvalidDefinition(message))
+                if message.contains("maximum wire instance is 255")
+        ));
+    }
+
+    #[test]
+    fn blf_defaults_to_unknown() {
+        assert_eq!(BlfState::default(), BlfState::Unknown);
     }
 
     #[test]

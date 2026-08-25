@@ -294,6 +294,23 @@ mod tests {
     }
 
     #[test]
+    fn management_json_preserves_redacted_native_identities() {
+        let mut redacted = event(ParkingEventKind::Parked, "private", 701);
+        redacted.caller_name.clear();
+        redacted.caller_number.clear();
+        redacted.connected_name.clear();
+        redacted.connected_number.clear();
+
+        let mut registry = ParkingRegistry::default();
+        registry.apply(&redacted);
+
+        assert_eq!(
+            registry.lot_json("private"),
+            "{\"lot\":\"private\",\"calls\":[{\"slot\":701,\"caller_name\":\"\",\"caller_number\":\"\",\"connected_name\":\"\",\"connected_number\":\"\",\"timeout_seconds\":45,\"duration_seconds\":3}]}"
+        );
+    }
+
+    #[test]
     fn retrieval_claim_has_one_deterministic_winner_and_can_retry_after_failure() {
         let mut registry = ParkingRegistry::default();
         registry.apply(&event(ParkingEventKind::Parked, "main", 701));

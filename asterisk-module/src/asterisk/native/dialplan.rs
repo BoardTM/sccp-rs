@@ -17,6 +17,7 @@ use std::mem;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::asterisk::boundary::MutexExt as _;
 use crate::asterisk::boundary::{CallbackStatus, write_c_text};
 use crate::asterisk::direct::module_info::module_self;
 use crate::asterisk::sys;
@@ -108,12 +109,6 @@ fn slots() -> &'static Mutex<Vec<Arc<Slot>>> {
     SLOTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 fn names_equal(kind: Kind, first: &CStr, second: &CStr) -> bool {
     if kind.is_function() {
         first.to_bytes() == second.to_bytes()
@@ -131,13 +126,14 @@ unsafe fn lookup(
     } else {
         unsafe { CStr::from_ptr(name) }
     };
-    let slot = lock(slots())
+    let slot = slots()
+        .lock_unpoisoned()
         .iter()
         .find(|slot| {
             slot.kind.is_function() == function && names_equal(slot.kind, &slot.name, name)
         })
         .cloned()?;
-    let generation = lock(&slot.current).clone()?;
+    let generation = slot.current.lock_unpoisoned().clone()?;
     Some((slot, generation))
 }
 
@@ -372,7 +368,7 @@ fn register(
         },
     );
 
-    let mut registry = lock(slots());
+    let mut registry = slots().lock_unpoisoned();
     if let Some(slot) = registry
         .iter()
         .find(|slot| {
@@ -389,7 +385,7 @@ fn register(
             drop(generation);
             return Err(DialplanError::RegistrationFailed);
         }
-        let mut current = lock(&slot.current);
+        let mut current = slot.current.lock_unpoisoned();
         if current.is_some() {
             drop(current);
             drop(registry);
@@ -470,7 +466,7 @@ pub fn register_dialplan_application(
 }
 
 fn retire_generation(slot: &Slot, generation: &Arc<CallbackRegistration<Generation>>) {
-    let mut current = lock(&slot.current);
+    let mut current = slot.current.lock_unpoisoned();
     let is_current = current
         .as_ref()
         .is_some_and(|active| Arc::ptr_eq(active, generation));
@@ -485,9 +481,9 @@ fn retire_generation(slot: &Slot, generation: &Arc<CallbackRegistration<Generati
 }
 
 pub fn cleanup() {
-    let registrations = mem::take(&mut *lock(slots()));
+    let registrations = mem::take(&mut *slots().lock_unpoisoned());
     for slot in registrations {
-        if let Some(generation) = lock(&slot.current).take() {
+        if let Some(generation) = slot.current.lock_unpoisoned().take() {
             generation.close_admission();
             let _ = generation.drain();
         }

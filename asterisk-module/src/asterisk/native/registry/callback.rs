@@ -22,6 +22,7 @@
 //! destruction) with [`contain_callback_panic`].  No Rust unwind may cross an
 //! Asterisk ABI boundary.
 
+use crate::asterisk::boundary::{CondvarExt as _, MutexExt as _};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -163,10 +164,7 @@ impl<T> CallbackRegistration<T> {
             return ShutdownDisposition::DeferredToCallback;
         }
         while gate.active_callbacks != 0 {
-            gate = self
-                .drained
-                .wait(gate)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            gate = self.drained.wait_unpoisoned(gate);
         }
         gate.deferred_drop = false;
         drop(gate);
@@ -202,9 +200,7 @@ impl<T> CallbackRegistration<T> {
     }
 
     fn lock_gate(&self) -> MutexGuard<'_, Gate<T>> {
-        self.gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.gate.lock_unpoisoned()
     }
 }
 

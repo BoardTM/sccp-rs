@@ -11,12 +11,14 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+use crate::asterisk::boundary::nullable_lossy_c_text;
 use crate::asterisk::raw::handles::{Ao2Object, ChannelLock, ChannelRef};
 use crate::asterisk::raw::registry::contain_callback_panic;
 use crate::asterisk::sys;
+use crate::config::HintTarget;
 use crate::presence::hints::{
-    ExtensionState, Hint, HintBackend, HintCaller, HintError, HintUpdate, HintUpdateReason,
-    OwnedHintCallback,
+    ExtensionState, HintCallback, HintCaller, HintError, HintProvider, HintSnapshot,
+    HintUpdateReason,
 };
 
 const SOURCE_FILE: &CStr = c"asterisk/native/presence/hints.rs";
@@ -25,11 +27,12 @@ const SOURCE_FUNCTION: &CStr = c"sccp_presence";
 struct HintWatcher {
     id: AtomicI32,
     watcher_reference: AtomicBool,
-    callback: OwnedHintCallback,
+    target: HintTarget,
+    callback: HintCallback,
 }
 
 impl HintWatcher {
-    fn deliver(&self, update: HintUpdate) -> c_int {
+    fn deliver(&self, update: HintSnapshot) -> c_int {
         (self.callback)(update);
         0
     }
@@ -138,16 +141,6 @@ const fn hint_state(state: c_int) -> ExtensionState {
     ExtensionState::from_raw(mapped)
 }
 
-fn lossy_text(value: *const c_char) -> String {
-    if value.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(value) }
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
 unsafe fn hint_caller(info: &sys::ast_state_cb_info) -> Option<HintCaller> {
     if info.device_state_info.is_null() {
         return None;
@@ -169,8 +162,17 @@ unsafe fn hint_caller(info: &sys::ast_state_cb_info) -> Option<HintCaller> {
             break;
         };
         let channel = unsafe { (*device.as_ptr()).causing_channel };
-        if let Some(channel) = unsafe { ChannelRef::acquire(channel) } {
-            if let Ok(channel) = ChannelLock::acquire(channel) {
+        if channel.is_null() {
+            continue;
+        }
+        // Count every raw causal channel before retaining or locking it. A
+        // failed acquisition is still a cause and makes another identity
+        // ambiguous.
+        candidates.push(None);
+        *candidates.last_mut().expect("raw cause was just counted") = resolve_causal_candidate(
+            || unsafe { ChannelRef::acquire(channel) },
+            |channel| ChannelLock::acquire(channel).ok(),
+            |channel| {
                 let pickup_private = unsafe {
                     let value = sys::pbx_builtin_getvar_helper(
                         channel.as_ptr(),
@@ -180,15 +182,16 @@ unsafe fn hint_caller(info: &sys::ast_state_cb_info) -> Option<HintCaller> {
                 };
                 let caller = unsafe { sys::ast_channel_caller(channel.as_ptr()) };
                 let caller = unsafe { caller.as_ref() }.map(|caller| HintCaller {
-                    name: (caller.id.name.valid != 0).then(|| lossy_text(caller.id.name.str_)),
+                    name: (caller.id.name.valid != 0)
+                        .then(|| unsafe { nullable_lossy_c_text(caller.id.name.str_) }),
                     number: (caller.id.number.valid != 0)
-                        .then(|| lossy_text(caller.id.number.str_)),
+                        .then(|| unsafe { nullable_lossy_c_text(caller.id.number.str_) }),
                     name_presentation: caller.id.name.presentation,
                     number_presentation: caller.id.number.presentation,
                 });
-                candidates.push(visible_caller(pickup_private, caller));
-            }
-        }
+                visible_caller(pickup_private, caller)
+            },
+        );
     }
     unsafe { sys::ao2_iterator_destroy(&mut iterator) };
     unambiguous_caller(candidates)
@@ -205,8 +208,21 @@ fn unambiguous_caller(mut candidates: Vec<Option<HintCaller>>) -> Option<HintCal
     }
 }
 
+fn resolve_causal_candidate<Acquired, Locked>(
+    acquire: impl FnOnce() -> Option<Acquired>,
+    lock: impl FnOnce(Acquired) -> Option<Locked>,
+    inspect: impl FnOnce(&Locked) -> Option<HintCaller>,
+) -> Option<HintCaller> {
+    let acquired = acquire()?;
+    let locked = lock(acquired)?;
+    inspect(&locked)
+}
+
 fn visible_caller(pickup_private: bool, caller: Option<HintCaller>) -> Option<HintCaller> {
-    (!pickup_private).then_some(caller).flatten()
+    (!pickup_private)
+        .then_some(caller)
+        .flatten()
+        .filter(HintCaller::presentation_allowed)
 }
 
 unsafe extern "C" fn hint_update(
@@ -223,9 +239,9 @@ unsafe extern "C" fn hint_update(
     let watcher = unsafe { Arc::from_raw(watcher) };
     contain_callback_panic(-1, || {
         let info = unsafe { &*info };
-        let update = HintUpdate {
-            context: lossy_text(context),
-            extension: lossy_text(extension),
+        let _ = (context, extension);
+        let update = HintSnapshot {
+            target: watcher.target.clone(),
             state: hint_state(info.exten_state as c_int),
             reason: if info.reason as c_int == sys::AST_HINT_UPDATE_PRESENCE as c_int {
                 HintUpdateReason::Presence
@@ -262,14 +278,15 @@ unsafe fn release_watcher_reference(watcher: *const HintWatcher) {
 
 pub struct NativeHintAdapter;
 
-impl HintBackend for NativeHintAdapter {
+impl HintProvider for NativeHintAdapter {
     type Subscription = NativeHintSubscription;
+    type Error = HintError;
 
-    fn lookup(&self, context: &str, extension: &str) -> Result<Option<Hint>, HintError> {
-        let context =
-            CString::new(context).map_err(|_| HintError::InvalidText { field: "context" })?;
-        let extension =
-            CString::new(extension).map_err(|_| HintError::InvalidText { field: "extension" })?;
+    fn lookup(&self, target: &HintTarget) -> Result<Option<HintSnapshot>, HintError> {
+        let context = CString::new(target.context())
+            .map_err(|_| HintError::InvalidText { field: "context" })?;
+        let extension = CString::new(target.extension())
+            .map_err(|_| HintError::InvalidText { field: "extension" })?;
         let mut devices = AstBuffer::new(64)?;
         let mut name = AstBuffer::new(64)?;
         let found = unsafe {
@@ -286,28 +303,33 @@ impl HintBackend for NativeHintAdapter {
         if found == 0 {
             return Ok(None);
         }
-        Ok(Some(Hint {
-            devices: devices.text("hint devices")?,
-            name: name.text("hint name")?,
+        // Force strict UTF-8 validation of Asterisk's diagnostic fields even
+        // though the unified semantic model intentionally does not expose
+        // technology strings or hint labels.
+        let _ = (devices.text("hint devices")?, name.text("hint name")?);
+        Ok(Some(HintSnapshot {
+            target: target.clone(),
             state: hint_state(unsafe {
                 sys::ast_extension_state(ptr::null_mut(), context.as_ptr(), extension.as_ptr())
             }),
+            reason: HintUpdateReason::Device,
+            caller: None,
         }))
     }
 
     fn subscribe(
         &self,
-        context: &str,
-        extension: &str,
-        callback: OwnedHintCallback,
+        target: &HintTarget,
+        callback: HintCallback,
     ) -> Result<Self::Subscription, HintError> {
-        let context =
-            CString::new(context).map_err(|_| HintError::InvalidText { field: "context" })?;
-        let extension =
-            CString::new(extension).map_err(|_| HintError::InvalidText { field: "extension" })?;
+        let context = CString::new(target.context())
+            .map_err(|_| HintError::InvalidText { field: "context" })?;
+        let extension = CString::new(target.extension())
+            .map_err(|_| HintError::InvalidText { field: "extension" })?;
         let watcher = Arc::new(HintWatcher {
             id: AtomicI32::new(-1),
             watcher_reference: AtomicBool::new(true),
+            target: target.clone(),
             callback,
         });
         let watcher_reference = Arc::into_raw(Arc::clone(&watcher));
@@ -331,6 +353,8 @@ impl HintBackend for NativeHintAdapter {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn caller(number: &str) -> HintCaller {
@@ -358,6 +382,48 @@ mod tests {
             unambiguous_caller(vec![Some(caller("4000")), Some(caller("5000"))]),
             None
         );
+        assert_eq!(unambiguous_caller(vec![Some(caller("4000")), None]), None);
+    }
+
+    #[test]
+    fn acquisition_failure_still_counts_as_an_ambiguous_raw_cause() {
+        let lock_called = Cell::new(false);
+        let inspect_called = Cell::new(false);
+        let acquisition_failed = resolve_causal_candidate(
+            || None::<()>,
+            |_| {
+                lock_called.set(true);
+                Some(())
+            },
+            |_| {
+                inspect_called.set(true);
+                Some(caller("5000"))
+            },
+        );
+        assert!(!lock_called.get());
+        assert!(!inspect_called.get());
+        assert_eq!(
+            unambiguous_caller(vec![Some(caller("4000")), acquisition_failed]),
+            None
+        );
+    }
+
+    #[test]
+    fn lock_failure_still_counts_as_an_ambiguous_raw_cause() {
+        let inspect_called = Cell::new(false);
+        let lock_failed = resolve_causal_candidate(
+            || Some(()),
+            |_| None::<()>,
+            |_| {
+                inspect_called.set(true);
+                Some(caller("5000"))
+            },
+        );
+        assert!(!inspect_called.get());
+        assert_eq!(
+            unambiguous_caller(vec![Some(caller("4000")), lock_failed]),
+            None
+        );
     }
 
     #[test]
@@ -367,5 +433,16 @@ mod tests {
             visible_caller(false, Some(caller("4000"))),
             Some(caller("4000"))
         );
+    }
+
+    #[test]
+    fn restricted_presentation_never_crosses_the_native_boundary() {
+        let mut restricted_name = caller("4000");
+        restricted_name.name_presentation = 0x20;
+        assert_eq!(visible_caller(false, Some(restricted_name)), None);
+
+        let mut restricted_number = caller("4000");
+        restricted_number.number_presentation = 0x20;
+        assert_eq!(visible_caller(false, Some(restricted_number)), None);
     }
 }

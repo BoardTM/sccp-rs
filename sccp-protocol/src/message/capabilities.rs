@@ -282,28 +282,29 @@ impl CapabilityUpdate {
                 count: payload.len() - maximum,
             });
         }
+        let cursor = CapabilityCursor::new(payload, message_id);
 
         let audio_count = bounded_wire_count(
-            word(payload, 0, message_id)?,
+            cursor.word(0)?,
             MAX_AUDIO_CAPABILITIES,
             "audio capabilities",
             message_id,
         )?;
         let video_count = bounded_wire_count(
-            word(payload, 4, message_id)?,
+            cursor.word(4)?,
             MAX_VIDEO_CAPABILITIES,
             "video capabilities",
             message_id,
         )?;
         let data_count = bounded_wire_count(
-            word(payload, 8, message_id)?,
+            cursor.word(8)?,
             MAX_DATA_CAPABILITIES,
             "data capabilities",
             message_id,
         )?;
-        let rtp_payload_format = word(payload, 12, message_id)?;
+        let rtp_payload_format = cursor.word(12)?;
         let picture_count = bounded_wire_count(
-            word(payload, 16, message_id)?,
+            cursor.word(16)?,
             MAX_CUSTOM_PICTURES,
             "custom picture formats",
             message_id,
@@ -335,16 +336,10 @@ impl CapabilityUpdate {
         let mut custom_picture_formats = Vec::with_capacity(picture_count);
         for index in 0..picture_count {
             let offset = CUSTOM_PICTURES_OFFSET + index * CUSTOM_PICTURE_SIZE;
-            custom_picture_formats.push(CustomPictureFormat {
-                width: word(payload, offset, message_id)?,
-                height: word(payload, offset + 4, message_id)?,
-                pixel_aspect_ratio: word(payload, offset + 8, message_id)?,
-                pixel_clock_conversion: word(payload, offset + 12, message_id)?,
-                pixel_clock_divisor: word(payload, offset + 16, message_id)?,
-            });
+            custom_picture_formats.push(decode_picture_entry(&cursor, offset)?);
         }
 
-        let service_count = match optional_word(payload, CONFERENCE_OFFSET + 8) {
+        let service_count = match cursor.optional_word(CONFERENCE_OFFSET + 8) {
             Some(count) => bounded_wire_count(
                 count,
                 MAX_CONFERENCE_SERVICES,
@@ -363,104 +358,30 @@ impl CapabilityUpdate {
         )?;
         for index in 0..service_count {
             let offset = CONFERENCE_OFFSET + 12 + index * CONFERENCE_SERVICE_SIZE;
-            let layout_count = bounded_wire_count(
-                word(payload, offset, message_id)?,
-                MAX_SERVICE_LAYOUTS,
-                "conference service layouts",
-                message_id,
-            )?;
-            let mut layouts = Vec::with_capacity(layout_count);
-            for layout in 0..layout_count {
-                layouts.push(word(payload, offset + 4 + layout * 4, message_id)?);
-            }
-            services.push(ConferenceServiceResource {
-                layouts,
-                service_number: word(payload, offset + 24, message_id)?,
-                max_streams: word(payload, offset + 28, message_id)?,
-                max_conferences: word(payload, offset + 32, message_id)?,
-                active_conference_on_registration: word(payload, offset + 36, message_id)?,
-            });
+            services.push(decode_conference_service_entry(&cursor, offset)?);
         }
         let conference = ConferenceResource {
-            active_streams_on_registration: optional_word(payload, CONFERENCE_OFFSET).unwrap_or(0),
-            max_bandwidth: optional_word(payload, CONFERENCE_OFFSET + 4).unwrap_or(0),
+            active_streams_on_registration: cursor.optional_word(CONFERENCE_OFFSET).unwrap_or(0),
+            max_bandwidth: cursor.optional_word(CONFERENCE_OFFSET + 4).unwrap_or(0),
             services,
         };
 
         let mut audio = Vec::with_capacity(audio_count);
         for index in 0..audio_count {
             let offset = AUDIO_OFFSET + index * AUDIO_CAPABILITY_SIZE;
-            audio.push(MediaCapability {
-                codec: Codec::from(word(payload, offset, message_id)?),
-                max_frames_per_packet: word(payload, offset + 4, message_id)?,
-                codec_parameters: payload[offset + 8..offset + 16]
-                    .try_into()
-                    .expect("validated fixed audio capability bounds"),
-            });
+            audio.push(decode_audio_entry(&cursor, offset)?);
         }
 
         let mut video = Vec::with_capacity(video_count);
         for index in 0..video_count {
             let offset = VIDEO_OFFSET + index * video_size;
-            let level_count = bounded_wire_count(
-                word(payload, offset + 8, message_id)?,
-                MAX_LEVEL_PREFERENCES,
-                "video level preferences",
-                message_id,
-            )?;
-            let mut level_preferences = Vec::with_capacity(level_count);
-            for level in 0..level_count {
-                let level_offset = offset + 12 + level * 24;
-                level_preferences.push(VideoLevelPreference {
-                    transmit_preference: word(payload, level_offset, message_id)?,
-                    format: word(payload, level_offset + 4, message_id)?,
-                    max_bit_rate: word(payload, level_offset + 8, message_id)?,
-                    min_bit_rate: word(payload, level_offset + 12, message_id)?,
-                    minimum_picture_interval: word(payload, level_offset + 16, message_id)?,
-                    service_number: word(payload, level_offset + 20, message_id)?,
-                });
-            }
-            let parameters_offset =
-                offset + 108 + usize::from(variant == CapabilityUpdateVariant::Version3) * 4;
-            let codec_parameters = (0..variant.codec_parameter_words())
-                .map(|parameter| word(payload, parameters_offset + parameter * 4, message_id))
-                .collect::<Result<_, _>>()?;
-            video.push(VideoCapability {
-                codec: Codec::from(word(payload, offset, message_id)?),
-                direction: ReceiveTransmit::from_bits_retain(word(
-                    payload,
-                    offset + 4,
-                    message_id,
-                )?),
-                level_preferences,
-                codec_parameters,
-                encryption_capability: (variant == CapabilityUpdateVariant::Version3)
-                    .then(|| {
-                        word(payload, offset + 108, message_id).map(EncryptionCapability::from)
-                    })
-                    .transpose()?,
-                address_type: (variant == CapabilityUpdateVariant::Version3 && protocol >= 17)
-                    .then(|| word(payload, offset + 136, message_id).map(IpAddressType::from))
-                    .transpose()?,
-            });
+            video.push(decode_video_entry(&cursor, offset, variant, protocol)?);
         }
 
         let mut data = Vec::with_capacity(data_count);
         for index in 0..data_count {
             let offset = data_offset + index * variant.data_entry_size();
-            data.push(DataCapability {
-                payload_capability: word(payload, offset, message_id)?,
-                direction: ReceiveTransmit::from_bits_retain(word(
-                    payload,
-                    offset + 4,
-                    message_id,
-                )?),
-                protocol_dependent_data: word(payload, offset + 8, message_id)?,
-                max_bit_rate: word(payload, offset + 12, message_id)?,
-                encryption_capability: (variant == CapabilityUpdateVariant::Version3)
-                    .then(|| word(payload, offset + 16, message_id).map(EncryptionCapability::from))
-                    .transpose()?,
-            });
+            data.push(decode_data_entry(&cursor, offset, variant)?);
         }
 
         let trailing = payload.get(trailing_offset..).unwrap_or_default();
@@ -488,6 +409,156 @@ impl CapabilityUpdate {
             raw_payload: payload.to_vec(),
         })
     }
+}
+
+/// Offset-aware bounded reader for the fixed capability tables. Each family
+/// decoder receives this cursor instead of indexing the raw body directly.
+struct CapabilityCursor<'a> {
+    payload: &'a [u8],
+    message_id: u32,
+}
+
+impl<'a> CapabilityCursor<'a> {
+    const fn new(payload: &'a [u8], message_id: u32) -> Self {
+        Self {
+            payload,
+            message_id,
+        }
+    }
+
+    fn bytes(&self, offset: usize, length: usize) -> Result<&'a [u8], CodecError> {
+        let end = offset.checked_add(length).ok_or(CodecError::Truncated {
+            message_id: self.message_id,
+            needed: usize::MAX,
+            actual: self.payload.len(),
+        })?;
+        require_len(self.payload, end, self.message_id)?;
+        Ok(&self.payload[offset..end])
+    }
+
+    fn word(&self, offset: usize) -> Result<u32, CodecError> {
+        Ok(u32::from_le_bytes(
+            self.bytes(offset, 4)?
+                .try_into()
+                .expect("bounded capability word"),
+        ))
+    }
+
+    fn optional_word(&self, offset: usize) -> Option<u32> {
+        self.payload
+            .get(offset..offset + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+    }
+}
+
+fn decode_picture_entry(
+    cursor: &CapabilityCursor<'_>,
+    offset: usize,
+) -> Result<CustomPictureFormat, CodecError> {
+    Ok(CustomPictureFormat {
+        width: cursor.word(offset)?,
+        height: cursor.word(offset + 4)?,
+        pixel_aspect_ratio: cursor.word(offset + 8)?,
+        pixel_clock_conversion: cursor.word(offset + 12)?,
+        pixel_clock_divisor: cursor.word(offset + 16)?,
+    })
+}
+
+fn decode_conference_service_entry(
+    cursor: &CapabilityCursor<'_>,
+    offset: usize,
+) -> Result<ConferenceServiceResource, CodecError> {
+    let layout_count = bounded_wire_count(
+        cursor.word(offset)?,
+        MAX_SERVICE_LAYOUTS,
+        "conference service layouts",
+        cursor.message_id,
+    )?;
+    let layouts = (0..layout_count)
+        .map(|layout| cursor.word(offset + 4 + layout * 4))
+        .collect::<Result<_, _>>()?;
+    Ok(ConferenceServiceResource {
+        layouts,
+        service_number: cursor.word(offset + 24)?,
+        max_streams: cursor.word(offset + 28)?,
+        max_conferences: cursor.word(offset + 32)?,
+        active_conference_on_registration: cursor.word(offset + 36)?,
+    })
+}
+
+fn decode_audio_entry(
+    cursor: &CapabilityCursor<'_>,
+    offset: usize,
+) -> Result<MediaCapability, CodecError> {
+    Ok(MediaCapability {
+        codec: Codec::from(cursor.word(offset)?),
+        max_frames_per_packet: cursor.word(offset + 4)?,
+        codec_parameters: cursor
+            .bytes(offset + 8, 8)?
+            .try_into()
+            .expect("bounded audio capability parameters"),
+    })
+}
+
+fn decode_video_entry(
+    cursor: &CapabilityCursor<'_>,
+    offset: usize,
+    variant: CapabilityUpdateVariant,
+    protocol: u32,
+) -> Result<VideoCapability, CodecError> {
+    let level_count = bounded_wire_count(
+        cursor.word(offset + 8)?,
+        MAX_LEVEL_PREFERENCES,
+        "video level preferences",
+        cursor.message_id,
+    )?;
+    let level_preferences = (0..level_count)
+        .map(|level| {
+            let level_offset = offset + 12 + level * 24;
+            Ok(VideoLevelPreference {
+                transmit_preference: cursor.word(level_offset)?,
+                format: cursor.word(level_offset + 4)?,
+                max_bit_rate: cursor.word(level_offset + 8)?,
+                min_bit_rate: cursor.word(level_offset + 12)?,
+                minimum_picture_interval: cursor.word(level_offset + 16)?,
+                service_number: cursor.word(level_offset + 20)?,
+            })
+        })
+        .collect::<Result<_, CodecError>>()?;
+    let parameters_offset =
+        offset + 108 + usize::from(variant == CapabilityUpdateVariant::Version3) * 4;
+    let codec_parameters = (0..variant.codec_parameter_words())
+        .map(|parameter| cursor.word(parameters_offset + parameter * 4))
+        .collect::<Result<_, _>>()?;
+    Ok(VideoCapability {
+        codec: Codec::from(cursor.word(offset)?),
+        direction: ReceiveTransmit::from_bits_retain(cursor.word(offset + 4)?),
+        level_preferences,
+        codec_parameters,
+        encryption_capability: (variant == CapabilityUpdateVariant::Version3)
+            .then(|| cursor.word(offset + 108).map(EncryptionCapability::from))
+            .transpose()?,
+        address_type: (variant == CapabilityUpdateVariant::Version3 && protocol >= 17)
+            .then(|| cursor.word(offset + 136).map(IpAddressType::from))
+            .transpose()?,
+    })
+}
+
+fn decode_data_entry(
+    cursor: &CapabilityCursor<'_>,
+    offset: usize,
+    variant: CapabilityUpdateVariant,
+) -> Result<DataCapability, CodecError> {
+    Ok(DataCapability {
+        payload_capability: cursor.word(offset)?,
+        direction: ReceiveTransmit::from_bits_retain(cursor.word(offset + 4)?),
+        protocol_dependent_data: cursor.word(offset + 8)?,
+        max_bit_rate: cursor.word(offset + 12)?,
+        encryption_capability: (variant == CapabilityUpdateVariant::Version3)
+            .then(|| cursor.word(offset + 16).map(EncryptionCapability::from))
+            .transpose()?,
+    })
 }
 
 fn bounded_wire_count(
@@ -537,22 +608,6 @@ fn require_declared_entries(
     } else {
         require_len(payload, offset + count * entry_size, message_id)
     }
-}
-
-fn word(payload: &[u8], offset: usize, message_id: u32) -> Result<u32, CodecError> {
-    require_len(payload, offset + 4, message_id)?;
-    Ok(u32::from_le_bytes(
-        payload[offset..offset + 4]
-            .try_into()
-            .expect("validated word bounds"),
-    ))
-}
-
-fn optional_word(payload: &[u8], offset: usize) -> Option<u32> {
-    payload
-        .get(offset..offset + 4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u32::from_le_bytes)
 }
 
 #[cfg(test)]

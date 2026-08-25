@@ -11,6 +11,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use super::validation::{text_length_is_within, validate_count};
 use super::xml::{PhoneXmlError, from_bytes, to_string, to_writer as write_document};
 
 /// Maximum encoded size of a provisioning XML document, in bytes.
@@ -766,18 +767,6 @@ fn validate_host(value: &str) -> Result<(), PhoneXmlError> {
     Ok(())
 }
 
-fn validate_count(kind: &'static str, actual: usize, maximum: usize) -> Result<(), PhoneXmlError> {
-    if actual > maximum {
-        Err(PhoneXmlError::LimitExceeded {
-            kind,
-            actual,
-            maximum,
-        })
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_optional_text(
     field: &'static str,
     value: Option<&str>,
@@ -796,8 +785,7 @@ fn validate_text(
     minimum: usize,
     maximum: usize,
 ) -> Result<(), PhoneXmlError> {
-    let length = value.chars().count();
-    if !(minimum..=maximum).contains(&length)
+    if !text_length_is_within(value, minimum, maximum)
         || value.chars().any(|character| character.is_control())
     {
         Err(PhoneXmlError::InvalidField {

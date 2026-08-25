@@ -1,8 +1,39 @@
-use super::super::*;
+use super::{
+    Access, AmiEventPublisher, Arc, AsteriskDatabase, AsteriskDialplan, AsteriskHints,
+    AsteriskHttp, AsteriskManager, AsteriskParking, AsyncMutex, AtomicU64, BTreeMap,
+    BlfSubscriptions, Builder, CallId, CallSelectionOrder, Codec, ConferenceTaskRegistry,
+    ConfigurationProvider, Controller, DeviceId, Duration, ExternalAddressCache, FeatureStore,
+    ForwardingEntryRegistry, HashMap, HashSet, Instant, LineBinding, LineInstance, LogLevel,
+    MODULE, MediaAnchorRegistry, MediaAnchorRestores, MediaEndpoint, MobilityRegistry, Module,
+    ModuleConfig, Mutex, MutexExt as _, NoAnswerTimerRegistry, ParkingRegistry, PbxCallId,
+    PhoneCommand, PhoneCommandAction, RegistrationFallback, RegistrationRegistryError,
+    RegistrationTokenPolicy, ReloadPlan, ReloadSelection, RuntimeCallSignal,
+    RuntimeCallSignalDeliveryResult, RuntimeCallSignalKind, RuntimeCallSignalQueue,
+    RuntimeCalledPartyProvider, RuntimeChannelQueryProvider, RuntimeCodecPreferenceProvider,
+    RuntimeControlProvider, RuntimeDeviceQueryProvider, RuntimeDirectoryProvider,
+    RuntimeFeatureControlProvider, RuntimeHandsetMessageProvider, RuntimeInventoryProvider,
+    RuntimeLineQueryProvider, RuntimeRegistrationContexts, RuntimeServiceProvider, RwLock,
+    RwLockExt as _, Semaphore, Server, ServerConfig, ServerIngress, Shared, SignalingQos,
+    SignalingSocket, StagedMwiSubscriptions, StationIo, StationTransport, SystemHostResolver,
+    adapters, anonymous_hotline_definition, ast_log, configured_mobility_button, controller_step,
+    dial_terminator_digit, log_feature_store_error, mobility_device_registered, mpsc,
+    native_channel, publish_device_features, publish_feature_changes, publish_line,
+    register_called_party_application, register_channel_query,
+    register_codec_preference_application, register_control_actions, register_device_query,
+    register_directory_http, register_feature_control_actions,
+    register_handset_message_application, register_inventory_actions, register_line_query,
+    register_runtime_status_actions, register_service_control_actions, run_call_signals,
+    run_events, shutdown_conferences, shutdown_one_way_microphones, shutdown_remote_hangups,
+    uninstall_blf, uninstall_device_blf,
+};
+use crate::call::parking::ParkingEventSource as _;
 use crate::media::encryption::AudioEncryptionAdmissions;
 use crate::runtime::tls::RuntimeTlsAcceptor;
+use sccp_protocol::StationSocketQos as _;
 use std::net::SocketAddr;
 use std::os::fd::AsFd;
+use std::path::PathBuf;
+use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
 impl From<crate::config::FallbackDecision> for RegistrationFallback {
@@ -26,6 +57,33 @@ impl From<crate::config::CallAnswerOrder> for CallSelectionOrder {
 }
 
 const MAX_CONCURRENT_SECURE_HANDSHAKES: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptedSocketStage {
+    Accept,
+    ConfigureNoDelay,
+    InspectLocalAddress,
+}
+
+fn accepted_socket_error(
+    kind: &str,
+    stage: AcceptedSocketStage,
+    error: &dyn std::fmt::Display,
+) -> String {
+    match stage {
+        AcceptedSocketStage::Accept => format!("{kind} signaling listener failed: {error}"),
+        AcceptedSocketStage::ConfigureNoDelay => {
+            format!("unable to configure {kind} signaling socket: {error}")
+        }
+        AcceptedSocketStage::InspectLocalAddress => {
+            format!("unable to inspect {kind} signaling socket: {error}")
+        }
+    }
+}
+
+fn secure_handshake_limiter() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(MAX_CONCURRENT_SECURE_HANDSHAKES))
+}
 
 async fn bind_runtime_listeners(
     clear: std::net::SocketAddr,
@@ -87,11 +145,19 @@ fn report_socket_qos(
     kind: &str,
     endpoint: SocketAddr,
 ) {
-    for failure in socket.apply(signaling_qos).failures() {
-        ast_log(
-            LogLevel::Warning,
-            &format!("{kind} signaling socket {endpoint}: {failure}"),
-        );
+    report_socket_qos_failures(socket.apply(signaling_qos), kind, endpoint, |message| {
+        ast_log(LogLevel::Warning, &message)
+    });
+}
+
+fn report_socket_qos_failures(
+    report: sccp_protocol::SocketQosReport,
+    kind: &str,
+    endpoint: SocketAddr,
+    mut warn: impl FnMut(String),
+) {
+    for failure in report.into_failures() {
+        warn(format!("{kind} signaling socket {endpoint}: {failure}"));
     }
 }
 
@@ -117,19 +183,35 @@ where
     .map_err(|error| error.to_string())
 }
 
+async fn accept_station_socket(
+    listener: &TcpListener,
+    kind: &'static str,
+) -> Result<
+    (
+        tokio::net::TcpStream,
+        SocketAddr,
+        SocketAddr,
+        Option<SignalingSocket>,
+    ),
+    String,
+> {
+    let (stream, peer) = listener
+        .accept()
+        .await
+        .map_err(|error| accepted_socket_error(kind, AcceptedSocketStage::Accept, &error))?;
+    stream.set_nodelay(true).map_err(|error| {
+        accepted_socket_error(kind, AcceptedSocketStage::ConfigureNoDelay, &error)
+    })?;
+    let local = stream.local_addr().map_err(|error| {
+        accepted_socket_error(kind, AcceptedSocketStage::InspectLocalAddress, &error)
+    })?;
+    let socket_qos = capture_socket_qos(&stream, local, kind);
+    Ok((stream, peer, local, socket_qos))
+}
+
 async fn run_clear_listener(listener: TcpListener, ingress: ServerIngress) -> Result<(), String> {
     loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .map_err(|error| format!("clear signaling listener failed: {error}"))?;
-        stream
-            .set_nodelay(true)
-            .map_err(|error| format!("unable to configure clear signaling socket: {error}"))?;
-        let local = stream
-            .local_addr()
-            .map_err(|error| format!("unable to inspect clear signaling socket: {error}"))?;
-        let socket_qos = capture_socket_qos(&stream, local, "clear");
+        let (stream, peer, local, socket_qos) = accept_station_socket(&listener, "clear").await?;
         admit_station(
             &ingress,
             stream,
@@ -150,7 +232,7 @@ async fn run_secure_listener(
     let Some((listener, acceptor)) = listener.zip(acceptor) else {
         return std::future::pending().await;
     };
-    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_SECURE_HANDSHAKES));
+    let permits = secure_handshake_limiter();
     let mut handshakes = JoinSet::new();
     loop {
         while let Some(result) = handshakes.try_join_next() {
@@ -165,17 +247,7 @@ async fn run_secure_listener(
             .acquire_owned()
             .await
             .map_err(|_| "secure signaling handshake limiter stopped".to_owned())?;
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .map_err(|error| format!("secure signaling listener failed: {error}"))?;
-        stream
-            .set_nodelay(true)
-            .map_err(|error| format!("unable to configure secure signaling socket: {error}"))?;
-        let local = stream
-            .local_addr()
-            .map_err(|error| format!("unable to inspect secure signaling socket: {error}"))?;
-        let socket_qos = capture_socket_qos(&stream, local, "secure");
+        let (stream, peer, local, socket_qos) = accept_station_socket(&listener, "secure").await?;
         let acceptor = acceptor.clone();
         let ingress = ingress.clone();
         handshakes.spawn(async move {
@@ -210,6 +282,95 @@ impl From<native_channel::ChannelIdentity> for ChannelState {
             pbx_id: PbxCallId(identity.pbx_id),
             sccp_id: CallId(identity.sccp_id),
         }
+    }
+}
+
+#[cfg(test)]
+mod accepted_socket_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn clear_and_secure_accept_paths_share_socket_setup_and_qos_capture() {
+        for kind in ["clear", "secure"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let connect =
+                tokio::spawn(async move { tokio::net::TcpStream::connect(address).await });
+            let (stream, peer, local, socket_qos) =
+                accept_station_socket(&listener, kind).await.unwrap();
+            connect.await.unwrap().unwrap();
+            assert!(stream.nodelay().unwrap());
+            assert_eq!(local, address);
+            assert_eq!(
+                peer.ip(),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            );
+            assert!(socket_qos.is_some());
+        }
+    }
+
+    #[test]
+    fn clear_and_secure_accept_failures_keep_the_listener_family() {
+        for kind in ["clear", "secure"] {
+            for (stage, expected) in [
+                (
+                    AcceptedSocketStage::Accept,
+                    format!("{kind} signaling listener failed: closed"),
+                ),
+                (
+                    AcceptedSocketStage::ConfigureNoDelay,
+                    format!("unable to configure {kind} signaling socket: closed"),
+                ),
+                (
+                    AcceptedSocketStage::InspectLocalAddress,
+                    format!("unable to inspect {kind} signaling socket: closed"),
+                ),
+            ] {
+                assert_eq!(accepted_socket_error(kind, stage, &"closed"), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn secure_handshake_limiter_holds_the_sixty_fifth_handshake() {
+        let permits = secure_handshake_limiter();
+        let occupied = Arc::clone(&permits)
+            .acquire_many_owned(MAX_CONCURRENT_SECURE_HANDSHAKES as u32)
+            .await
+            .unwrap();
+        assert_eq!(permits.available_permits(), 0);
+        let pending = Arc::clone(&permits).acquire_owned();
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        drop(occupied);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn qos_application_failures_are_reported_with_listener_identity() {
+        let report = sccp_protocol::SocketQosReport::failed(
+            sccp_protocol::SocketQosMark::Dscp,
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        );
+        let mut warnings = Vec::new();
+        report_socket_qos_failures(
+            report,
+            "secure",
+            "127.0.0.1:2000".parse().unwrap(),
+            |message| warnings.push(message),
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("secure signaling socket 127.0.0.1:2000"));
+        assert!(warnings[0].contains("unable to apply socket DSCP"));
     }
 }
 

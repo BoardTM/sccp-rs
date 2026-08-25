@@ -1,5 +1,14 @@
-use super::super::*;
+use super::{
+    Access, AddressSelectionPolicy, AsteriskBackend, AudioProcessingPolicy, CallId, CallState,
+    Codec, DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET, DEFAULT_AUDIO_PACKET_MS, DeviceId, DirectMediaCall,
+    DirectMediaPolicy, DtmfMode, Instant, IpAddr, LogLevel, MediaEndpoint, MediaEndpointAddress,
+    MediaStreamState, MediaTrafficClass, ModuleConfig, MutexExt as _, NonNull, OutboundMediaMode,
+    PbxCallId, PhoneCommand, PhoneCommandAction, ResolvedExternalAddresses, ast_log,
+    canonical_ip_address, controller_step, native_channel, state_from_channel, sys, with_channel,
+};
+use crate::media::direct::direct_failure_anchor;
 use crate::media::encryption::{AudioEncryptionAdmission, MediaEncryptionDecision};
+use crate::runtime::backend::MediaBackend as _;
 
 fn audio_encryption_admission(
     access: &Access,

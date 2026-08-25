@@ -84,20 +84,16 @@ struct RecordingId {
 }
 
 struct CallbackOwner {
-    callback: Option<RecordingCallback>,
+    callback: RecordingCallback,
 }
 
 impl CallbackOwner {
     fn new(callback: RecordingCallback) -> Self {
-        Self {
-            callback: Some(callback),
-        }
+        Self { callback }
     }
 
     fn notify(&self, event: RecordingEvent) {
-        if let Some(callback) = &self.callback {
-            callback(event);
-        }
+        (self.callback)(event);
     }
 }
 
@@ -333,8 +329,8 @@ unsafe fn publish_mute_event(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -364,6 +360,38 @@ mod tests {
         let owner = CallbackOwner::new(callback);
         owner.notify(RecordingEvent::Started);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn session_field_order_destroys_callback_before_channel_owner() {
+        struct Probe {
+            name: &'static str,
+            order: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.order.lock().unwrap().push(self.name);
+            }
+        }
+        struct SessionOrder {
+            callback: Probe,
+            channel: Probe,
+        }
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let session = SessionOrder {
+            callback: Probe {
+                name: "callback",
+                order: Arc::clone(&order),
+            },
+            channel: Probe {
+                name: "channel",
+                order: Arc::clone(&order),
+            },
+        };
+        let _ = (&session.callback, &session.channel);
+        drop(session);
+        assert_eq!(*order.lock().unwrap(), ["callback", "channel"]);
     }
 
     #[test]

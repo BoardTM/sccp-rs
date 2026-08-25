@@ -1,4 +1,8 @@
-use super::super::*;
+use super::{
+    AsteriskChannel, AsteriskChannelMetadata, AsteriskPartyUpdates, AutoAnswerMode, CString,
+    CallMetadata, ChannelState, Codec, Digit, LogLevel, ModuleConfig, NonNull, PartySnapshot,
+    PbxAudioFormat, native_channel, parse_requestor_mode, pbx_audio_format, raw, sys,
+};
 
 pub fn format_for(codec: Codec) -> Option<native_channel::NativeAudioFormat> {
     Some(native_audio_format(pbx_audio_format(codec).ok()?))
@@ -74,15 +78,8 @@ pub unsafe fn take_state_from_channel(channel: *mut sys::ast_channel) -> Option<
     unsafe { native_channel::take_channel_identity(channel) }.map(ChannelState::from)
 }
 
-pub fn c_string(value: &str) -> CString {
-    let bytes = value
-        .as_bytes()
-        .iter()
-        .copied()
-        .filter(|byte| *byte != 0)
-        .collect::<Vec<_>>();
-    // SAFETY: the filtering step above removes every interior NUL byte.
-    unsafe { CString::from_vec_unchecked(bytes) }
+pub fn c_string(value: &str) -> Result<CString, crate::asterisk::boundary::NativeTextError> {
+    crate::asterisk::boundary::native_c_string(value)
 }
 
 pub fn requestor_auto_answer_mode(
@@ -102,54 +99,151 @@ pub fn ast_log(level: LogLevel, message: &str) {
     raw::system::log_message(level, message);
 }
 
-pub fn read_party_snapshot(channel: *mut sys::ast_channel) -> Option<PartySnapshot> {
+fn read_snapshot_with<T, Borrowed, BorrowError, CopyError>(
+    channel: *mut sys::ast_channel,
+    description: &'static str,
+    borrow: impl FnOnce(*mut sys::ast_channel) -> Result<Borrowed, BorrowError>,
+    copy: impl FnOnce(&Borrowed) -> Result<T, CopyError>,
+    warn: impl Fn(&str),
+) -> Option<T>
+where
+    BorrowError: std::fmt::Display,
+    CopyError: std::fmt::Display,
+{
     if channel.is_null() {
         return None;
     }
-    let channel = match unsafe { AsteriskChannel::from_raw(channel.cast()) } {
+    let channel = match borrow(channel) {
         Ok(channel) => channel,
         Err(error) => {
-            ast_log(
-                LogLevel::Warning,
-                &format!("unable to borrow channel party metadata: {error}"),
-            );
+            warn(&format!("unable to borrow {description}: {error}"));
             return None;
         }
     };
-    match AsteriskPartyUpdates::new().snapshot(&channel) {
-        Ok(snapshot) => Some(snapshot),
+    match copy(&channel) {
+        Ok(value) => Some(value),
         Err(error) => {
-            ast_log(
-                LogLevel::Warning,
-                &format!("unable to copy channel party metadata: {error}"),
-            );
+            warn(&format!("unable to copy {description}: {error}"));
             None
         }
     }
 }
 
+fn read_native_channel_snapshot<T, E>(
+    channel: *mut sys::ast_channel,
+    description: &'static str,
+    copy: impl for<'channel> FnOnce(&AsteriskChannel<'channel>) -> Result<T, E>,
+) -> Option<T>
+where
+    E: std::fmt::Display,
+{
+    read_snapshot_with(
+        channel,
+        description,
+        |channel| unsafe { AsteriskChannel::from_raw(channel.cast()) },
+        copy,
+        |message| ast_log(LogLevel::Warning, message),
+    )
+}
+
+pub fn read_party_snapshot(channel: *mut sys::ast_channel) -> Option<PartySnapshot> {
+    read_native_channel_snapshot(channel, "channel party metadata", |channel| {
+        AsteriskPartyUpdates::new().snapshot(channel)
+    })
+}
+
 pub fn read_channel_metadata(channel: *mut sys::ast_channel) -> Option<CallMetadata> {
-    if channel.is_null() {
-        return None;
+    read_native_channel_snapshot(channel, "PBX channel metadata", |channel| {
+        AsteriskChannelMetadata::new().snapshot(channel)
+    })
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    fn non_null_channel() -> *mut sys::ast_channel {
+        NonNull::<sys::ast_channel>::dangling().as_ptr()
     }
-    let channel = match unsafe { AsteriskChannel::from_raw(channel.cast()) } {
-        Ok(channel) => channel,
-        Err(error) => {
-            ast_log(
-                LogLevel::Warning,
-                &format!("unable to borrow PBX channel metadata: {error}"),
+
+    #[test]
+    fn both_snapshot_families_reject_null_before_borrowing() {
+        for description in ["channel party metadata", "PBX channel metadata"] {
+            let borrowed = RefCell::new(false);
+            let result = read_snapshot_with(
+                ptr::null_mut(),
+                description,
+                |_| {
+                    *borrowed.borrow_mut() = true;
+                    Ok::<_, &'static str>(())
+                },
+                |_| Ok::<_, &'static str>(()),
+                |_| {},
             );
-            return None;
+            assert_eq!(result, None);
+            assert!(!*borrowed.borrow());
         }
-    };
-    match AsteriskChannelMetadata::new().snapshot(&channel) {
-        Ok(metadata) => Some(metadata),
-        Err(error) => {
-            ast_log(
-                LogLevel::Warning,
-                &format!("unable to copy PBX channel metadata: {error}"),
+    }
+
+    #[test]
+    fn party_snapshot_reports_borrow_and_copy_failures() {
+        for copy_fails in [false, true] {
+            let warnings = RefCell::new(Vec::new());
+            let result = read_snapshot_with(
+                non_null_channel(),
+                "channel party metadata",
+                |_| {
+                    if copy_fails {
+                        Ok(())
+                    } else {
+                        Err("borrow failed")
+                    }
+                },
+                |_| Err::<(), _>("copy failed"),
+                |message| warnings.borrow_mut().push(message.to_owned()),
             );
-            None
+            assert_eq!(result, None);
+            assert_eq!(warnings.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn metadata_snapshot_reports_borrow_and_copy_failures() {
+        for borrow_fails in [true, false] {
+            let warnings = RefCell::new(Vec::new());
+            let result = read_snapshot_with(
+                non_null_channel(),
+                "PBX channel metadata",
+                |_| {
+                    if borrow_fails {
+                        Err("borrow failed")
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| Err::<(), _>("copy failed"),
+                |message| warnings.borrow_mut().push(message.to_owned()),
+            );
+            assert_eq!(result, None);
+            assert_eq!(warnings.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn both_snapshot_families_copy_owned_values_without_leaking_the_borrow() {
+        for description in ["channel party metadata", "PBX channel metadata"] {
+            let warnings = RefCell::new(Vec::new());
+            let result = read_snapshot_with(
+                non_null_channel(),
+                description,
+                |_| Ok::<_, &'static str>("borrowed"),
+                |value| Ok::<_, &'static str>(value.to_uppercase()),
+                |message| warnings.borrow_mut().push(message.to_owned()),
+            );
+            assert_eq!(result.as_deref(), Some("BORROWED"));
+            assert!(warnings.borrow().is_empty());
         }
     }
 }

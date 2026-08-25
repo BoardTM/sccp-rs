@@ -636,18 +636,14 @@ fn validate_arguments(arguments: &[&str]) -> Result<(), CliDiagnosticError> {
 }
 
 fn parse_device(value: &str) -> Result<DeviceId, CliDiagnosticError> {
-    DeviceId::new(value).map_err(|_| CliDiagnosticError::InvalidSelector)
+    super::cli_support::parse_device(value, || CliDiagnosticError::InvalidSelector)
 }
 
 fn parse_positive<T>(value: &str) -> Result<T, CliDiagnosticError>
 where
     T: std::str::FromStr + PartialEq + Default,
 {
-    value
-        .parse::<T>()
-        .ok()
-        .filter(|value| *value != T::default())
-        .ok_or(CliDiagnosticError::InvalidSelector)
+    super::cli_support::parse_positive(value, || CliDiagnosticError::InvalidSelector)
 }
 
 fn parse_identity(pbx_id: &str, call_id: &str) -> Result<(u64, u64), CliDiagnosticError> {

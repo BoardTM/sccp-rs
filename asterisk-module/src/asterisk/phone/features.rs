@@ -1,6 +1,20 @@
 //! Device feature, forwarding, DND, and voicemail interactions.
 
-use super::*;
+use super::{
+    Access, AsteriskBackend, ButtonDefinition, ButtonType, CallId, DeviceFeatureState, DeviceId,
+    Digit, DndButtonMode, DndMode, DndMutation, DriverEffect, Duration, FeatureChange,
+    FeatureControlProviderError, FeatureStoreError, ForwardingCommit, ForwardingDestination,
+    ForwardingDigitOutcome, ForwardingEntryTiming, ForwardingExpiryOutcome, ForwardingKind,
+    ForwardingRejection, ForwardingWriteOutcome, Instant, LineInstance, LogLevel,
+    MANAGER_CONTROL_DELIVERY_TIMEOUT, ManagementEvent, ModuleConfig, MutexExt as _, PbxAudioFormat,
+    PbxEffect, PhoneCommand, PhoneCommandAction, PhoneDndButtonMode, PhoneDndMode, SoftKey,
+    VoicemailNativeOutcome, VoicemailPlan, VoicemailTarget, ast_log, configure_pickup_policy,
+    configured_feature_state, controller_step, default_button_mode, dial_terminator_digit,
+    execute_effects, execute_forwarding_mutation, feature_changes, feature_event,
+    forwarding_ui_line_instances, handset_status_message, preferred_codec, publish_device_lines,
+    publish_line, with_channel,
+};
+use crate::runtime::backend::SupplementaryBackend as _;
 
 pub fn update_device_features_locked(
     access: &Access,
@@ -25,6 +39,164 @@ pub fn update_device_features_locked(
         controller.set_feature_state(device_id, next.clone())
     });
     Ok(Some((current, next)))
+}
+
+pub fn publish_device_features(access: &Access, device_id: &DeviceId, state: &DeviceFeatureState) {
+    let config = access.config();
+    let line_instances = forwarding_ui_line_instances(
+        None,
+        config
+            .appearances_for_device(device_id)
+            .map(|binding| (binding.line.number.as_str(), binding.line_instance)),
+    )
+    .unwrap_or_default();
+    for line_instance in line_instances {
+        access.spawn_phone(PhoneCommand::new(
+            device_id.clone(),
+            PhoneCommandAction::SetForwardStatus {
+                line_instance: LineInstance::new(line_instance),
+                forward_all: state
+                    .forwarding
+                    .all
+                    .clone()
+                    .map(ForwardingDestination::into_string),
+                forward_busy: state
+                    .forwarding
+                    .busy
+                    .clone()
+                    .map(ForwardingDestination::into_string),
+                forward_no_answer: state
+                    .forwarding
+                    .no_answer
+                    .clone()
+                    .map(ForwardingDestination::into_string),
+            },
+        ));
+    }
+    let Some(device) = config.devices.get(device_id) else {
+        return;
+    };
+    access.spawn_phone(PhoneCommand::new(
+        device_id.clone(),
+        PhoneCommandAction::SetStatusMessage {
+            message: handset_status_message(state.dnd),
+            beep: false,
+        },
+    ));
+    for (instance, button_mode) in config.dnd_buttons_for_device(device_id) {
+        access.spawn_phone(PhoneCommand::new(
+            device_id.clone(),
+            PhoneCommandAction::SetDoNotDisturbStatus {
+                instance: LineInstance::new(instance),
+                mode: phone_dnd_mode(state.dnd),
+                button_mode: phone_dnd_button_mode(button_mode),
+            },
+        ));
+    }
+    for button in &device.buttons {
+        let ButtonDefinition::Feature(feature) = button else {
+            continue;
+        };
+        if feature.feature == ButtonType::DoNotDisturb {
+            continue;
+        }
+        let enabled = match feature.feature {
+            ButtonType::ForwardAll => state.forwarding.all.is_some(),
+            ButtonType::ForwardBusy => state.forwarding.busy.is_some(),
+            ButtonType::ForwardNoAnswer => state.forwarding.no_answer.is_some(),
+            ButtonType::ParkingLot => config
+                .parking_lot_for_button(device_id, feature.instance)
+                .is_some_and(|button| {
+                    access
+                        .shared
+                        .parking_registry
+                        .lock_unpoisoned()
+                        .lot_has_calls(&button.lot)
+                }),
+            _ => state
+                .buttons
+                .get(&feature.instance)
+                .copied()
+                .unwrap_or(false),
+        };
+        access.spawn_phone(PhoneCommand::new(
+            device_id.clone(),
+            PhoneCommandAction::SetFeatureStatus {
+                instance: LineInstance::new(feature.instance),
+                enabled,
+            },
+        ));
+    }
+}
+
+pub(super) const fn phone_dnd_mode(mode: DndMode) -> PhoneDndMode {
+    match mode {
+        DndMode::Off => PhoneDndMode::Off,
+        DndMode::Silent => PhoneDndMode::Silent,
+        DndMode::Reject => PhoneDndMode::Reject,
+    }
+}
+
+pub(super) const fn phone_dnd_button_mode(mode: DndButtonMode) -> PhoneDndButtonMode {
+    match mode {
+        DndButtonMode::Cycle => PhoneDndButtonMode::Cycle,
+        DndButtonMode::Silent => PhoneDndButtonMode::Silent,
+        DndButtonMode::Reject => PhoneDndButtonMode::Reject,
+    }
+}
+
+pub fn publish_ami_event(access: &Access, event: &ManagementEvent) {
+    if let Err(error) = access.shared.ami_events.publish(event) {
+        ast_log(
+            LogLevel::Warning,
+            &format!("unable to publish a management event: {error}"),
+        );
+    }
+}
+
+pub fn publish_feature_changes(
+    access: &Access,
+    device_id: &DeviceId,
+    previous: &DeviceFeatureState,
+    current: &DeviceFeatureState,
+) {
+    for change in feature_changes(previous, current) {
+        publish_ami_event(access, &feature_event(device_id, change));
+    }
+}
+
+pub async fn expire_forwarding_entries(access: &Access, now: Instant) {
+    let expired = access
+        .shared
+        .forwarding_entries
+        .lock_unpoisoned()
+        .claim_expired(now);
+    for outcome in expired {
+        match outcome {
+            ForwardingExpiryOutcome::Cancel(entry) => {
+                if send_confirmed_forwarding(
+                    access,
+                    PhoneCommand::new(
+                        entry.device_id,
+                        PhoneCommandAction::CloseCall {
+                            call_id: entry.call_id,
+                        },
+                    ),
+                )
+                .await
+                    == ForwardingWriteOutcome::Failed
+                {
+                    ast_log(
+                        LogLevel::Warning,
+                        "unable to close expired forwarding collection on the handset",
+                    );
+                }
+            }
+            ForwardingExpiryOutcome::Commit(commit) => {
+                finish_forwarding_commit(access, commit).await;
+            }
+        }
+    }
 }
 
 pub enum RuntimeDndMutation {

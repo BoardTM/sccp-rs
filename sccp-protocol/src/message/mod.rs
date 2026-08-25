@@ -52,6 +52,9 @@ pub const MULTIMEDIA_CAPABILITY_BYTES: usize = 76;
 /// Maximum picture-format entries in one multimedia video capability.
 pub const MAX_MULTIMEDIA_PICTURE_FORMATS: usize = 5;
 
+/// Number of definitions reserved by the fixed 96-byte ButtonTemplate body.
+pub(crate) const BUTTON_TEMPLATE_ENTRIES_PER_CHUNK: usize = 42;
+
 /// Non-zero token placed in the SCCP pass-through-party field to identify one
 /// media request generation, rather than the lifetime of a call.
 ///
@@ -152,179 +155,14 @@ impl MediaRequestIdentity {
     }
 }
 
-/// Raw numeric message identifiers retained for source compatibility.
+/// Legacy numeric message identifiers generated from the canonical catalog.
 ///
+/// The alias spelling map contains no wire values, so the catalog remains the
+/// single numeric source of truth even for historical `*_REQ`/`*_RES` names.
 /// New code should generally use [`catalog::MessageId`], which also exposes
 /// routing and wire-contract metadata.
 pub mod id {
-    pub const KEEP_ALIVE: u32 = 0x0000;
-    pub const REGISTER: u32 = 0x0001;
-    pub const IP_PORT: u32 = 0x0002;
-    pub const KEYPAD_BUTTON: u32 = 0x0003;
-    pub const ENBLOC_CALL: u32 = 0x0004;
-    pub const STIMULUS: u32 = 0x0005;
-    pub const OFF_HOOK: u32 = 0x0006;
-    pub const ON_HOOK: u32 = 0x0007;
-    pub const HOOK_FLASH: u32 = 0x0008;
-    pub const FORWARD_STAT_REQ: u32 = 0x0009;
-    pub const SPEED_DIAL_STAT_REQ: u32 = 0x000a;
-    pub const LINE_STAT_REQ: u32 = 0x000b;
-    pub const CONFIG_STAT_REQ: u32 = 0x000c;
-    pub const TIME_DATE_REQ: u32 = 0x000d;
-    pub const BUTTON_TEMPLATE_REQ: u32 = 0x000e;
-    pub const VERSION_REQ: u32 = 0x000f;
-    pub const CAPABILITIES_RES: u32 = 0x0010;
-    pub const SERVER_REQ: u32 = 0x0012;
-    pub const ALARM: u32 = 0x0020;
-    pub const MULTICAST_MEDIA_RECEPTION_ACK: u32 = 0x0021;
-    pub const OPEN_RECEIVE_CHANNEL_ACK: u32 = 0x0022;
-    pub const CONNECTION_STATISTICS_RES: u32 = 0x0023;
-    pub const OFF_HOOK_WITH_CALLING_PARTY: u32 = 0x0024;
-    pub const SOFT_KEY_SET_REQ: u32 = 0x0025;
-    pub const SOFT_KEY_EVENT: u32 = 0x0026;
-    pub const UNREGISTER: u32 = 0x0027;
-    pub const SOFT_KEY_TEMPLATE_REQ: u32 = 0x0028;
-    pub const REGISTER_TOKEN_REQ: u32 = 0x0029;
-    pub const MEDIA_TRANSMISSION_FAILURE: u32 = 0x002a;
-    pub const HEADSET_STATUS: u32 = 0x002b;
-    pub const MEDIA_RESOURCE_NOTIFICATION: u32 = 0x002c;
-    pub const REGISTER_AVAILABLE_LINES: u32 = 0x002d;
-    pub const DEVICE_TO_USER_DATA: u32 = 0x002e;
-    pub const DEVICE_TO_USER_DATA_RESPONSE: u32 = 0x002f;
-    pub const UPDATE_CAPABILITIES: u32 = 0x0030;
-    pub const OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK: u32 = 0x0031;
-    pub const CLEAR_CONFERENCE: u32 = 0x0032;
-    pub const SERVICE_URL_STAT_REQ: u32 = 0x0033;
-    pub const FEATURE_STAT_REQ: u32 = 0x0034;
-    pub const CREATE_CONFERENCE_RES: u32 = 0x0035;
-    pub const DELETE_CONFERENCE_RES: u32 = 0x0036;
-    pub const MODIFY_CONFERENCE_RES: u32 = 0x0037;
-    pub const ADD_PARTICIPANT_RES: u32 = 0x0038;
-    pub const AUDIT_CONFERENCE_RES: u32 = 0x0039;
-    pub const AUDIT_PARTICIPANT_RES: u32 = 0x0040;
-    pub const QOS_RESERVATION_NOTIFY: u32 = 0x0046;
-    pub const QOS_ERROR_NOTIFY: u32 = 0x0047;
-    pub const DEVICE_TO_USER_DATA_V1: u32 = 0x0041;
-    pub const DEVICE_TO_USER_DATA_RESPONSE_V1: u32 = 0x0042;
-    pub const UPDATE_CAPABILITIES_V2: u32 = 0x0043;
-    pub const UPDATE_CAPABILITIES_V3: u32 = 0x0044;
-    pub const PORT_RESPONSE: u32 = 0x0045;
-    pub const SUBSCRIPTION_STAT_REQ: u32 = 0x0048;
-    pub const ACCESSORY_STATUS: u32 = 0x0049;
-    pub const MEDIA_PATH_CAPABILITY: u32 = 0x004a;
-    pub const MWI_NOTIFICATION: u32 = 0x004c;
-
-    pub const REGISTER_ACK: u32 = 0x0081;
-    pub const START_TONE: u32 = 0x0082;
-    pub const STOP_TONE: u32 = 0x0083;
-    pub const SET_RINGER: u32 = 0x0085;
-    pub const SET_LAMP: u32 = 0x0086;
-    pub const SET_SPEAKER_MODE: u32 = 0x0088;
-    pub const SET_MICROPHONE_MODE: u32 = 0x0089;
-    pub const START_MEDIA_TRANSMISSION: u32 = 0x008a;
-    pub const STOP_MEDIA_TRANSMISSION: u32 = 0x008b;
-    pub const START_SESSION_TRANSMISSION: u32 = 0x0095;
-    pub const STOP_SESSION_TRANSMISSION: u32 = 0x0096;
-    pub const CALL_INFO: u32 = 0x008f;
-    pub const FORWARD_STAT: u32 = 0x0090;
-    pub const SPEED_DIAL_STAT: u32 = 0x0091;
-    pub const LINE_STAT: u32 = 0x0092;
-    pub const CONFIG_STAT: u32 = 0x0093;
-    pub const DEFINE_TIME_DATE: u32 = 0x0094;
-    pub const BUTTON_TEMPLATE: u32 = 0x0097;
-    pub const VERSION: u32 = 0x0098;
-    pub const DISPLAY_TEXT: u32 = 0x0099;
-    pub const CLEAR_DISPLAY: u32 = 0x009a;
-    pub const CAPABILITIES_REQ: u32 = 0x009b;
-    pub const REGISTER_REJECT: u32 = 0x009d;
-    pub const SERVER_RES: u32 = 0x009e;
-    pub const RESET: u32 = 0x009f;
-    pub const KEEP_ALIVE_ACK: u32 = 0x0100;
-    pub const START_MULTICAST_MEDIA_RECEPTION: u32 = 0x0101;
-    pub const START_MULTICAST_MEDIA_TRANSMISSION: u32 = 0x0102;
-    pub const STOP_MULTICAST_MEDIA_RECEPTION: u32 = 0x0103;
-    pub const STOP_MULTICAST_MEDIA_TRANSMISSION: u32 = 0x0104;
-    pub const OPEN_RECEIVE_CHANNEL: u32 = 0x0105;
-    pub const CLOSE_RECEIVE_CHANNEL: u32 = 0x0106;
-    pub const CONNECTION_STATISTICS_REQ: u32 = 0x0107;
-    pub const SOFT_KEY_TEMPLATE_RES: u32 = 0x0108;
-    pub const SOFT_KEY_SET_RES: u32 = 0x0109;
-    pub const SELECT_SOFT_KEYS: u32 = 0x0110;
-    pub const CALL_STATE: u32 = 0x0111;
-    pub const DISPLAY_PROMPT_STATUS: u32 = 0x0112;
-    pub const CLEAR_PROMPT_STATUS: u32 = 0x0113;
-    pub const DISPLAY_NOTIFY: u32 = 0x0114;
-    pub const CLEAR_NOTIFY: u32 = 0x0115;
-    pub const ACTIVATE_CALL_PLANE: u32 = 0x0116;
-    pub const DEACTIVATE_CALL_PLANE: u32 = 0x0117;
-    pub const UNREGISTER_ACK: u32 = 0x0118;
-    pub const BACKSPACE_RESPONSE: u32 = 0x0119;
-    pub const REGISTER_TOKEN_ACK: u32 = 0x011a;
-    pub const REGISTER_TOKEN_REJECT: u32 = 0x011b;
-    pub const START_MEDIA_FAILURE_DETECTION: u32 = 0x011c;
-    pub const DIALED_NUMBER: u32 = 0x011d;
-    pub const USER_TO_DEVICE_DATA: u32 = 0x011e;
-    pub const FEATURE_STAT: u32 = 0x011f;
-    pub const DISPLAY_PRIORITY_NOTIFY: u32 = 0x0120;
-    pub const CLEAR_PRIORITY_NOTIFY: u32 = 0x0121;
-    pub const START_ANNOUNCEMENT: u32 = 0x0122;
-    pub const STOP_ANNOUNCEMENT: u32 = 0x0123;
-    pub const ANNOUNCEMENT_FINISH: u32 = 0x0124;
-    pub const NOTIFY_DTMF_TONE: u32 = 0x0127;
-    pub const SEND_DTMF_TONE: u32 = 0x0128;
-    pub const SUBSCRIBE_DTMF_PAYLOAD_REQ: u32 = 0x0129;
-    pub const SUBSCRIBE_DTMF_PAYLOAD_RES: u32 = 0x012a;
-    pub const SUBSCRIBE_DTMF_PAYLOAD_ERR: u32 = 0x012b;
-    pub const UNSUBSCRIBE_DTMF_PAYLOAD_REQ: u32 = 0x012c;
-    pub const UNSUBSCRIBE_DTMF_PAYLOAD_RES: u32 = 0x012d;
-    pub const UNSUBSCRIBE_DTMF_PAYLOAD_ERR: u32 = 0x012e;
-    pub const SERVICE_URL_STAT: u32 = 0x012f;
-    pub const CALL_SELECT_STAT: u32 = 0x0130;
-    pub const STOP_MULTIMEDIA_TRANSMISSION: u32 = 0x0133;
-    pub const FLOW_CONTROL_COMMAND: u32 = 0x0135;
-    pub const CLOSE_MULTIMEDIA_RECEIVE_CHANNEL: u32 = 0x0136;
-    pub const CREATE_CONFERENCE_REQ: u32 = 0x0137;
-    pub const DELETE_CONFERENCE_REQ: u32 = 0x0138;
-    pub const MODIFY_CONFERENCE_REQ: u32 = 0x0139;
-    pub const ADD_PARTICIPANT_REQ: u32 = 0x013a;
-    pub const DROP_PARTICIPANT_REQ: u32 = 0x013b;
-    pub const AUDIT_CONFERENCE_REQ: u32 = 0x013c;
-    pub const AUDIT_PARTICIPANT_REQ: u32 = 0x013d;
-    pub const CHANGE_PARTICIPANT_REQ: u32 = 0x013e;
-    pub const USER_TO_DEVICE_DATA_V1: u32 = 0x013f;
-    pub const VIDEO_DISPLAY_COMMAND: u32 = 0x0140;
-    pub const FLOW_CONTROL_NOTIFY: u32 = 0x0141;
-    pub const CONFIG_STAT_DYNAMIC: u32 = 0x0142;
-    pub const DISPLAY_DYNAMIC_NOTIFY: u32 = 0x0143;
-    pub const DISPLAY_DYNAMIC_PRIORITY_NOTIFY: u32 = 0x0144;
-    pub const DISPLAY_DYNAMIC_PROMPT_STATUS: u32 = 0x0145;
-    pub const FEATURE_STAT_DYNAMIC: u32 = 0x0146;
-    pub const LINE_STAT_DYNAMIC: u32 = 0x0147;
-    pub const SERVICE_URL_STAT_DYNAMIC: u32 = 0x0148;
-    pub const SPEED_DIAL_STAT_DYNAMIC: u32 = 0x0149;
-    pub const CALL_INFO_DYNAMIC: u32 = 0x014a;
-    pub const PORT_REQUEST: u32 = 0x014b;
-    pub const PORT_CLOSE: u32 = 0x014c;
-    pub const QOS_LISTEN: u32 = 0x014d;
-    pub const QOS_PATH: u32 = 0x014e;
-    pub const QOS_TEARDOWN: u32 = 0x014f;
-    pub const UPDATE_DSCP: u32 = 0x0150;
-    pub const QOS_MODIFY: u32 = 0x0151;
-    pub const SUBSCRIPTION_STAT: u32 = 0x0152;
-    pub const NOTIFICATION: u32 = 0x0153;
-    pub const START_MEDIA_TRANSMISSION_ACK: u32 = 0x0154;
-    pub const START_MULTIMEDIA_TRANSMISSION_ACK: u32 = 0x0155;
-    pub const OPEN_MULTIMEDIA_CHANNEL: u32 = 0x0131;
-    pub const START_MULTIMEDIA_TRANSMISSION: u32 = 0x0132;
-    pub const MISCELLANEOUS_COMMAND: u32 = 0x0134;
-    pub const CALL_HISTORY_DISPOSITION: u32 = 0x0156;
-    pub const LOCATION_INFO: u32 = 0x0157;
-    pub const MWI_RESPONSE: u32 = 0x0158;
-    pub const EXTENSION_DEVICE_CAPABILITIES: u32 = 0x0159;
-    pub const XML_ALARM: u32 = 0x015a;
-    pub const CALL_COUNT_REQ: u32 = 0x015e;
-    pub const CALL_COUNT_RES: u32 = 0x015f;
-    pub const RECORDING_STATUS: u32 = 0x0160;
+    include!(concat!(env!("OUT_DIR"), "/legacy_message_ids.rs"));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -800,7 +638,7 @@ pub struct QosApplicationIdentifier {
     pub sub_application_id: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// New and previously heard message counts for one mailbox category.
 pub struct MessageWaitingCounts {
     pub new: u32,
@@ -1729,6 +1567,15 @@ pub struct ButtonTemplateEntry {
     pub button_type: ButtonType,
 }
 
+impl Default for ButtonTemplateEntry {
+    fn default() -> Self {
+        Self {
+            instance: 0,
+            button_type: ButtonType::Unused,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Typed messages accepted from a station connection.
 ///
@@ -2196,6 +2043,31 @@ pub enum ServerMessage {
 mod tests {
     use super::wire::{CodecError, Frame, FrameDecoder};
     use super::*;
+
+    #[test]
+    fn protocol_fillers_have_semantic_defaults() {
+        assert_eq!(
+            ButtonTemplateEntry::default(),
+            ButtonTemplateEntry {
+                instance: 0,
+                button_type: ButtonType::Unused,
+            }
+        );
+        assert_eq!(
+            MessageWaitingCounts::default(),
+            MessageWaitingCounts { new: 0, old: 0 }
+        );
+    }
+
+    #[test]
+    fn every_generated_legacy_alias_matches_its_catalog_id() {
+        assert_eq!(id::LEGACY_ALIAS_CATALOG_PAIRS.len(), 167);
+        assert!(
+            id::LEGACY_ALIAS_CATALOG_PAIRS
+                .iter()
+                .all(|(alias, catalog)| alias == catalog)
+        );
+    }
 
     const fn test_rtp_payload_number(value: u32) -> RtpPayloadNumber {
         match RtpPayloadNumber::new(value) {
