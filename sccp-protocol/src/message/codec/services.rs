@@ -130,7 +130,7 @@ pub(super) fn encode_port_response(
 ) -> Result<Vec<u8>, CodecError> {
     if protocol.wire() >= 20 {
         encode(
-            id::PORT_RESPONSE,
+            wire_id::PORT_RESPONSE,
             &WirePortResponseV20 {
                 conference_id: endpoint.conference_id,
                 call_reference: endpoint.call_reference,
@@ -141,7 +141,7 @@ pub(super) fn encode_port_response(
                 media_type: endpoint
                     .media_type
                     .ok_or(CodecError::InvalidValue {
-                        message_id: id::PORT_RESPONSE,
+                        message_id: wire_id::PORT_RESPONSE,
                         field: "media type required from protocol 20",
                         value: 0,
                     })?
@@ -151,13 +151,13 @@ pub(super) fn encode_port_response(
     } else {
         let IpAddr::V4(address) = endpoint.address else {
             return Err(CodecError::InvalidValue {
-                message_id: id::PORT_RESPONSE,
+                message_id: wire_id::PORT_RESPONSE,
                 field: "IP address family for this protocol version",
                 value: 1,
             });
         };
         encode(
-            id::PORT_RESPONSE,
+            wire_id::PORT_RESPONSE,
             &WirePortResponseV3 {
                 conference_id: endpoint.conference_id,
                 call_reference: endpoint.call_reference,

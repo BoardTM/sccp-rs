@@ -158,7 +158,7 @@ pub(super) fn encode_open_multimedia_ack(
 ) -> Result<Vec<u8>, CodecError> {
     if protocol.wire() >= 17 {
         encode(
-            id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
+            wire_id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
             &WireOpenMultimediaAckFrom17 {
                 status: value.status.wire_value(),
                 address: WireExtendedAddress::from_ip(value.endpoint.address),
@@ -170,13 +170,13 @@ pub(super) fn encode_open_multimedia_ack(
     } else {
         let IpAddr::V4(address) = value.endpoint.address else {
             return Err(CodecError::InvalidValue {
-                message_id: id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
+                message_id: wire_id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
                 field: "IP address family for this protocol version",
                 value: 1,
             });
         };
         encode(
-            id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
+            wire_id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
             &WireOpenMultimediaAckPre17 {
                 status: value.status.wire_value(),
                 address: address.octets(),
@@ -232,7 +232,7 @@ pub(super) fn encode_start_multimedia_ack(
 ) -> Result<Vec<u8>, CodecError> {
     if protocol.wire() >= 17 {
         encode(
-            id::START_MULTIMEDIA_TRANSMISSION_ACK,
+            wire_id::START_MULTIMEDIA_TRANSMISSION_ACK,
             &WireStartMultimediaAckFrom17 {
                 conference_id: value.conference_id.get(),
                 passthrough_party_id: value.passthrough_party_id.get(),
@@ -245,13 +245,13 @@ pub(super) fn encode_start_multimedia_ack(
     } else {
         let IpAddr::V4(address) = value.endpoint.address else {
             return Err(CodecError::InvalidValue {
-                message_id: id::START_MULTIMEDIA_TRANSMISSION_ACK,
+                message_id: wire_id::START_MULTIMEDIA_TRANSMISSION_ACK,
                 field: "IP address family for this protocol version",
                 value: 1,
             });
         };
         encode(
-            id::START_MULTIMEDIA_TRANSMISSION_ACK,
+            wire_id::START_MULTIMEDIA_TRANSMISSION_ACK,
             &WireStartMultimediaAckPre17 {
                 conference_id: value.conference_id.get(),
                 passthrough_party_id: value.passthrough_party_id.get(),
@@ -621,7 +621,7 @@ pub(super) fn encode_open_multimedia(
         &value.payload,
         MultimediaPayloadDirection::Receive,
         protocol,
-        id::OPEN_MULTIMEDIA_CHANNEL,
+        wire_id::OPEN_MULTIMEDIA_CHANNEL,
     )?;
     let common = WireOpenMultimediaV11 {
         conference_id: value.conference_id.get(),
@@ -638,7 +638,7 @@ pub(super) fn encode_open_multimedia(
     };
     match protocol.wire() {
         17.. => encode(
-            id::OPEN_MULTIMEDIA_CHANNEL,
+            wire_id::OPEN_MULTIMEDIA_CHANNEL,
             &WireOpenMultimediaV17 {
                 conference_id: common.conference_id,
                 passthrough_party_id: common.passthrough_party_id,
@@ -659,13 +659,13 @@ pub(super) fn encode_open_multimedia(
         12..=16 => {
             let IpAddr::V4(address) = value.source.address else {
                 return Err(CodecError::InvalidValue {
-                    message_id: id::OPEN_MULTIMEDIA_CHANNEL,
+                    message_id: wire_id::OPEN_MULTIMEDIA_CHANNEL,
                     field: "IP address family for this protocol version",
                     value: 1,
                 });
             };
             encode(
-                id::OPEN_MULTIMEDIA_CHANNEL,
+                wire_id::OPEN_MULTIMEDIA_CHANNEL,
                 &WireOpenMultimediaV12 {
                     base: common,
                     source_address: address.octets(),
@@ -673,7 +673,7 @@ pub(super) fn encode_open_multimedia(
                 },
             )
         }
-        _ => encode(id::OPEN_MULTIMEDIA_CHANNEL, &common),
+        _ => encode(wire_id::OPEN_MULTIMEDIA_CHANNEL, &common),
     }
 }
 
@@ -765,11 +765,11 @@ pub(super) fn encode_start_multimedia(
         &value.payload,
         MultimediaPayloadDirection::Transmit,
         protocol,
-        id::START_MULTIMEDIA_TRANSMISSION,
+        wire_id::START_MULTIMEDIA_TRANSMISSION,
     )?;
     if protocol.wire() >= 17 {
         encode(
-            id::START_MULTIMEDIA_TRANSMISSION,
+            wire_id::START_MULTIMEDIA_TRANSMISSION,
             &WireStartMultimediaFrom17 {
                 conference_id: value.conference_id.get(),
                 passthrough_party_id: value.passthrough_party_id.get(),
@@ -788,13 +788,13 @@ pub(super) fn encode_start_multimedia(
     } else {
         let IpAddr::V4(address) = value.endpoint.address else {
             return Err(CodecError::InvalidValue {
-                message_id: id::START_MULTIMEDIA_TRANSMISSION,
+                message_id: wire_id::START_MULTIMEDIA_TRANSMISSION,
                 field: "IP address family for this protocol version",
                 value: 1,
             });
         };
         encode(
-            id::START_MULTIMEDIA_TRANSMISSION,
+            wire_id::START_MULTIMEDIA_TRANSMISSION,
             &WireStartMultimediaPre17 {
                 conference_id: value.conference_id.get(),
                 passthrough_party_id: value.passthrough_party_id.get(),
@@ -831,7 +831,7 @@ pub(super) fn encode_miscellaneous_command(
     value: &MiscellaneousCommand,
 ) -> Result<Vec<u8>, CodecError> {
     encode(
-        id::MISCELLANEOUS_COMMAND,
+        wire_id::MISCELLANEOUS_COMMAND,
         &WireMiscellaneousCommand {
             conference_id: value.conference_id.get(),
             passthrough_party_id: value.passthrough_party_id.get(),

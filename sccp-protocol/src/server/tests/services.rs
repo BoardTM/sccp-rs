@@ -24,7 +24,7 @@ async fn parking_button_menu_and_selection_are_typed_end_to_end() {
     let device_id = DeviceId::new("SEP001122334455").unwrap();
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -74,10 +74,11 @@ async fn parking_button_menu_and_selection_are_typed_end_to_end() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::USER_TO_DEVICE_DATA_V1).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::USER_TO_DEVICE_DATA_V1).await;
     let message = frames
         .into_iter()
-        .find(|frame| frame.message_id == id::USER_TO_DEVICE_DATA_V1)
+        .find(|frame| frame.message_id == wire_id::USER_TO_DEVICE_DATA_V1)
         .map(|frame| ServerMessage::decode(frame, protocol).unwrap())
         .unwrap();
     let ServerMessage::UserToDeviceDataV1(menu) = message else {
@@ -161,7 +162,7 @@ async fn conference_list_uses_protocol_family_and_routes_typed_actions() {
         let device_id = DeviceId::new("SEP001122334455").unwrap();
 
         phone.write_all(&register_bytes(protocol)).await.unwrap();
-        read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+        read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
         assert!(matches!(
             events.recv().await,
             Some(Event::Device(DeviceEvent {
@@ -181,7 +182,7 @@ async fn conference_list_uses_protocol_family_and_routes_typed_actions() {
             ))
             .await
             .unwrap();
-        read_until_message(&mut phone, &mut decoder, id::CALL_STATE).await;
+        read_until_message(&mut phone, &mut decoder, wire_id::CALL_STATE).await;
 
         handle
             .send(Command::new(
@@ -200,10 +201,11 @@ async fn conference_list_uses_protocol_family_and_routes_typed_actions() {
             ))
             .await
             .unwrap();
-        let frames = read_until_message(&mut phone, &mut decoder, id::USER_TO_DEVICE_DATA_V1).await;
+        let frames =
+            read_until_message(&mut phone, &mut decoder, wire_id::USER_TO_DEVICE_DATA_V1).await;
         let message = frames
             .into_iter()
-            .find(|frame| frame.message_id == id::USER_TO_DEVICE_DATA_V1)
+            .find(|frame| frame.message_id == wire_id::USER_TO_DEVICE_DATA_V1)
             .map(|frame| ServerMessage::decode(frame, protocol).unwrap())
             .unwrap();
         let ServerMessage::UserToDeviceDataV1(menu) = message else {
@@ -288,10 +290,11 @@ async fn conference_list_uses_protocol_family_and_routes_typed_actions() {
             ))
             .await
             .unwrap();
-        let frames = read_until_message(&mut phone, &mut decoder, id::USER_TO_DEVICE_DATA_V1).await;
+        let frames =
+            read_until_message(&mut phone, &mut decoder, wire_id::USER_TO_DEVICE_DATA_V1).await;
         let message = frames
             .into_iter()
-            .find(|frame| frame.message_id == id::USER_TO_DEVICE_DATA_V1)
+            .find(|frame| frame.message_id == wire_id::USER_TO_DEVICE_DATA_V1)
             .map(|frame| ServerMessage::decode(frame, protocol).unwrap())
             .unwrap();
         let ServerMessage::UserToDeviceDataV1(menu) = message else {
@@ -444,10 +447,11 @@ async fn conference_list_uses_protocol_family_and_routes_typed_actions() {
             ))
             .await
             .unwrap();
-        let frames = read_until_message(&mut phone, &mut decoder, id::USER_TO_DEVICE_DATA_V1).await;
+        let frames =
+            read_until_message(&mut phone, &mut decoder, wire_id::USER_TO_DEVICE_DATA_V1).await;
         let message = frames
             .into_iter()
-            .find(|frame| frame.message_id == id::USER_TO_DEVICE_DATA_V1)
+            .find(|frame| frame.message_id == wire_id::USER_TO_DEVICE_DATA_V1)
             .map(|frame| ServerMessage::decode(frame, protocol).unwrap())
             .unwrap();
         let ServerMessage::UserToDeviceDataV1(menu) = message else {
@@ -483,7 +487,7 @@ async fn phone_service_responses_preserve_legacy_and_extended_routing() {
     let device_id = DeviceId::new("SEP001122334455").unwrap();
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -604,7 +608,7 @@ async fn parking_selection_requires_the_pending_envelope_and_survives_malformed_
     let device_id = DeviceId::new("SEP001122334455").unwrap();
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -625,7 +629,7 @@ async fn parking_selection_requires_the_pending_envelope_and_survives_malformed_
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::USER_TO_DEVICE_DATA_V1).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::USER_TO_DEVICE_DATA_V1).await;
 
     let response =
         |application_id, line_instance, call_reference, transaction_id, instance, data: &[u8]| {
@@ -703,7 +707,7 @@ async fn parking_selection_requires_the_pending_envelope_and_survives_malformed_
     else {
         panic!("expected malformed service-data warning");
     };
-    assert_eq!(message_id, id::DEVICE_TO_USER_DATA_V1);
+    assert_eq!(message_id, wire_id::DEVICE_TO_USER_DATA_V1);
     assert!(!error.contains("secret"));
 
     phone

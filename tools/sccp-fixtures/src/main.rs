@@ -43,9 +43,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use sccp_protocol::message::id;
 use sccp_protocol::{
-    ClientMessage, Frame, FrameDecoder, MediaEndpoint, ProtocolVersion, ServerMessage,
+    ClientMessage, Frame, FrameDecoder, MediaEndpoint, MessageId, ProtocolVersion, ServerMessage,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -825,26 +824,26 @@ enum PrivacyClass {
 }
 
 fn privacy_class(message_id: u32) -> PrivacyClass {
-    match message_id {
-        id::KEEP_ALIVE
-        | id::OFF_HOOK
-        | id::ON_HOOK
-        | id::HOOK_FLASH
-        | id::CAPABILITIES_RES
-        | id::UPDATE_CAPABILITIES
-        | id::UPDATE_CAPABILITIES_V2
-        | id::UPDATE_CAPABILITIES_V3
-        | id::HEADSET_STATUS
-        | id::ACCESSORY_STATUS
-        | id::KEEP_ALIVE_ACK
-        | id::STOP_MEDIA_TRANSMISSION
-        | id::CLOSE_RECEIVE_CHANNEL => PrivacyClass::Safe,
-        id::OPEN_RECEIVE_CHANNEL_ACK
-        | id::MEDIA_TRANSMISSION_FAILURE
-        | id::START_MEDIA_TRANSMISSION_ACK
-        | id::OPEN_RECEIVE_CHANNEL
-        | id::START_MEDIA_TRANSMISSION => PrivacyClass::Network,
-        id::LINE_STAT_DYNAMIC => PrivacyClass::Station,
+    match MessageId::from(message_id) {
+        MessageId::KeepAlive
+        | MessageId::OffHook
+        | MessageId::OnHook
+        | MessageId::HookFlash
+        | MessageId::CapabilitiesResponse
+        | MessageId::UpdateCapabilities
+        | MessageId::UpdateCapabilitiesV2
+        | MessageId::UpdateCapabilitiesV3
+        | MessageId::HeadsetStatus
+        | MessageId::MediaPathEvent
+        | MessageId::KeepAliveAck
+        | MessageId::StopMediaTransmission
+        | MessageId::CloseReceiveChannel => PrivacyClass::Safe,
+        MessageId::OpenReceiveChannelAck
+        | MessageId::MediaTransmissionFailure
+        | MessageId::StartMediaTransmissionAck
+        | MessageId::OpenReceiveChannel
+        | MessageId::StartMediaTransmission => PrivacyClass::Network,
+        MessageId::LineStatusDynamic => PrivacyClass::Station,
         _ => PrivacyClass::Sensitive,
     }
 }
@@ -854,7 +853,9 @@ fn network_is_wildcard(
     frame: &Frame,
     protocol: ProtocolVersion,
 ) -> Result<bool, String> {
-    if direction != Direction::ServerToDevice || frame.message_id != id::OPEN_RECEIVE_CHANNEL {
+    if direction != Direction::ServerToDevice
+        || frame.message_id != MessageId::OpenReceiveChannel.wire_value()
+    {
         return Ok(false);
     }
     let message = ServerMessage::decode(frame.clone(), protocol)
@@ -1004,8 +1005,8 @@ mod tests {
 
     #[test]
     fn parses_follow_output_and_preserves_direction_chunks() {
-        let first = frame(id::KEEP_ALIVE);
-        let second = frame(id::KEEP_ALIVE_ACK);
+        let first = frame(MessageId::KeepAlive.wire_value());
+        let second = frame(MessageId::KeepAliveAck.wire_value());
         let input = format!(
             "===================================================================\nFollow: tcp,raw\nFilter: tcp.stream eq 3\nNode 0: 192.0.2.10:50000\nNode 1: 192.0.2.20:2000\n{}\n\t{}\n===================================================================\n",
             hex(&first),
@@ -1044,15 +1045,24 @@ mod tests {
 
     #[test]
     fn privacy_policy_fails_closed() {
-        assert_eq!(privacy_class(id::UPDATE_CAPABILITIES), PrivacyClass::Safe);
         assert_eq!(
-            privacy_class(id::OPEN_RECEIVE_CHANNEL),
+            privacy_class(MessageId::UpdateCapabilities.wire_value()),
+            PrivacyClass::Safe
+        );
+        assert_eq!(
+            privacy_class(MessageId::OpenReceiveChannel.wire_value()),
             PrivacyClass::Network
         );
-        assert_eq!(privacy_class(id::LINE_STAT_DYNAMIC), PrivacyClass::Station);
-        assert_eq!(privacy_class(id::REGISTER), PrivacyClass::Sensitive);
         assert_eq!(
-            privacy_class(id::USER_TO_DEVICE_DATA_V1),
+            privacy_class(MessageId::LineStatusDynamic.wire_value()),
+            PrivacyClass::Station
+        );
+        assert_eq!(
+            privacy_class(MessageId::Register.wire_value()),
+            PrivacyClass::Sensitive
+        );
+        assert_eq!(
+            privacy_class(MessageId::UserToDeviceDataV1.wire_value()),
             PrivacyClass::Sensitive
         );
     }
@@ -1158,8 +1168,12 @@ mod tests {
 
     #[test]
     fn fragmented_and_coalesced_follow_chunks_produce_deterministic_frames() {
-        let first = Frame::new(0, id::KEEP_ALIVE, Vec::new()).encode().unwrap();
-        let second = Frame::new(22, id::OFF_HOOK, vec![0; 8]).encode().unwrap();
+        let first = Frame::new(0, MessageId::KeepAlive.wire_value(), Vec::new())
+            .encode()
+            .unwrap();
+        let second = Frame::new(22, MessageId::OffHook.wire_value(), vec![0; 8])
+            .encode()
+            .unwrap();
         let mut bytes = first.clone();
         bytes.extend_from_slice(&second);
         let node = Node {
@@ -1174,9 +1188,9 @@ mod tests {
 
     #[test]
     fn bidirectional_inventory_orders_frame_origins_across_tcp_reassembly() {
-        let first = frame(id::KEEP_ALIVE);
-        let second = frame(id::OFF_HOOK);
-        let response = frame(id::KEEP_ALIVE_ACK);
+        let first = frame(MessageId::KeepAlive.wire_value());
+        let second = frame(MessageId::OffHook.wire_value());
+        let response = frame(MessageId::KeepAliveAck.wire_value());
         let mut final_server_segment = first[5..].to_vec();
         final_server_segment.extend_from_slice(&second);
         let segments = vec![
@@ -1222,9 +1236,27 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                (1, 10, Direction::ServerToDevice, 0, id::KEEP_ALIVE),
-                (2, 11, Direction::DeviceToServer, 0, id::KEEP_ALIVE_ACK),
-                (3, 13, Direction::ServerToDevice, 1, id::OFF_HOOK),
+                (
+                    1,
+                    10,
+                    Direction::ServerToDevice,
+                    0,
+                    MessageId::KeepAlive.wire_value()
+                ),
+                (
+                    2,
+                    11,
+                    Direction::DeviceToServer,
+                    0,
+                    MessageId::KeepAliveAck.wire_value()
+                ),
+                (
+                    3,
+                    13,
+                    Direction::ServerToDevice,
+                    1,
+                    MessageId::OffHook.wire_value()
+                ),
             ]
         );
     }

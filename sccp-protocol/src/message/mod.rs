@@ -28,6 +28,7 @@ use crate::types::{
 };
 use capabilities::CapabilityUpdate;
 use catalog::MessageId;
+pub(crate) use catalog::wire_id;
 use values::{
     AddParticipantResult, AlarmSeverity, AnnouncementPlayMode, AnnouncementPlayStatus,
     AuditParticipantResult, BusyLampFieldState, ButtonType, CallHistoryDisposition, CallState,
@@ -153,16 +154,6 @@ impl MediaRequestIdentity {
             && acknowledgement_party_id == 0
             && acknowledgement_call_reference == stable_call_reference
     }
-}
-
-/// Legacy numeric message identifiers generated from the canonical catalog.
-///
-/// The alias spelling map contains no wire values, so the catalog remains the
-/// single numeric source of truth even for historical `*_REQ`/`*_RES` names.
-/// New code should generally use [`catalog::MessageId`], which also exposes
-/// routing and wire-contract metadata.
-pub mod id {
-    include!(concat!(env!("OUT_DIR"), "/legacy_message_ids.rs"));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1203,7 +1194,7 @@ impl XmlAlarmMessage {
         }
         if xml.len() > XML_ALARM_CANONICAL_DOCUMENT_BYTES {
             return Err(CodecError::TextTooLong {
-                message_id: id::XML_ALARM,
+                message_id: wire_id::XML_ALARM,
                 field: "alarm XML",
                 actual: xml.len(),
                 maximum: XML_ALARM_CANONICAL_DOCUMENT_BYTES,
@@ -1219,7 +1210,7 @@ impl XmlAlarmMessage {
         let payload = payload.into();
         let wire_payload =
             BoundedBytes::new(payload).map_err(|error| CodecError::CountTooLarge {
-                message_id: id::XML_ALARM,
+                message_id: wire_id::XML_ALARM,
                 field: "alarm payload",
                 count: error.actual,
                 maximum: error.maximum,
@@ -1421,7 +1412,7 @@ impl ConnectionQualityStatistics {
         let bytes = bytes.into();
         if bytes.len() > CONNECTION_QUALITY_MAX_BYTES {
             return Err(CodecError::CountTooLarge {
-                message_id: id::CONNECTION_STATISTICS_RES,
+                message_id: wire_id::CONNECTION_STATISTICS_RES,
                 field: "quality statistics",
                 count: bytes.len(),
                 maximum: CONNECTION_QUALITY_MAX_BYTES,
@@ -2059,16 +2050,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_generated_legacy_alias_matches_its_catalog_id() {
-        assert_eq!(id::LEGACY_ALIAS_CATALOG_PAIRS.len(), 167);
-        assert!(
-            id::LEGACY_ALIAS_CATALOG_PAIRS
-                .iter()
-                .all(|(alias, catalog)| alias == catalog)
-        );
-    }
-
     const fn test_rtp_payload_number(value: u32) -> RtpPayloadNumber {
         match RtpPayloadNumber::new(value) {
             Ok(value) => value,
@@ -2230,7 +2211,7 @@ mod tests {
 
     #[test]
     fn decodes_7962_off_hook_capture_shape() {
-        let frame = Frame::new(22, id::OFF_HOOK, vec![1, 0, 0, 0, 42, 0, 0, 0]);
+        let frame = Frame::new(22, wire_id::OFF_HOOK, vec![1, 0, 0, 0, 42, 0, 0, 0]);
         assert_eq!(
             ClientMessage::decode(frame).unwrap(),
             ClientMessage::OffHook {
@@ -2246,7 +2227,7 @@ mod tests {
             .into_iter()
             .flat_map(u32::to_le_bytes)
             .collect();
-        let frame = Frame::new(22, id::KEYPAD_BUTTON, payload.clone());
+        let frame = Frame::new(22, wire_id::KEYPAD_BUTTON, payload.clone());
         let decoded = ClientMessage::decode(frame).unwrap();
         assert_eq!(
             decoded,
@@ -2277,7 +2258,7 @@ mod tests {
         .unwrap();
         let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
         assert_eq!(frame.protocol_version, 0);
-        assert_eq!(frame.message_id, id::REGISTER_ACK);
+        assert_eq!(frame.message_id, wire_id::REGISTER_ACK);
         assert_eq!(
             ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
             ServerMessage::RegisterAck {
@@ -3238,8 +3219,8 @@ mod tests {
     #[test]
     fn dtmf_subscription_messages_require_their_exact_word_layouts() {
         for message_id in [
-            id::SUBSCRIBE_DTMF_PAYLOAD_RES,
-            id::UNSUBSCRIBE_DTMF_PAYLOAD_RES,
+            wire_id::SUBSCRIBE_DTMF_PAYLOAD_RES,
+            wire_id::UNSUBSCRIBE_DTMF_PAYLOAD_RES,
         ] {
             assert!(ClientMessage::decode(Frame::new(22, message_id, Vec::new())).is_err());
             assert!(ClientMessage::decode(Frame::new(22, message_id, vec![0; 11])).is_err());
@@ -3247,10 +3228,10 @@ mod tests {
             assert!(ClientMessage::decode(Frame::new(22, message_id, vec![0; 13])).is_err());
         }
         for (message_id, size) in [
-            (id::SUBSCRIBE_DTMF_PAYLOAD_REQ, 16),
-            (id::SUBSCRIBE_DTMF_PAYLOAD_ERR, 12),
-            (id::UNSUBSCRIBE_DTMF_PAYLOAD_REQ, 16),
-            (id::UNSUBSCRIBE_DTMF_PAYLOAD_ERR, 12),
+            (wire_id::SUBSCRIBE_DTMF_PAYLOAD_REQ, 16),
+            (wire_id::SUBSCRIBE_DTMF_PAYLOAD_ERR, 12),
+            (wire_id::UNSUBSCRIBE_DTMF_PAYLOAD_REQ, 16),
+            (wire_id::UNSUBSCRIBE_DTMF_PAYLOAD_ERR, 12),
         ] {
             assert!(
                 ServerMessage::decode(
@@ -3430,7 +3411,7 @@ mod tests {
         assert!(matches!(
             message.encode(ProtocolVersion::V22),
             Err(CodecError::InvalidValue {
-                message_id: id::IP_PORT,
+                message_id: wire_id::IP_PORT,
                 field: "opaque preservation requires an opaque-only contract",
                 ..
             })
@@ -3442,7 +3423,7 @@ mod tests {
         assert!(matches!(
             ClientMessage::decode(Frame::new(
                 22,
-                id::CAPABILITIES_RES,
+                wire_id::CAPABILITIES_RES,
                 19_u32.to_le_bytes().to_vec(),
             )),
             Err(CodecError::CountTooLarge { .. })
@@ -3468,7 +3449,7 @@ mod tests {
         assert!(matches!(
             ClientMessage::decode(Frame::new(
                 22,
-                id::IP_PORT,
+                wire_id::IP_PORT,
                 70_000_u32.to_le_bytes().to_vec(),
             )),
             Err(CodecError::InvalidValue { .. })
@@ -3541,7 +3522,11 @@ mod tests {
         oversized_conference_data[8..12].copy_from_slice(&2001_u32.to_le_bytes());
         assert!(matches!(
             ControlMessage::decode(
-                Frame::new(22, id::CREATE_CONFERENCE_RES, oversized_conference_data),
+                Frame::new(
+                    22,
+                    wire_id::CREATE_CONFERENCE_RES,
+                    oversized_conference_data
+                ),
                 ProtocolVersion::V22,
             ),
             Err(CodecError::CountTooLarge {
@@ -3556,7 +3541,7 @@ mod tests {
         oversized_audit[4..8].copy_from_slice(&33_u32.to_le_bytes());
         assert!(matches!(
             ControlMessage::decode(
-                Frame::new(22, id::AUDIT_CONFERENCE_RES, oversized_audit),
+                Frame::new(22, wire_id::AUDIT_CONFERENCE_RES, oversized_audit),
                 ProtocolVersion::V22,
             ),
             Err(CodecError::CountTooLarge {

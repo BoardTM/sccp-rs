@@ -120,7 +120,7 @@ async fn native_blf_update_is_validated_cached_and_replayed_as_feature_status_on
     let mut phone = TcpStream::connect(address).await.unwrap();
     let mut decoder = FrameDecoder::new();
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
 
     handle
         .send_confirmed(Command::new(
@@ -136,27 +136,27 @@ async fn native_blf_update_is_validated_cached_and_replayed_as_feature_status_on
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::FEATURE_STAT).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::FEATURE_STAT).await;
     assert_eq!(
         frames
             .iter()
             .filter(|frame| matches!(
                 frame.message_id,
-                id::FEATURE_STAT | id::FEATURE_STAT_DYNAMIC
+                wire_id::FEATURE_STAT | wire_id::FEATURE_STAT_DYNAMIC
             ))
             .count(),
         1
     );
     assert!(frames.iter().all(|frame| !matches!(
         frame.message_id,
-        id::SPEED_DIAL_STAT | id::SPEED_DIAL_STAT_DYNAMIC | id::SET_LAMP
+        wire_id::SPEED_DIAL_STAT | wire_id::SPEED_DIAL_STAT_DYNAMIC | wire_id::SET_LAMP
     )));
     let feature = frames
         .into_iter()
         .find(|frame| {
             matches!(
                 frame.message_id,
-                id::FEATURE_STAT | id::FEATURE_STAT_DYNAMIC
+                wire_id::FEATURE_STAT | wire_id::FEATURE_STAT_DYNAMIC
             )
         })
         .unwrap();
@@ -181,10 +181,10 @@ async fn native_blf_update_is_validated_cached_and_replayed_as_feature_status_on
         )
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::FEATURE_STAT).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::FEATURE_STAT).await;
     let feature = frames
         .into_iter()
-        .find(|frame| frame.message_id == id::FEATURE_STAT)
+        .find(|frame| frame.message_id == wire_id::FEATURE_STAT)
         .unwrap();
     assert!(matches!(
         ServerMessage::decode(feature, protocol).unwrap(),

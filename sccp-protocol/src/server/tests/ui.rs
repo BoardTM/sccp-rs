@@ -338,7 +338,7 @@ async fn mutable_forwarding_and_feature_state_is_published_and_answered() {
     let mut phone = TcpStream::connect(address).await.unwrap();
     let mut decoder = FrameDecoder::new();
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::REGISTER_ACK).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::REGISTER_ACK).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -360,7 +360,7 @@ async fn mutable_forwarding_and_feature_state_is_published_and_answered() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::FORWARD_STAT).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::FORWARD_STAT).await;
     assert!(frames.into_iter().any(|frame| matches!(
         ServerMessage::decode(frame, protocol),
         Ok(ServerMessage::ForwardStatus {
@@ -383,7 +383,7 @@ async fn mutable_forwarding_and_feature_state_is_published_and_answered() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::SET_LAMP).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::SET_LAMP).await;
     assert!(frames.iter().any(|frame| matches!(
         ServerMessage::decode(frame.clone(), protocol),
         Ok(ServerMessage::FeatureStatus {
@@ -419,7 +419,7 @@ async fn mutable_forwarding_and_feature_state_is_published_and_answered() {
         )
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::FEATURE_STAT).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::FEATURE_STAT).await;
     assert!(frames.iter().any(|frame| matches!(
         ServerMessage::decode(frame.clone(), protocol),
         Ok(ServerMessage::ForwardStatus { ref forward_all, .. })
@@ -500,7 +500,7 @@ async fn generic_feature_button_emits_only_for_the_configured_instance() {
     let protocol = ProtocolVersion::V22;
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -649,7 +649,7 @@ async fn mobility_button_and_live_appearance_refresh_preserve_the_session_call()
     let device_id = DeviceId::new("SEP001122334455").unwrap();
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -695,7 +695,7 @@ async fn mobility_button_and_live_appearance_refresh_preserve_the_session_call()
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
 
     let roaming = LineAppearance::new(
         2,
@@ -714,7 +714,7 @@ async fn mobility_button_and_live_appearance_refresh_preserve_the_session_call()
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::LINE_STAT_DYNAMIC).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::LINE_STAT_DYNAMIC).await;
     assert!(frames.iter().any(|frame| matches!(
         ServerMessage::decode(frame.clone(), protocol),
         Ok(ServerMessage::ButtonTemplate { ref buttons, .. })
@@ -735,7 +735,7 @@ async fn mobility_button_and_live_appearance_refresh_preserve_the_session_call()
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::LINE_STAT_DYNAMIC).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::LINE_STAT_DYNAMIC).await;
     assert!(frames.iter().any(|frame| matches!(
         ServerMessage::decode(frame.clone(), protocol),
         Ok(ServerMessage::LineStatus { instance: 2, ref number, .. }) if number.is_empty()
@@ -750,7 +750,7 @@ async fn mobility_button_and_live_appearance_refresh_preserve_the_session_call()
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::CALL_STATE).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::CALL_STATE).await;
     assert!(frames.iter().any(|frame| matches!(
         ServerMessage::decode(frame.clone(), protocol),
         Ok(ServerMessage::CallState {
@@ -780,7 +780,7 @@ async fn unavailable_soft_key_events_and_stimuli_preserve_on_hook_state() {
     let protocol = ProtocolVersion::V22;
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -840,7 +840,7 @@ async fn unavailable_soft_key_events_and_stimuli_preserve_on_hook_state() {
         )
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -879,7 +879,7 @@ async fn configured_redial_menu_uses_typed_native_action_with_legacy_fallback_po
     let protocol = ProtocolVersion::V22;
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -901,7 +901,8 @@ async fn configured_redial_menu_uses_typed_native_action_with_legacy_fallback_po
         )
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::USER_TO_DEVICE_DATA_V1).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::USER_TO_DEVICE_DATA_V1).await;
     let message = frames
         .into_iter()
         .find_map(|frame| match ServerMessage::decode(frame, protocol) {
@@ -953,7 +954,7 @@ async fn configured_voicemail_button_creates_an_exact_line_call_before_routing()
     let protocol = ProtocolVersion::V22;
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -975,7 +976,7 @@ async fn configured_voicemail_button_creates_an_exact_line_call_before_routing()
         )
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     let call_id = match events.recv().await {
         Some(Event::Device(DeviceEvent {
             session_generation: _,
@@ -1019,7 +1020,7 @@ async fn legacy_phone_receives_static_button_status_layouts() {
         .write_all(&register_bytes(ProtocolVersion::V3))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     let requests = [
         ClientMessage::SpeedDialStatusRequest {
             speed_dial_instance: 1,
@@ -1038,11 +1039,11 @@ async fn legacy_phone_receives_static_button_status_layouts() {
     ]
     .concat();
     phone.write_all(&requests).await.unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::SERVICE_URL_STAT).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::SERVICE_URL_STAT).await;
 
     for (message_id, expected) in [
         (
-            id::SPEED_DIAL_STAT,
+            wire_id::SPEED_DIAL_STAT,
             ServerMessage::SpeedDialStatus {
                 instance: 1,
                 number: "2001".into(),
@@ -1050,7 +1051,7 @@ async fn legacy_phone_receives_static_button_status_layouts() {
             },
         ),
         (
-            id::FEATURE_STAT,
+            wire_id::FEATURE_STAT,
             ServerMessage::FeatureStatus {
                 instance: 1,
                 button_type: ButtonType::DoNotDisturb,
@@ -1059,7 +1060,7 @@ async fn legacy_phone_receives_static_button_status_layouts() {
             },
         ),
         (
-            id::SERVICE_URL_STAT,
+            wire_id::SERVICE_URL_STAT,
             ServerMessage::ServiceUrlStatus {
                 index: 1,
                 url: "http://services.invalid/directory".into(),

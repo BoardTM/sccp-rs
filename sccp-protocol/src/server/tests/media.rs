@@ -291,7 +291,7 @@ async fn video_receive_session_correlates_fragmented_acknowledgements_and_preser
     let call_id = CallId::new(71);
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -368,7 +368,7 @@ async fn video_receive_session_correlates_fragmented_acknowledgements_and_preser
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
 
     handle
         .send_confirmed(Command::new(
@@ -715,7 +715,7 @@ async fn video_receive_session_correlates_fragmented_acknowledgements_and_preser
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send_confirmed(Command::new(
             device_id.clone(),
@@ -726,7 +726,7 @@ async fn video_receive_session_correlates_fragmented_acknowledgements_and_preser
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send_confirmed(Command::new(
             device_id.clone(),
@@ -863,7 +863,7 @@ async fn video_transmit_session_correlates_frames_and_preserves_receive_and_audi
     let call_id = CallId::new(81);
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -939,7 +939,7 @@ async fn video_transmit_session_correlates_frames_and_preserves_receive_and_audi
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
 
     handle
         .send_confirmed(Command::new(
@@ -1581,7 +1581,7 @@ async fn video_receive_deadline_closes_and_retires_the_exact_generation() {
     let call_id = CallId::new(72);
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -1616,7 +1616,7 @@ async fn video_receive_deadline_closes_and_retires_the_exact_generation() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send_confirmed(Command::new(
             device_id.clone(),
@@ -1627,7 +1627,7 @@ async fn video_receive_deadline_closes_and_retires_the_exact_generation() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send_confirmed(Command::new(
             device_id.clone(),
@@ -1704,7 +1704,7 @@ async fn video_receive_deadline_closes_and_retires_the_exact_generation() {
         .write_all(&ClientMessage::KeepAlive.encode(protocol).unwrap())
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::KEEP_ALIVE_ACK).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::KEEP_ALIVE_ACK).await;
 
     handle
         .send_confirmed(Command::new(
@@ -1778,7 +1778,7 @@ async fn video_transmit_deadline_stops_and_retires_the_exact_generation() {
     let call_id = CallId::new(82);
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -1813,7 +1813,7 @@ async fn video_transmit_deadline_stops_and_retires_the_exact_generation() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send_confirmed(Command::new(
             device_id.clone(),
@@ -1824,7 +1824,7 @@ async fn video_transmit_deadline_stops_and_retires_the_exact_generation() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send_confirmed(Command::new(
             device_id.clone(),
@@ -2149,7 +2149,7 @@ async fn multicast_session_enforces_transaction_identity_order_and_teardown() {
     };
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -2235,7 +2235,7 @@ async fn multicast_session_enforces_transaction_identity_order_and_teardown() {
         .write_all(&ClientMessage::KeepAlive.encode(protocol).unwrap())
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::KEEP_ALIVE_ACK).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::KEEP_ALIVE_ACK).await;
 
     handle
         .send_confirmed(Command::new(
@@ -2499,7 +2499,7 @@ async fn multicast_session_enforces_transaction_identity_order_and_teardown() {
         .write_all(&ClientMessage::KeepAlive.encode(protocol).unwrap())
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::KEEP_ALIVE_ACK).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::KEEP_ALIVE_ACK).await;
 
     handle
         .send_confirmed(Command::new(
@@ -2517,7 +2517,7 @@ async fn multicast_session_enforces_transaction_identity_order_and_teardown() {
     read_until_message(
         &mut phone,
         &mut decoder,
-        id::START_MULTICAST_MEDIA_RECEPTION,
+        wire_id::START_MULTICAST_MEDIA_RECEPTION,
     )
     .await;
     handle
@@ -2538,7 +2538,7 @@ async fn multicast_session_enforces_transaction_identity_order_and_teardown() {
     read_until_message(
         &mut phone,
         &mut decoder,
-        id::START_MULTICAST_MEDIA_TRANSMISSION,
+        wire_id::START_MULTICAST_MEDIA_TRANSMISSION,
     )
     .await;
     assert!(matches!(
@@ -2605,7 +2605,7 @@ async fn multicast_session_enforces_transaction_identity_order_and_teardown() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     for action in [
         CommandAction::StartMulticastReception {
             conference_id,
@@ -2632,7 +2632,7 @@ async fn multicast_session_enforces_transaction_identity_order_and_teardown() {
     read_until_message(
         &mut phone,
         &mut decoder,
-        id::START_MULTICAST_MEDIA_TRANSMISSION,
+        wire_id::START_MULTICAST_MEDIA_TRANSMISSION,
     )
     .await;
     assert!(matches!(
@@ -2718,7 +2718,7 @@ async fn multicast_receive_deadline_stops_and_retires_the_pending_generation() {
     let route = multicast_route("239.1.2.5".parse().unwrap(), Codec::Pcmu);
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -2758,7 +2758,7 @@ async fn multicast_receive_deadline_stops_and_retires_the_pending_generation() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send_confirmed(Command::new(
             device_id,
@@ -2825,7 +2825,7 @@ async fn multicast_receive_deadline_stops_and_retires_the_pending_generation() {
         .write_all(&ClientMessage::KeepAlive.encode(protocol).unwrap())
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::KEEP_ALIVE_ACK).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::KEEP_ALIVE_ACK).await;
 
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
@@ -2848,7 +2848,7 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
     let protocol = ProtocolVersion::V22;
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -2870,7 +2870,7 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         )
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -2893,7 +2893,7 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         )
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -2940,14 +2940,14 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         ))
         .await
         .unwrap();
-    let prefix = read_until_message(&mut phone, &mut decoder, id::CALL_STATE).await;
+    let prefix = read_until_message(&mut phone, &mut decoder, wire_id::CALL_STATE).await;
     let stop_tone = prefix
         .iter()
-        .position(|frame| frame.message_id == id::STOP_TONE)
+        .position(|frame| frame.message_id == wire_id::STOP_TONE)
         .expect("outbound route prefix omitted StopTone");
     let call_info = prefix
         .iter()
-        .position(|frame| frame.message_id == id::CALL_INFO_DYNAMIC)
+        .position(|frame| frame.message_id == wire_id::CALL_INFO_DYNAMIC)
         .expect("outbound route prefix omitted CallInfo");
     let dialed_number = prefix
         .iter()
@@ -2978,7 +2978,7 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
                 state: CallState::OffHook,
                 ..
             })
-        ) && frame.message_id != id::ACTIVATE_CALL_PLANE
+        ) && frame.message_id != wire_id::ACTIVATE_CALL_PLANE
     }));
 
     let outbound_info = CallInfo {
@@ -2997,27 +2997,31 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         ))
         .await
         .unwrap();
-    let proceeding =
-        read_until_message(&mut phone, &mut decoder, id::DISPLAY_DYNAMIC_PROMPT_STATUS).await;
+    let proceeding = read_until_message(
+        &mut phone,
+        &mut decoder,
+        wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS,
+    )
+    .await;
     let proceeding_ids = proceeding
         .iter()
         .map(|frame| frame.message_id)
         .collect::<Vec<_>>();
     let stop = proceeding_ids
         .iter()
-        .position(|message_id| *message_id == id::STOP_TONE)
+        .position(|message_id| *message_id == wire_id::STOP_TONE)
         .unwrap();
     let state = proceeding_ids
         .iter()
-        .position(|message_id| *message_id == id::CALL_STATE)
+        .position(|message_id| *message_id == wire_id::CALL_STATE)
         .unwrap();
     let info = proceeding_ids
         .iter()
-        .position(|message_id| *message_id == id::CALL_INFO_DYNAMIC)
+        .position(|message_id| *message_id == wire_id::CALL_INFO_DYNAMIC)
         .unwrap();
     let prompt = proceeding_ids
         .iter()
-        .position(|message_id| *message_id == id::DISPLAY_DYNAMIC_PROMPT_STATUS)
+        .position(|message_id| *message_id == wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS)
         .unwrap();
     assert!(stop < state && state < info && info < prompt);
 
@@ -3031,36 +3035,36 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         ))
         .await
         .unwrap();
-    let ringing = read_until_message(&mut phone, &mut decoder, id::CALL_INFO_DYNAMIC).await;
+    let ringing = read_until_message(&mut phone, &mut decoder, wire_id::CALL_INFO_DYNAMIC).await;
     let ringing_ids = ringing
         .iter()
         .map(|frame| frame.message_id)
         .collect::<Vec<_>>();
     let state = ringing_ids
         .iter()
-        .position(|message_id| *message_id == id::CALL_STATE)
+        .position(|message_id| *message_id == wire_id::CALL_STATE)
         .unwrap();
     let prompt = ringing_ids
         .iter()
-        .position(|message_id| *message_id == id::DISPLAY_DYNAMIC_PROMPT_STATUS)
+        .position(|message_id| *message_id == wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS)
         .unwrap();
     let tone = ringing_ids
         .iter()
-        .position(|message_id| *message_id == id::START_TONE)
+        .position(|message_id| *message_id == wire_id::START_TONE)
         .unwrap();
     let keys = ringing_ids
         .iter()
-        .position(|message_id| *message_id == id::SELECT_SOFT_KEYS)
+        .position(|message_id| *message_id == wire_id::SELECT_SOFT_KEYS)
         .unwrap();
     let info = ringing_ids
         .iter()
-        .position(|message_id| *message_id == id::CALL_INFO_DYNAMIC)
+        .position(|message_id| *message_id == wire_id::CALL_INFO_DYNAMIC)
         .unwrap();
     assert!(state < prompt && prompt < tone && tone < keys && keys < info);
     assert_eq!(
         ringing
             .iter()
-            .filter(|frame| frame.message_id == id::DISPLAY_DYNAMIC_PROMPT_STATUS)
+            .filter(|frame| frame.message_id == wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS)
             .count(),
         1,
         "outbound ringing flashed an intermediate prompt"
@@ -3092,14 +3096,15 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::START_MEDIA_TRANSMISSION).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::START_MEDIA_TRANSMISSION).await;
     let receive = frames
         .iter()
-        .position(|frame| frame.message_id == id::OPEN_RECEIVE_CHANNEL)
+        .position(|frame| frame.message_id == wire_id::OPEN_RECEIVE_CHANNEL)
         .expect("coupled transaction omitted OpenReceiveChannel");
     let transmit = frames
         .iter()
-        .position(|frame| frame.message_id == id::START_MEDIA_TRANSMISSION)
+        .position(|frame| frame.message_id == wire_id::START_MEDIA_TRANSMISSION)
         .expect("coupled transaction omitted StartMediaTransmission");
     let first_request_party = coupled_media_request_party(&frames, protocol);
     assert_eq!(transmit, receive + 1);
@@ -3203,7 +3208,8 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::START_MEDIA_TRANSMISSION).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::START_MEDIA_TRANSMISSION).await;
     let second_request_party = coupled_media_request_party(&frames, protocol);
     assert_ne!(second_request_party, first_request_party);
     phone
@@ -3306,7 +3312,8 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::START_MEDIA_TRANSMISSION).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::START_MEDIA_TRANSMISSION).await;
     let third_request_party = coupled_media_request_party(&frames, protocol);
     assert_ne!(third_request_party, second_request_party);
     phone
@@ -3381,7 +3388,8 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::START_MEDIA_TRANSMISSION).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::START_MEDIA_TRANSMISSION).await;
     let fourth_request_party = coupled_media_request_party(&frames, protocol);
     assert_ne!(fourth_request_party, third_request_party);
     phone
@@ -3454,7 +3462,7 @@ async fn invalid_coupled_media_is_rejected_without_disconnect() {
     let protocol = ProtocolVersion::V22;
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -3476,7 +3484,7 @@ async fn invalid_coupled_media_is_rejected_without_disconnect() {
         )
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -3524,7 +3532,7 @@ async fn invalid_coupled_media_is_rejected_without_disconnect() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     assert!(frames.iter().any(|frame| matches!(
         ServerMessage::decode(frame.clone(), protocol),
         Ok(ServerMessage::CallState {
@@ -3560,7 +3568,7 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -3583,7 +3591,7 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         )
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -3606,7 +3614,7 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send(Command::new(
             device_id.clone(),
@@ -3633,11 +3641,11 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::OPEN_RECEIVE_CHANNEL).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::OPEN_RECEIVE_CHANNEL).await;
     assert_eq!(
         frames
             .iter()
-            .filter(|frame| frame.message_id == id::SUBSCRIBE_DTMF_PAYLOAD_REQ)
+            .filter(|frame| frame.message_id == wire_id::SUBSCRIBE_DTMF_PAYLOAD_REQ)
             .count(),
         0,
         "RFC2833 is negotiated in the media messages, not with an unsolicited subscription"
@@ -3651,7 +3659,7 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         .unwrap();
     let frame = frames
         .into_iter()
-        .find(|frame| frame.message_id == id::OPEN_RECEIVE_CHANNEL)
+        .find(|frame| frame.message_id == wire_id::OPEN_RECEIVE_CHANNEL)
         .unwrap();
     assert!(matches!(
         ServerMessage::decode(frame, protocol).unwrap(),
@@ -3687,17 +3695,18 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::START_MEDIA_TRANSMISSION).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::START_MEDIA_TRANSMISSION).await;
     assert!(
         frames
             .iter()
-            .all(|frame| frame.message_id != id::SUBSCRIBE_DTMF_PAYLOAD_REQ),
+            .all(|frame| frame.message_id != wire_id::SUBSCRIBE_DTMF_PAYLOAD_REQ),
         "starting the second media direction resubscribed RFC2833"
     );
     let start_media_party = start_media_request_party(&frames, protocol);
     let frame = frames
         .into_iter()
-        .find(|frame| frame.message_id == id::START_MEDIA_TRANSMISSION)
+        .find(|frame| frame.message_id == wire_id::START_MEDIA_TRANSMISSION)
         .unwrap();
     assert!(matches!(
         ServerMessage::decode(frame, protocol).unwrap(),
@@ -3917,7 +3926,8 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::START_MEDIA_TRANSMISSION).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::START_MEDIA_TRANSMISSION).await;
     let recovery_media_party = start_media_request_party(&frames, protocol);
     assert_ne!(recovery_media_party, start_media_party);
     phone
@@ -3993,18 +4003,18 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::OPEN_RECEIVE_CHANNEL).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::OPEN_RECEIVE_CHANNEL).await;
     assert_eq!(
         frames
             .iter()
-            .filter(|frame| frame.message_id == id::UNSUBSCRIBE_DTMF_PAYLOAD_REQ)
+            .filter(|frame| frame.message_id == wire_id::UNSUBSCRIBE_DTMF_PAYLOAD_REQ)
             .count(),
         0,
         "changing one media direction unsubscribed the remaining RFC2833 stream"
     );
     let frame = frames
         .into_iter()
-        .find(|frame| frame.message_id == id::OPEN_RECEIVE_CHANNEL)
+        .find(|frame| frame.message_id == wire_id::OPEN_RECEIVE_CHANNEL)
         .unwrap();
     assert!(matches!(
         ServerMessage::decode(frame, protocol).unwrap(),
@@ -4040,11 +4050,12 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::STOP_MEDIA_TRANSMISSION).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::STOP_MEDIA_TRANSMISSION).await;
     assert!(
         frames
             .iter()
-            .all(|frame| frame.message_id != id::UNSUBSCRIBE_DTMF_PAYLOAD_REQ)
+            .all(|frame| frame.message_id != wire_id::UNSUBSCRIBE_DTMF_PAYLOAD_REQ)
     );
     handle
         .send(Command::new(
@@ -4086,11 +4097,11 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::CLOSE_RECEIVE_CHANNEL).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::CLOSE_RECEIVE_CHANNEL).await;
     assert_eq!(
         frames
             .iter()
-            .filter(|frame| frame.message_id == id::CLOSE_RECEIVE_CHANNEL)
+            .filter(|frame| frame.message_id == wire_id::CLOSE_RECEIVE_CHANNEL)
             .count(),
         1
     );
@@ -4108,10 +4119,10 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::SET_RINGER).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::SET_RINGER).await;
     assert!(frames.iter().all(|frame| !matches!(
         frame.message_id,
-        id::STOP_MEDIA_TRANSMISSION | id::CLOSE_RECEIVE_CHANNEL
+        wire_id::STOP_MEDIA_TRANSMISSION | wire_id::CLOSE_RECEIVE_CHANNEL
     )));
 
     handle.shutdown().await.unwrap();
@@ -4183,7 +4194,12 @@ async fn capability_snapshots_replace_atomically_and_remain_session_scoped() {
         .write_all(&register_bytes(protocol))
         .await
         .unwrap();
-    read_until_message(&mut first_phone, &mut first_decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(
+        &mut first_phone,
+        &mut first_decoder,
+        wire_id::CAPABILITIES_REQ,
+    )
+    .await;
     let first_generation = match events.recv().await {
         Some(Event::Device(DeviceEvent {
             session_generation,
@@ -4262,7 +4278,12 @@ async fn capability_snapshots_replace_atomically_and_remain_session_scoped() {
         .write_all(&register_bytes(protocol))
         .await
         .unwrap();
-    read_until_message(&mut second_phone, &mut second_decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(
+        &mut second_phone,
+        &mut second_decoder,
+        wire_id::CAPABILITIES_REQ,
+    )
+    .await;
     let second_generation = match events.recv().await {
         Some(Event::Device(DeviceEvent {
             session_generation,
@@ -4326,7 +4347,7 @@ async fn hangup_statistics_are_exactly_correlated_retained_and_not_replayed() {
     let call_id = CallId(7001);
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -4346,7 +4367,7 @@ async fn hangup_statistics_are_exactly_correlated_retained_and_not_replayed() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CALL_STATE).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CALL_STATE).await;
     handle
         .send(Command::new(
             device_id.clone(),
@@ -4384,7 +4405,7 @@ async fn hangup_statistics_are_exactly_correlated_retained_and_not_replayed() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::OPEN_RECEIVE_CHANNEL).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::OPEN_RECEIVE_CHANNEL).await;
     let receive_media_party = open_receive_request_party(&frames, protocol);
     let receive_peer = MediaEndpoint {
         address: "192.0.2.10".parse().unwrap(),
@@ -4434,7 +4455,8 @@ async fn hangup_statistics_are_exactly_correlated_retained_and_not_replayed() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::START_MEDIA_TRANSMISSION).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::START_MEDIA_TRANSMISSION).await;
     let transmit_media_party = start_media_request_party(&frames, protocol);
     let transmit_peer = MediaEndpoint {
         address: "2001:db8::20".parse().unwrap(),
@@ -4486,20 +4508,21 @@ async fn hangup_statistics_are_exactly_correlated_retained_and_not_replayed() {
         ))
         .await
         .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, id::CONNECTION_STATISTICS_REQ).await;
+    let frames =
+        read_until_message(&mut phone, &mut decoder, wire_id::CONNECTION_STATISTICS_REQ).await;
     let trailing = if frames
         .iter()
-        .any(|frame| frame.message_id == id::SET_RINGER)
+        .any(|frame| frame.message_id == wire_id::SET_RINGER)
     {
         Vec::new()
     } else {
-        read_until_message(&mut phone, &mut decoder, id::SET_RINGER).await
+        read_until_message(&mut phone, &mut decoder, wire_id::SET_RINGER).await
     };
     assert_eq!(
         frames
             .iter()
             .chain(&trailing)
-            .filter(|frame| frame.message_id == id::STOP_MEDIA_TRANSMISSION)
+            .filter(|frame| frame.message_id == wire_id::STOP_MEDIA_TRANSMISSION)
             .count(),
         1
     );
@@ -4507,17 +4530,17 @@ async fn hangup_statistics_are_exactly_correlated_retained_and_not_replayed() {
         frames
             .iter()
             .chain(&trailing)
-            .filter(|frame| frame.message_id == id::CLOSE_RECEIVE_CHANNEL)
+            .filter(|frame| frame.message_id == wire_id::CLOSE_RECEIVE_CHANNEL)
             .count(),
         1
     );
     let close_receive = frames
         .iter()
-        .position(|frame| frame.message_id == id::CLOSE_RECEIVE_CHANNEL)
+        .position(|frame| frame.message_id == wire_id::CLOSE_RECEIVE_CHANNEL)
         .expect("hangup did not close receive media");
     let stop_media = frames
         .iter()
-        .position(|frame| frame.message_id == id::STOP_MEDIA_TRANSMISSION)
+        .position(|frame| frame.message_id == wire_id::STOP_MEDIA_TRANSMISSION)
         .expect("hangup did not stop transmit media");
     let on_hook = frames
         .iter()
@@ -4533,13 +4556,13 @@ async fn hangup_statistics_are_exactly_correlated_retained_and_not_replayed() {
         .expect("hangup did not publish OnHook");
     let statistics = frames
         .iter()
-        .position(|frame| frame.message_id == id::CONNECTION_STATISTICS_REQ)
+        .position(|frame| frame.message_id == wire_id::CONNECTION_STATISTICS_REQ)
         .expect("hangup did not request connection statistics");
     assert!(close_receive < stop_media && stop_media < on_hook && on_hook < statistics);
     assert!(
         frames
             .iter()
-            .all(|frame| frame.message_id != id::CALL_HISTORY_DISPOSITION)
+            .all(|frame| frame.message_id != wire_id::CALL_HISTORY_DISPOSITION)
     );
     assert!(frames.iter().any(|frame| matches!(
         ServerMessage::decode(frame.clone(), protocol),
@@ -4779,11 +4802,11 @@ async fn registration_applies_device_socket_qos_without_making_failure_fatal() {
         .unwrap();
 
     let mut decoder = FrameDecoder::new();
-    let frames = read_until_message(&mut phone, &mut decoder, id::REGISTER_ACK).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::REGISTER_ACK).await;
     assert!(
         frames
             .iter()
-            .any(|frame| frame.message_id == id::REGISTER_ACK)
+            .any(|frame| frame.message_id == wire_id::REGISTER_ACK)
     );
     assert!(matches!(
         events.recv().await,
@@ -4816,7 +4839,7 @@ async fn unpaired_active_media_path_release_completes_on_hook_after_grace() {
     let call_id = CallId(7101);
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -4835,7 +4858,7 @@ async fn unpaired_active_media_path_release_completes_on_hook_after_grace() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send(Command::new(
             device_id,
@@ -4846,7 +4869,7 @@ async fn unpaired_active_media_path_release_completes_on_hook_after_grace() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
 
     for event in [crate::MediaPathEvent::On, crate::MediaPathEvent::Off] {
         phone
@@ -4887,7 +4910,7 @@ async fn unpaired_active_media_path_release_completes_on_hook_after_grace() {
             ..
         }))) if ended == call_id
     ));
-    let frames = read_until_message(&mut phone, &mut decoder, id::SET_RINGER).await;
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::SET_RINGER).await;
     assert!(frames.into_iter().any(|frame| matches!(
         ServerMessage::decode(frame, protocol),
         Ok(ServerMessage::CallState {
@@ -4917,7 +4940,7 @@ async fn replacement_media_path_cancels_pending_on_hook_completion() {
     let call_id = CallId(7102);
 
     phone.write_all(&register_bytes(protocol)).await.unwrap();
-    read_until_message(&mut phone, &mut decoder, id::CAPABILITIES_REQ).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -4936,7 +4959,7 @@ async fn replacement_media_path_cancels_pending_on_hook_completion() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
     handle
         .send(Command::new(
             device_id,
@@ -4947,7 +4970,7 @@ async fn replacement_media_path_cancels_pending_on_hook_completion() {
         ))
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, id::SELECT_SOFT_KEYS).await;
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
 
     for (path, event) in [
         (crate::MediaPathId::Speaker, crate::MediaPathEvent::On),

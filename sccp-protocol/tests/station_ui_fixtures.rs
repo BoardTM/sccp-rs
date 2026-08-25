@@ -1,9 +1,8 @@
-use sccp_protocol::message::id;
 use sccp_protocol::message::values::{PhoneFeatures, StationSessionContext};
 use sccp_protocol::{
     BusyLampFieldState, ButtonTemplateEntry, ButtonType, CallDirection, CallHistoryDisposition,
     CallInfo, CallState, ClientMessage, Digit, Frame, FrameDecoder, KeyMode, LampMode,
-    MediaPathEvent, MediaPathId, MicrophoneMode, NotificationPriority, ProtocolVersion,
+    MediaPathEvent, MediaPathId, MessageId, MicrophoneMode, NotificationPriority, ProtocolVersion,
     RingDuration, RingerMode, ServerMessage, SoftKey, SoftKeyProfile, SpeakerMode, Stimulus,
     SubscriptionCause, SubscriptionRequest, Tone, ToneDirection,
 };
@@ -110,7 +109,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "keypad button",
             ProtocolVersion::V22,
-            id::KEYPAD_BUTTON,
+            MessageId::KeypadButton.wire_value(),
             20,
             ClientMessage::KeypadButton {
                 button: Digit::Pound,
@@ -122,7 +121,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "legacy enbloc call",
             ProtocolVersion::V3,
-            id::ENBLOC_CALL,
+            MessageId::EnblocCall.wire_value(),
             28,
             ClientMessage::EnblocCall {
                 called_party: "2001".into(),
@@ -132,7 +131,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "v17 enbloc call",
             ProtocolVersion::V17,
-            id::ENBLOC_CALL,
+            MessageId::EnblocCall.wire_value(),
             28,
             ClientMessage::EnblocCall {
                 called_party: "2001".into(),
@@ -142,7 +141,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "v22 enbloc call",
             ProtocolVersion::V22,
-            id::ENBLOC_CALL,
+            MessageId::EnblocCall.wire_value(),
             32,
             ClientMessage::EnblocCall {
                 called_party: "2001".into(),
@@ -152,7 +151,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "v18 off-hook with calling party",
             ProtocolVersion::V18,
-            id::OFF_HOOK_WITH_CALLING_PARTY,
+            MessageId::OffHookWithCallingParty.wire_value(),
             52,
             ClientMessage::OffHookWithCallingParty {
                 calling_party_number: "2001".into(),
@@ -163,7 +162,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "v19 off-hook with calling party",
             ProtocolVersion::V19,
-            id::OFF_HOOK_WITH_CALLING_PARTY,
+            MessageId::OffHookWithCallingParty.wire_value(),
             56,
             ClientMessage::OffHookWithCallingParty {
                 calling_party_number: "2001".into(),
@@ -174,7 +173,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "stimulus",
             ProtocolVersion::V22,
-            id::STIMULUS,
+            MessageId::Stimulus.wire_value(),
             16,
             ClientMessage::Stimulus {
                 stimulus: Stimulus::Line,
@@ -186,7 +185,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "off-hook",
             ProtocolVersion::V22,
-            id::OFF_HOOK,
+            MessageId::OffHook.wire_value(),
             8,
             ClientMessage::OffHook {
                 line_instance: 2,
@@ -196,7 +195,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "on-hook",
             ProtocolVersion::V22,
-            id::ON_HOOK,
+            MessageId::OnHook.wire_value(),
             8,
             ClientMessage::OnHook {
                 line_instance: 2,
@@ -206,7 +205,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "hook flash",
             ProtocolVersion::V22,
-            id::HOOK_FLASH,
+            MessageId::HookFlash.wire_value(),
             8,
             ClientMessage::HookFlash {
                 line_instance: 2,
@@ -216,7 +215,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "soft-key event",
             ProtocolVersion::V22,
-            id::SOFT_KEY_EVENT,
+            MessageId::SoftKeyEvent.wire_value(),
             12,
             ClientMessage::SoftKeyEvent {
                 event: SoftKey::Answer.wire_value(),
@@ -227,14 +226,14 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "headset status",
             ProtocolVersion::V22,
-            id::HEADSET_STATUS,
+            MessageId::HeadsetStatus.wire_value(),
             4,
             ClientMessage::HeadsetStatus { enabled: true },
         ),
         (
             "accessory status",
             ProtocolVersion::V22,
-            id::ACCESSORY_STATUS,
+            MessageId::MediaPathEvent.wire_value(),
             8,
             ClientMessage::MediaPathEvent {
                 path: MediaPathId::Headset,
@@ -244,14 +243,14 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
         (
             "call-count request",
             ProtocolVersion::V22,
-            id::CALL_COUNT_REQ,
+            MessageId::CallCountRequest.wire_value(),
             4,
             ClientMessage::CallCountRequest { value: 3 },
         ),
         (
             "BLF subscription request",
             ProtocolVersion::V22,
-            id::SUBSCRIPTION_STAT_REQ,
+            MessageId::SubscriptionStatusRequest.wire_value(),
             268,
             ClientMessage::SubscriptionStatusRequest(SubscriptionRequest {
                 transaction_id: 7,
@@ -271,13 +270,13 @@ fn station_ui_request_fixtures_cover_every_status_query_layout() {
     for (name, message_id, payload, expected) in [
         (
             "forward status request",
-            id::FORWARD_STAT_REQ,
+            MessageId::ForwardStatusRequest.wire_value(),
             words(&[3]),
             ClientMessage::ForwardStatusRequest { line_instance: 3 },
         ),
         (
             "speed-dial status request",
-            id::SPEED_DIAL_STAT_REQ,
+            MessageId::SpeedDialStatusRequest.wire_value(),
             words(&[4]),
             ClientMessage::SpeedDialStatusRequest {
                 speed_dial_instance: 4,
@@ -285,55 +284,55 @@ fn station_ui_request_fixtures_cover_every_status_query_layout() {
         ),
         (
             "line status request",
-            id::LINE_STAT_REQ,
+            MessageId::LineStatusRequest.wire_value(),
             words(&[5]),
             ClientMessage::LineStatRequest { line_instance: 5 },
         ),
         (
             "configuration status request",
-            id::CONFIG_STAT_REQ,
+            MessageId::ConfigStatusRequest.wire_value(),
             Vec::new(),
             ClientMessage::ConfigStatRequest,
         ),
         (
             "time/date request",
-            id::TIME_DATE_REQ,
+            MessageId::TimeDateRequest.wire_value(),
             Vec::new(),
             ClientMessage::TimeDateRequest,
         ),
         (
             "button-template request",
-            id::BUTTON_TEMPLATE_REQ,
+            MessageId::ButtonTemplateRequest.wire_value(),
             Vec::new(),
             ClientMessage::ButtonTemplateRequest,
         ),
         (
             "version request",
-            id::VERSION_REQ,
+            MessageId::VersionRequest.wire_value(),
             Vec::new(),
             ClientMessage::VersionRequest,
         ),
         (
             "soft-key set request",
-            id::SOFT_KEY_SET_REQ,
+            MessageId::SoftKeySetRequest.wire_value(),
             Vec::new(),
             ClientMessage::SoftKeySetRequest,
         ),
         (
             "soft-key template request",
-            id::SOFT_KEY_TEMPLATE_REQ,
+            MessageId::SoftKeyTemplateRequest.wire_value(),
             Vec::new(),
             ClientMessage::SoftKeyTemplateRequest,
         ),
         (
             "service URL status request",
-            id::SERVICE_URL_STAT_REQ,
+            MessageId::ServiceUrlStatusRequest.wire_value(),
             words(&[6]),
             ClientMessage::ServiceUrlStatusRequest { index: 6 },
         ),
         (
             "feature status request",
-            id::FEATURE_STAT_REQ,
+            MessageId::FeatureStatusRequest.wire_value(),
             words(&[7, 0x0102_0304]),
             ClientMessage::FeatureStatusRequest {
                 index: 7,
@@ -362,7 +361,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "configuration status",
             ProtocolVersion::V3,
-            id::CONFIG_STAT,
+            MessageId::ConfigStatus.wire_value(),
             112,
             ServerMessage::ConfigStatus(sccp_protocol::ConfigurationStatus {
                 device_name: "SEP001122334455".into(),
@@ -377,7 +376,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "legacy line status",
             ProtocolVersion::V3,
-            id::LINE_STAT,
+            MessageId::LineStatus.wire_value(),
             112,
             ServerMessage::LineStatus {
                 instance: 1,
@@ -388,7 +387,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "dynamic line status",
             ProtocolVersion::V22,
-            id::LINE_STAT_DYNAMIC,
+            MessageId::LineStatusDynamic.wire_value(),
             28,
             ServerMessage::LineStatus {
                 instance: 1,
@@ -399,7 +398,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "button template",
             ProtocolVersion::V22,
-            id::BUTTON_TEMPLATE,
+            MessageId::ButtonTemplate.wire_value(),
             96,
             ServerMessage::ButtonTemplate {
                 offset: 0,
@@ -419,7 +418,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "firmware version",
             ProtocolVersion::V22,
-            id::VERSION,
+            MessageId::Version.wire_value(),
             16,
             ServerMessage::Version {
                 firmware: "SCCP45.9-4".into(),
@@ -428,7 +427,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "time/date",
             ProtocolVersion::V22,
-            id::DEFINE_TIME_DATE,
+            MessageId::DefineTimeDate.wire_value(),
             36,
             ServerMessage::TimeDate {
                 year: 2026,
@@ -445,7 +444,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "soft-key template",
             ProtocolVersion::V22,
-            id::SOFT_KEY_TEMPLATE_RES,
+            MessageId::SoftKeyTemplateResponse.wire_value(),
             652,
             ServerMessage::SoftKeyTemplate {
                 actions: profile.template_actions(),
@@ -454,14 +453,14 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "soft-key set",
             ProtocolVersion::V22,
-            id::SOFT_KEY_SET_RES,
+            MessageId::SoftKeySetResponse.wire_value(),
             780,
             ServerMessage::SoftKeySet { profile },
         ),
         (
             "legacy forwarding status",
             ProtocolVersion::V3,
-            id::FORWARD_STAT,
+            MessageId::ForwardStatus.wire_value(),
             92,
             ServerMessage::ForwardStatus {
                 line_instance: 1,
@@ -473,7 +472,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "extended forwarding status",
             ProtocolVersion::V22,
-            id::FORWARD_STAT,
+            MessageId::ForwardStatus.wire_value(),
             104,
             ServerMessage::ForwardStatus {
                 line_instance: 1,
@@ -485,7 +484,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "legacy speed-dial status",
             ProtocolVersion::V3,
-            id::SPEED_DIAL_STAT,
+            MessageId::SpeedDialStatus.wire_value(),
             68,
             ServerMessage::SpeedDialStatus {
                 instance: 2,
@@ -496,7 +495,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "dynamic speed-dial status",
             ProtocolVersion::V22,
-            id::SPEED_DIAL_STAT_DYNAMIC,
+            MessageId::SpeedDialStatusDynamic.wire_value(),
             20,
             ServerMessage::SpeedDialStatus {
                 instance: 2,
@@ -507,7 +506,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "legacy feature status",
             ProtocolVersion::V3,
-            id::FEATURE_STAT,
+            MessageId::FeatureStatus.wire_value(),
             52,
             ServerMessage::FeatureStatus {
                 instance: 3,
@@ -519,7 +518,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "legacy service URL status",
             ProtocolVersion::V3,
-            id::SERVICE_URL_STAT,
+            MessageId::ServiceUrlStatus.wire_value(),
             300,
             ServerMessage::ServiceUrlStatus {
                 index: 4,
@@ -531,7 +530,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
         (
             "dynamic service URL status",
             ProtocolVersion::V22,
-            id::SERVICE_URL_STAT_DYNAMIC,
+            MessageId::ServiceUrlStatusDynamic.wire_value(),
             44,
             ServerMessage::ServiceUrlStatus {
                 index: 4,
@@ -547,7 +546,7 @@ fn station_ui_response_fixtures_cover_static_and_dynamic_layouts() {
     assert_server_session_fixture(
         "feature status selected by session capability",
         StationSessionContext::new(ProtocolVersion::V8, PhoneFeatures::DYNAMIC_MESSAGES),
-        id::FEATURE_STAT_DYNAMIC,
+        MessageId::FeatureStatusDynamic.wire_value(),
         136,
         ServerMessage::FeatureStatus {
             instance: 3,
@@ -564,7 +563,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "register acknowledgement",
             ProtocolVersion::V22,
-            id::REGISTER_ACK,
+            MessageId::RegisterAck.wire_value(),
             20,
             ServerMessage::RegisterAck {
                 keepalive_seconds: 30,
@@ -577,7 +576,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "start tone",
             ProtocolVersion::V22,
-            id::START_TONE,
+            MessageId::StartTone.wire_value(),
             16,
             ServerMessage::StartTone {
                 tone: Tone::Zip,
@@ -589,7 +588,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "legacy stop tone",
             ProtocolVersion::V3,
-            id::STOP_TONE,
+            MessageId::StopTone.wire_value(),
             8,
             ServerMessage::StopTone {
                 line_instance: 2,
@@ -599,7 +598,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "extended stop tone",
             ProtocolVersion::V22,
-            id::STOP_TONE,
+            MessageId::StopTone.wire_value(),
             12,
             ServerMessage::StopTone {
                 line_instance: 2,
@@ -609,7 +608,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "ringer state",
             ProtocolVersion::V22,
-            id::SET_RINGER,
+            MessageId::SetRinger.wire_value(),
             16,
             ServerMessage::SetRinger {
                 mode: RingerMode::Inside,
@@ -621,7 +620,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "lamp state",
             ProtocolVersion::V22,
-            id::SET_LAMP,
+            MessageId::SetLamp.wire_value(),
             12,
             ServerMessage::SetLamp {
                 stimulus: ButtonType::Line,
@@ -632,21 +631,21 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "speaker mode",
             ProtocolVersion::V22,
-            id::SET_SPEAKER_MODE,
+            MessageId::SetSpeakerMode.wire_value(),
             4,
             ServerMessage::SetSpeakerMode(SpeakerMode::On),
         ),
         (
             "microphone mode",
             ProtocolVersion::V22,
-            id::SET_MICROPHONE_MODE,
+            MessageId::SetMicrophoneMode.wire_value(),
             4,
             ServerMessage::SetMicrophoneMode(MicrophoneMode::Off),
         ),
         (
             "select soft keys",
             ProtocolVersion::V22,
-            id::SELECT_SOFT_KEYS,
+            MessageId::SelectSoftKeys.wire_value(),
             16,
             ServerMessage::SelectSoftKeys {
                 line_instance: 2,
@@ -658,7 +657,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "call state",
             ProtocolVersion::V22,
-            id::CALL_STATE,
+            MessageId::CallState.wire_value(),
             24,
             ServerMessage::CallState {
                 state: CallState::Connected,
@@ -669,7 +668,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "legacy prompt",
             ProtocolVersion::V3,
-            id::DISPLAY_PROMPT_STATUS,
+            MessageId::DisplayPromptStatus.wire_value(),
             44,
             ServerMessage::DisplayPrompt {
                 timeout_seconds: 5,
@@ -681,7 +680,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "dynamic prompt",
             ProtocolVersion::V22,
-            id::DISPLAY_DYNAMIC_PROMPT_STATUS,
+            MessageId::DisplayDynamicPromptStatus.wire_value(),
             24,
             ServerMessage::DisplayPrompt {
                 timeout_seconds: 5,
@@ -693,7 +692,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "clear prompt",
             ProtocolVersion::V22,
-            id::CLEAR_PROMPT_STATUS,
+            MessageId::ClearPromptStatus.wire_value(),
             8,
             ServerMessage::ClearPrompt {
                 line_instance: 2,
@@ -703,7 +702,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "legacy notification",
             ProtocolVersion::V3,
-            id::DISPLAY_NOTIFY,
+            MessageId::DisplayNotify.wire_value(),
             36,
             ServerMessage::DisplayNotify {
                 timeout_seconds: 5,
@@ -713,7 +712,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "dynamic notification",
             ProtocolVersion::V22,
-            id::DISPLAY_DYNAMIC_NOTIFY,
+            MessageId::DisplayDynamicNotify.wire_value(),
             12,
             ServerMessage::DisplayNotify {
                 timeout_seconds: 5,
@@ -723,14 +722,14 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "clear notification",
             ProtocolVersion::V22,
-            id::CLEAR_NOTIFY,
+            MessageId::ClearNotify.wire_value(),
             0,
             ServerMessage::ClearNotify,
         ),
         (
             "legacy priority notification",
             ProtocolVersion::V3,
-            id::DISPLAY_PRIORITY_NOTIFY,
+            MessageId::DisplayPriorityNotify.wire_value(),
             40,
             ServerMessage::DisplayPriorityNotify {
                 timeout_seconds: 5,
@@ -741,7 +740,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "dynamic priority notification",
             ProtocolVersion::V22,
-            id::DISPLAY_DYNAMIC_PRIORITY_NOTIFY,
+            MessageId::DisplayDynamicPriorityNotify.wire_value(),
             20,
             ServerMessage::DisplayPriorityNotify {
                 timeout_seconds: 5,
@@ -752,7 +751,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "clear priority notification",
             ProtocolVersion::V22,
-            id::CLEAR_PRIORITY_NOTIFY,
+            MessageId::ClearPriorityNotify.wire_value(),
             4,
             ServerMessage::ClearPriorityNotify {
                 priority: NotificationPriority::Voicemail,
@@ -761,7 +760,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "display text",
             ProtocolVersion::V22,
-            id::DISPLAY_TEXT,
+            MessageId::DisplayText.wire_value(),
             32,
             ServerMessage::DisplayText {
                 text: "Ready".into(),
@@ -770,28 +769,28 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "clear display",
             ProtocolVersion::V22,
-            id::CLEAR_DISPLAY,
+            MessageId::ClearDisplay.wire_value(),
             0,
             ServerMessage::ClearDisplay,
         ),
         (
             "activate call plane",
             ProtocolVersion::V22,
-            id::ACTIVATE_CALL_PLANE,
+            MessageId::ActivateCallPlane.wire_value(),
             4,
             ServerMessage::ActivateCallPlane { line_instance: 2 },
         ),
         (
             "deactivate call plane",
             ProtocolVersion::V22,
-            id::DEACTIVATE_CALL_PLANE,
+            MessageId::DeactivateCallPlane.wire_value(),
             0,
             ServerMessage::DeactivateCallPlane,
         ),
         (
             "backspace response",
             ProtocolVersion::V22,
-            id::BACKSPACE_RESPONSE,
+            MessageId::BackspaceResponse.wire_value(),
             8,
             ServerMessage::BackspaceResponse {
                 line_instance: 2,
@@ -801,7 +800,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "legacy dialed number",
             ProtocolVersion::V3,
-            id::DIALED_NUMBER,
+            MessageId::DialedNumber.wire_value(),
             32,
             ServerMessage::DialedNumber {
                 number: "2001".into(),
@@ -812,7 +811,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "extended dialed number",
             ProtocolVersion::V22,
-            id::DIALED_NUMBER,
+            MessageId::DialedNumber.wire_value(),
             36,
             ServerMessage::DialedNumber {
                 number: "2001".into(),
@@ -823,7 +822,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "call selection status",
             ProtocolVersion::V22,
-            id::CALL_SELECT_STAT,
+            MessageId::CallSelectStatus.wire_value(),
             12,
             ServerMessage::CallSelectStatus {
                 status: 1,
@@ -834,7 +833,7 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "call-history disposition",
             ProtocolVersion::V22,
-            id::CALL_HISTORY_DISPOSITION,
+            MessageId::CallHistoryDisposition.wire_value(),
             12,
             ServerMessage::CallHistoryDisposition {
                 disposition: CallHistoryDisposition::Received,
@@ -845,14 +844,14 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
         (
             "call-count response",
             ProtocolVersion::V22,
-            id::CALL_COUNT_RES,
+            MessageId::CallCountResponse.wire_value(),
             0,
             ServerMessage::CallCountResponse,
         ),
         (
             "recording status",
             ProtocolVersion::V22,
-            id::RECORDING_STATUS,
+            MessageId::RecordingStatus.wire_value(),
             8,
             ServerMessage::RecordingStatus {
                 call_reference: 42,
@@ -889,14 +888,14 @@ fn station_ui_call_information_fixtures_cover_legacy_and_dynamic_layouts() {
     assert_server_fixture(
         "legacy call information",
         ProtocolVersion::V3,
-        id::CALL_INFO,
+        MessageId::CallInfo.wire_value(),
         384,
         message.clone(),
     );
     assert_server_fixture(
         "dynamic call information",
         ProtocolVersion::V22,
-        id::CALL_INFO_DYNAMIC,
+        MessageId::CallInfoDynamic.wire_value(),
         80,
         message,
     );
@@ -904,7 +903,7 @@ fn station_ui_call_information_fixtures_cover_legacy_and_dynamic_layouts() {
     assert_server_fixture(
         "BLF subscription status",
         ProtocolVersion::V22,
-        id::SUBSCRIPTION_STAT,
+        MessageId::SubscriptionStatus.wire_value(),
         16,
         ServerMessage::SubscriptionStatus {
             transaction_id: 7,
@@ -916,7 +915,7 @@ fn station_ui_call_information_fixtures_cover_legacy_and_dynamic_layouts() {
     assert_server_fixture(
         "BLF notification",
         ProtocolVersion::V22,
-        id::NOTIFICATION,
+        MessageId::Notification.wire_value(),
         112,
         ServerMessage::Notification {
             transaction_id: 7,

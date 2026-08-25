@@ -2714,7 +2714,7 @@ async fn run_session(
                     let message_id = frame.message_id;
                     let message = match ClientMessage::decode_with_version(frame, decode_protocol) {
                         Ok(message) => message,
-                        Err(error) if message_id != crate::message::id::REGISTER => {
+                        Err(error) if message_id != crate::message::wire_id::REGISTER => {
                             let device_id = state.as_ref().map(|state| state.device.id.clone());
                             warn!(peer = %context.peer, message_id = format_args!("0x{message_id:04x}"), %error, "ignoring malformed SCCP application message");
                             let _ = context.event_tx.send(Event::ProtocolWarning {
@@ -4590,7 +4590,7 @@ async fn handle_client_message(
             handle_phone_service_message(
                 state,
                 context,
-                crate::message::id::DEVICE_TO_USER_DATA,
+                crate::message::wire_id::DEVICE_TO_USER_DATA,
                 PhoneServiceMessageKind::Data,
                 PhoneServiceRouting {
                     application_id: ApplicationId::new(message.application_id),
@@ -4607,7 +4607,7 @@ async fn handle_client_message(
             handle_phone_service_message(
                 state,
                 context,
-                crate::message::id::DEVICE_TO_USER_DATA_RESPONSE,
+                crate::message::wire_id::DEVICE_TO_USER_DATA_RESPONSE,
                 PhoneServiceMessageKind::Response,
                 PhoneServiceRouting {
                     application_id: ApplicationId::new(message.application_id),
@@ -4624,7 +4624,7 @@ async fn handle_client_message(
             handle_phone_service_message(
                 state,
                 context,
-                crate::message::id::DEVICE_TO_USER_DATA_V1,
+                crate::message::wire_id::DEVICE_TO_USER_DATA_V1,
                 PhoneServiceMessageKind::Data,
                 PhoneServiceRouting {
                     application_id: ApplicationId::new(message.application_id),
@@ -4647,7 +4647,7 @@ async fn handle_client_message(
             handle_phone_service_message(
                 state,
                 context,
-                crate::message::id::DEVICE_TO_USER_DATA_RESPONSE_V1,
+                crate::message::wire_id::DEVICE_TO_USER_DATA_RESPONSE_V1,
                 PhoneServiceMessageKind::Response,
                 PhoneServiceRouting {
                     application_id: ApplicationId::new(message.application_id),

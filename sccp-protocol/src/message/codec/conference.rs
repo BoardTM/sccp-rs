@@ -57,9 +57,9 @@ impl ConferenceParticipantChange {
         routing: ParticipantChangeRouting,
     ) -> Result<UserDataV1Message, CodecError> {
         let data = encode(
-            id::USER_TO_DEVICE_DATA_V1,
+            wire_id::USER_TO_DEVICE_DATA_V1,
             &encode_participant_request(
-                id::USER_TO_DEVICE_DATA_V1,
+                wire_id::USER_TO_DEVICE_DATA_V1,
                 self.conference_id,
                 &self.participant,
             )?,
@@ -82,17 +82,17 @@ impl ConferenceParticipantChange {
     /// mismatched envelope/payload call or conference identities.
     pub fn from_user_data_v1(message: &UserDataV1Message) -> Result<Self, CodecError> {
         let (conference_id, participant) =
-            decode_participant_request(&message.data, id::USER_TO_DEVICE_DATA_V1)?;
+            decode_participant_request(&message.data, wire_id::USER_TO_DEVICE_DATA_V1)?;
         if message.conference_id != conference_id.get() {
             return Err(CodecError::InvalidValue {
-                message_id: id::USER_TO_DEVICE_DATA_V1,
+                message_id: wire_id::USER_TO_DEVICE_DATA_V1,
                 field: "participant change conference ID",
                 value: u64::from(message.conference_id),
             });
         }
         if message.call_reference != participant.call_reference.get() {
             return Err(CodecError::InvalidValue {
-                message_id: id::USER_TO_DEVICE_DATA_V1,
+                message_id: wire_id::USER_TO_DEVICE_DATA_V1,
                 field: "participant change call reference",
                 value: u64::from(message.call_reference),
             });

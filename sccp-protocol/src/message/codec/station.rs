@@ -120,7 +120,7 @@ pub(super) fn take_dynamic_word(message_id: u32, remaining: &mut &[u8]) -> Resul
 }
 
 pub(super) fn decode_dynamic_config_status(payload: &[u8]) -> Result<ServerMessage, CodecError> {
-    const MESSAGE_ID: u32 = id::CONFIG_STAT_DYNAMIC;
+    const MESSAGE_ID: u32 = wire_id::CONFIG_STAT_DYNAMIC;
     if !payload.len().is_multiple_of(4) {
         return Err(CodecError::InvalidAlignment {
             message_id: MESSAGE_ID,
@@ -151,7 +151,7 @@ pub(super) fn decode_dynamic_config_status(payload: &[u8]) -> Result<ServerMessa
 pub(super) fn encode_dynamic_config_status(
     value: &ConfigurationStatus,
 ) -> Result<Vec<u8>, CodecError> {
-    const MESSAGE_ID: u32 = id::CONFIG_STAT_DYNAMIC;
+    const MESSAGE_ID: u32 = wire_id::CONFIG_STAT_DYNAMIC;
     let mut payload = Vec::new();
     push_dynamic_text(
         &mut payload,
@@ -193,7 +193,7 @@ pub(super) fn encode_dynamic_line_status(
     code_page: Option<LegacyCodePage>,
 ) -> Result<Vec<u8>, CodecError> {
     let mut payload = encode(
-        id::LINE_STAT_DYNAMIC,
+        wire_id::LINE_STAT_DYNAMIC,
         &WireLineStatusDynamicHeader {
             line_instance: instance,
             line_type: 15,
@@ -201,14 +201,14 @@ pub(super) fn encode_dynamic_line_status(
     )?;
     push_dynamic_text(
         &mut payload,
-        id::LINE_STAT_DYNAMIC,
+        wire_id::LINE_STAT_DYNAMIC,
         "line number",
         number,
         24,
     )?;
     push_dynamic_station_text(
         &mut payload,
-        id::LINE_STAT_DYNAMIC,
+        wire_id::LINE_STAT_DYNAMIC,
         "fully qualified display name",
         display_name,
         120,
@@ -216,7 +216,7 @@ pub(super) fn encode_dynamic_line_status(
     )?;
     push_dynamic_station_text(
         &mut payload,
-        id::LINE_STAT_DYNAMIC,
+        wire_id::LINE_STAT_DYNAMIC,
         "line label",
         display_name,
         120,
@@ -232,7 +232,7 @@ pub(super) fn encode_dynamic_speed_dial_status(
     display_name: &str,
     code_page: Option<LegacyCodePage>,
 ) -> Result<Vec<u8>, CodecError> {
-    const MESSAGE_ID: u32 = id::SPEED_DIAL_STAT_DYNAMIC;
+    const MESSAGE_ID: u32 = wire_id::SPEED_DIAL_STAT_DYNAMIC;
     let mut payload = instance.to_le_bytes().to_vec();
     push_dynamic_text(&mut payload, MESSAGE_ID, "number", number, 23)?;
     push_dynamic_station_text(
@@ -250,7 +250,7 @@ pub(super) fn encode_dynamic_speed_dial_status(
 pub(super) fn decode_dynamic_speed_dial_status(
     payload: &[u8],
 ) -> Result<ServerMessage, CodecError> {
-    const MESSAGE_ID: u32 = id::SPEED_DIAL_STAT_DYNAMIC;
+    const MESSAGE_ID: u32 = wire_id::SPEED_DIAL_STAT_DYNAMIC;
     if !payload.len().is_multiple_of(4) {
         return Err(CodecError::InvalidAlignment {
             message_id: MESSAGE_ID,
@@ -273,14 +273,14 @@ pub(super) fn decode_dynamic_line_status(payload: &[u8]) -> Result<ServerMessage
     const HEADER_SIZE: usize = 8;
     if payload.len() < HEADER_SIZE {
         return Err(CodecError::Truncated {
-            message_id: id::LINE_STAT_DYNAMIC,
+            message_id: wire_id::LINE_STAT_DYNAMIC,
             needed: HEADER_SIZE,
             actual: payload.len(),
         });
     }
     let header: WireLineStatusDynamicHeader =
-        decode(id::LINE_STAT_DYNAMIC, &payload[..HEADER_SIZE])?;
-    let fields = decode_dynamic_texts(id::LINE_STAT_DYNAMIC, payload, HEADER_SIZE, 3)?;
+        decode(wire_id::LINE_STAT_DYNAMIC, &payload[..HEADER_SIZE])?;
+    let fields = decode_dynamic_texts(wire_id::LINE_STAT_DYNAMIC, payload, HEADER_SIZE, 3)?;
     Ok(ServerMessage::LineStatus {
         instance: header.line_instance,
         number: fields[0].clone(),
@@ -296,17 +296,20 @@ pub(super) fn encode_dynamic_service_url_status(
     protocol: ProtocolVersion,
     code_page: Option<LegacyCodePage>,
 ) -> Result<Vec<u8>, CodecError> {
-    let mut payload = encode(id::SERVICE_URL_STAT_DYNAMIC, &WireOneWord { value: index })?;
+    let mut payload = encode(
+        wire_id::SERVICE_URL_STAT_DYNAMIC,
+        &WireOneWord { value: index },
+    )?;
     push_dynamic_text(
         &mut payload,
-        id::SERVICE_URL_STAT_DYNAMIC,
+        wire_id::SERVICE_URL_STAT_DYNAMIC,
         "service URL",
         url,
         255,
     )?;
     push_dynamic_station_text(
         &mut payload,
-        id::SERVICE_URL_STAT_DYNAMIC,
+        wire_id::SERVICE_URL_STAT_DYNAMIC,
         "service label",
         label,
         120,
@@ -315,7 +318,7 @@ pub(super) fn encode_dynamic_service_url_status(
     if protocol >= ProtocolVersion::V19 {
         push_dynamic_station_text(
             &mut payload,
-            id::SERVICE_URL_STAT_DYNAMIC,
+            wire_id::SERVICE_URL_STAT_DYNAMIC,
             "service extension text",
             extension_text,
             120,
@@ -333,14 +336,14 @@ pub(super) fn decode_dynamic_service_url_status(
     const HEADER_SIZE: usize = 4;
     if payload.len() < HEADER_SIZE {
         return Err(CodecError::Truncated {
-            message_id: id::SERVICE_URL_STAT_DYNAMIC,
+            message_id: wire_id::SERVICE_URL_STAT_DYNAMIC,
             needed: HEADER_SIZE,
             actual: payload.len(),
         });
     }
-    let header: WireOneWord = decode(id::SERVICE_URL_STAT_DYNAMIC, &payload[..HEADER_SIZE])?;
+    let header: WireOneWord = decode(wire_id::SERVICE_URL_STAT_DYNAMIC, &payload[..HEADER_SIZE])?;
     let fields = decode_dynamic_texts(
-        id::SERVICE_URL_STAT_DYNAMIC,
+        wire_id::SERVICE_URL_STAT_DYNAMIC,
         payload,
         HEADER_SIZE,
         if protocol >= ProtocolVersion::V19 {
@@ -364,7 +367,7 @@ pub(super) fn encode_dynamic_call_info(
     protocol: ProtocolVersion,
 ) -> Result<Vec<u8>, CodecError> {
     let mut payload = encode(
-        id::CALL_INFO_DYNAMIC,
+        wire_id::CALL_INFO_DYNAMIC,
         &WireCallInfoDynamicHeader {
             line_instance,
             call_reference,
@@ -429,7 +432,13 @@ pub(super) fn encode_dynamic_call_info(
         ],
     };
     for &(field, text, maximum) in fields {
-        push_dynamic_text(&mut payload, id::CALL_INFO_DYNAMIC, field, text, maximum)?;
+        push_dynamic_text(
+            &mut payload,
+            wire_id::CALL_INFO_DYNAMIC,
+            field,
+            text,
+            maximum,
+        )?;
     }
     pad_dynamic_payload(&mut payload);
     Ok(payload)
@@ -442,14 +451,15 @@ pub(super) fn decode_dynamic_call_info(
     const HEADER_SIZE: usize = 32;
     if payload.len() < HEADER_SIZE {
         return Err(CodecError::Truncated {
-            message_id: id::CALL_INFO_DYNAMIC,
+            message_id: wire_id::CALL_INFO_DYNAMIC,
             needed: HEADER_SIZE,
             actual: payload.len(),
         });
     }
-    let header: WireCallInfoDynamicHeader = decode(id::CALL_INFO_DYNAMIC, &payload[..HEADER_SIZE])?;
+    let header: WireCallInfoDynamicHeader =
+        decode(wire_id::CALL_INFO_DYNAMIC, &payload[..HEADER_SIZE])?;
     let fields = decode_dynamic_texts(
-        id::CALL_INFO_DYNAMIC,
+        wire_id::CALL_INFO_DYNAMIC,
         payload,
         HEADER_SIZE,
         protocol.dynamic_call_info_layout().string_count(),

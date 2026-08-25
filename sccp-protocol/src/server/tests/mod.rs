@@ -7,7 +7,9 @@ use crate::message::values::{
     ReceiveTransmit,
 };
 use crate::message::wire::Frame;
-use crate::message::{ClientMessage, MediaTransmissionAck, RegistrationMessage, ServerMessage, id};
+use crate::message::{
+    ClientMessage, MediaTransmissionAck, RegistrationMessage, ServerMessage, wire_id,
+};
 use crate::types::{
     BlfSpeedDialDefinition, FeatureDefinition, LineAppearance, LineDefinition, ServiceDefinition,
     SpeedDialDefinition,
@@ -228,7 +230,7 @@ fn register_bytes_for_device_with_features(
     payload[28..32].copy_from_slice(&device_type.to_le_bytes());
     payload[40..44].copy_from_slice(&(protocol.wire() | features.bits()).to_le_bytes());
     payload[92..101].copy_from_slice(b"SCCP42.9-");
-    Frame::new(0, id::REGISTER, payload).encode().unwrap()
+    Frame::new(0, wire_id::REGISTER, payload).encode().unwrap()
 }
 
 fn capability_update_bytes(
@@ -274,7 +276,7 @@ fn capability_update_bytes(
         VIDEO_OFFSET + 136,
         u32::from(IpAddressType::Ipv4AndIpv6),
     );
-    Frame::new(protocol.wire(), id::UPDATE_CAPABILITIES_V3, payload)
+    Frame::new(protocol.wire(), wire_id::UPDATE_CAPABILITIES_V3, payload)
         .encode()
         .unwrap()
 }
