@@ -787,6 +787,8 @@ fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
         "/proc/$asterisk_pid/fd",
         "/proc/$asterisk_pid/task",
         "/proc/$asterisk_pid/status",
+        "assert_loaded_module_identity",
+        "verify-loaded-module.sh",
         "second_batch_rss + RSS_TOLERANCE_KB",
         "kill -0",
     ] {
@@ -820,6 +822,38 @@ fn native_lifecycle_gate_stays_separate_from_artifact_builds() {
     assert!(!workflow.contains("make basic-pbx"));
     assert!(!workflow.contains("test-native-lifecycle.sh"));
     assert!(workflow.contains("rust_sccp_|sccp_ast_"));
+}
+
+#[test]
+fn binary_upgrade_checks_loaded_inode_and_requires_an_asterisk_restart() {
+    let verifier = source("verify-loaded-module.sh");
+    for required in [
+        "/proc",
+        "maps",
+        "stat -Lc %i",
+        "$6 == module",
+        "(deleted)",
+        "Restart the Asterisk process",
+    ] {
+        assert!(
+            verifier.contains(required),
+            "loaded-module identity verifier lost {required}"
+        );
+    }
+
+    let install = workspace_source("docs/INSTALL.md");
+    for required in [
+        "This unload/load sequence is not a binary hot upgrade",
+        "stop the Asterisk process",
+        "verify-loaded-module.sh",
+        "A `Running` row from `module show` proves lifecycle state, not binary identity",
+        "If it reports `STALE`",
+    ] {
+        assert!(
+            install.contains(required),
+            "binary-upgrade guidance lost {required}"
+        );
+    }
 }
 
 #[test]

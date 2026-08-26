@@ -90,8 +90,12 @@ unsafe extern "C" fn register_module() {
 
 unsafe extern "C" fn unregister_module() {
     callback_guard((), || {
-        // SAFETY: Asterisk runs the DSO destructor after the module lifecycle;
-        // registration initialized the descriptor at this stable address.
+        // SAFETY: If the platform unmaps the DSO, Asterisk runs this destructor
+        // after the module lifecycle and registration initialized the descriptor
+        // at this stable address. glibc may instead retain the image while Rust
+        // TLS destructors remain pending; in that case the descriptor remains
+        // registered as Not Running and a later load restarts this same image.
+        // Replacing the binary therefore requires an Asterisk process restart.
         unsafe { sys::ast_module_unregister(MODULE_INFO.as_ptr()) };
     });
 }

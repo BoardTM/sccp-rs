@@ -3,6 +3,7 @@ set -eu
 
 module_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$module_dir/test-support/asterisk-sandbox.sh"
+identity_verifier="$module_dir/../verify-loaded-module.sh"
 
 WARMUP_CYCLES=${SCCP_LIFECYCLE_WARMUP_CYCLES:-4}
 BATCH_CYCLES=${SCCP_LIFECYCLE_BATCH_CYCLES:-12}
@@ -179,6 +180,16 @@ channel_driver_count() {
 		| awk '$1 == "SCCP" { count += 1 } END { print count + 0 }'
 }
 
+assert_loaded_module_identity() {
+	cycle_label=$1
+	if ! "$identity_verifier" \
+		"$test_root/modules/chan_sccp2.so" "$asterisk_pid" >>"$cli_log" 2>&1; then
+		printf 'module mapping did not match the candidate binary during lifecycle cycle %s\n' \
+			"$cycle_label" >&2
+		exit 1
+	fi
+}
+
 module_status_fixture='chan_sccp2.so Rust SCCP Channel Driver 0 Running extended
 chan_sccp2.so Rust SCCP Channel Driver 0 Not Running extended'
 if [ "$(printf '%s\n' "$module_status_fixture" | count_running_module_rows)" -ne 1 ]; then
@@ -204,6 +215,7 @@ run_cycle() {
 		printf 'module was not running during lifecycle cycle %s\n' "$cycle_label" >&2
 		exit 1
 	fi
+	assert_loaded_module_identity "$cycle_label"
 	if [ "$LIVE_BRIDGES" -eq 1 ]; then
 		bridge_result=$(cli 'sccp test bridges')
 		printf '\n[%s-bridges] sccp test bridges\n%s\n' \

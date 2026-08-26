@@ -446,8 +446,9 @@ instead of partially replacing the running configuration. Read the reported
 error, correct the file, and retry.
 
 Some listener or runtime changes require a module restart. If the reload says
-so, wait until there are no SCCP calls and then either restart Asterisk during a
-maintenance window or unload and load the module:
+so, wait until there are no SCCP calls and then restart Asterisk during a
+maintenance window. Unloading and loading the unchanged module is also enough
+to restart its runtime state:
 
 ```text
 pbx*CLI> sccp show channels
@@ -456,6 +457,11 @@ pbx*CLI> module load chan_sccp2.so
 ```
 
 Asterisk will reject an unload while the module still owns active channels.
+This unload/load sequence is not a binary hot upgrade. Rust runtime
+thread-local destructors can keep the DSO mapped on glibc after Asterisk marks
+the module `Not Running`. If `chan_sccp2.so` is replaced in that state, the next
+`module load` can report `Running` while reusing the old mapped inode. Restart
+the Asterisk process whenever the module file itself changes.
 
 ## Upgrading
 
@@ -467,10 +473,11 @@ the existing module until the new download and checksum have been verified.
 3. Confirm that the asset's ABI baseline is no newer than the installed
    Asterisk major and that its CPU architecture matches.
 4. Back up the installed `chan_sccp2.so` and `sccp.conf`.
-5. During a maintenance window, make sure `sccp show channels` is empty and
-   unload the module.
-6. Install the new file as `chan_sccp2.so` and load it again.
-7. Re-run the registration and call checks above.
+5. During a maintenance window, make sure `sccp show channels` and Asterisk's
+   channel count are empty, then stop the Asterisk process.
+6. Install the new file as `chan_sccp2.so` while Asterisk is stopped.
+7. Start Asterisk and verify that the running process maps the installed inode.
+8. Re-run the registration and call checks above.
 
 Example backup commands, with paths adjusted for your installation:
 
@@ -480,9 +487,21 @@ sudo cp -a /usr/lib64/asterisk/modules/chan_sccp2.so \
 sudo cp -a /etc/asterisk/sccp.conf /etc/asterisk/sccp.conf.previous
 ```
 
-If the upgrade fails, unload the new module, restore the `.previous` file, and
-load it again. Configuration changes introduced for the new build may also
-need to be reverted.
+After installing the new module, verify its identity from the repository
+checkout:
+
+```sh
+sudo ./asterisk-module/verify-loaded-module.sh
+```
+
+The verifier compares the installed inode with `/proc/<asterisk-pid>/maps` and
+fails if Asterisk still maps a deleted or replaced image. A `Running` row from
+`module show` proves lifecycle state, not binary identity.
+
+If the upgrade fails, stop Asterisk, restore the `.previous` file, and start
+Asterisk again. Run the identity verifier after rollback as well.
+Configuration changes introduced for the new build may also need to be
+reverted.
 
 ## Removing the module
 
@@ -567,3 +586,16 @@ The running configuration remains in place when a reload fails. Read the full
 CLI or log message; it identifies the invalid value or reports that a module
 restart is required. Correct the file and run `sccp reload` again. Do not assume
 that a failed reload applied the valid-looking parts of the edit.
+
+### The module is Running but an upgrade is missing
+
+Do not retry `module unload` and `module load`. Check the loaded file identity:
+
+```sh
+sudo ./asterisk-module/verify-loaded-module.sh
+```
+
+If it reports `STALE`, the module lifecycle was restarted but glibc retained
+the previous DSO mapping. Confirm there are no active calls and restart the
+entire Asterisk process. Run the verifier again before testing the changed
+behavior.
