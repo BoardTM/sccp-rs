@@ -67,16 +67,18 @@ docker run --detach --rm --name "$mysql_container" \
     --env MYSQL_DATABASE=realtime \
     mysql:8.4 >/dev/null
 until docker exec --env MYSQL_PWD=realtime "$mysql_container" mysql \
+    --protocol=TCP --host=127.0.0.1 \
     --user=root --database=realtime --execute 'SELECT 1' >/dev/null 2>&1; do
     sleep 1
 done
 docker exec --interactive --env MYSQL_PWD=realtime "$mysql_container" mysql \
-    --user=root --database=realtime \
+    --protocol=TCP --host=127.0.0.1 --user=root --database=realtime \
     < "$realtime_dir/mysql/001_initial.up.sql"
 mysql_output=$(docker exec --interactive --env MYSQL_PWD=realtime "$mysql_container" mysql \
+    --protocol=TCP --host=127.0.0.1 \
     --user=root --database=realtime --batch --raw --skip-column-names \
     < "$realtime_dir/integration.sql" | tr '\t' '|')
 assert_output mysql "$mysql_output"
 docker exec --interactive --env MYSQL_PWD=realtime "$mysql_container" mysql \
-    --user=root --database=realtime \
+    --protocol=TCP --host=127.0.0.1 --user=root --database=realtime \
     < "$realtime_dir/mysql/001_initial.down.sql"
