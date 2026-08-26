@@ -4043,23 +4043,12 @@ async fn handle_client_message(
                     ))
                     .await
                     .map_err(|_| ServerError::Stopped)?;
-            } else if stimulus == Stimulus::Voicemail {
-                let configured = state.device.buttons.iter().any(|button| {
-                    matches!(
-                        button,
-                        ButtonDefinition::Feature(feature)
-                            if feature.instance == instance
-                                && feature.feature == ButtonType::Voicemail
-                    )
-                });
-                if !configured {
-                    debug!(
-                        device_id = %state.device.id,
-                        instance,
-                        "ignoring unconfigured voicemail button stimulus"
-                    );
-                    return Ok(());
-                }
+            } else if matches!(stimulus, Stimulus::Voicemail | Stimulus::Messages) {
+                // Cisco stations report the dedicated Messages key as either
+                // the legacy Voicemail stimulus or the newer Messages
+                // stimulus. Unlike a programmable feature key, that physical
+                // key is not present in the server-provided button template,
+                // so it must not require a matching ButtonDefinition.
                 let line = call_id
                     .and_then(|call_id| state.calls_by_id.get(&call_id))
                     .map_or_else(

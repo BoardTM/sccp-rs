@@ -931,22 +931,13 @@ async fn configured_redial_menu_uses_typed_native_action_with_legacy_fallback_po
     task.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn configured_voicemail_button_creates_an_exact_line_call_before_routing() {
+async fn assert_dedicated_messages_key_creates_an_exact_line_call(stimulus: Stimulus) {
     let config = ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         advertised_address: Ipv4Addr::LOCALHOST,
         ..ServerConfig::default()
     };
-    let mut device = definition();
-    device
-        .buttons
-        .push(ButtonDefinition::Feature(FeatureDefinition {
-            instance: 1,
-            label: "Messages".into(),
-            feature: ButtonType::Voicemail,
-        }));
-    let (server, handle, mut events) = Server::bind(config, [device]).await.unwrap();
+    let (server, handle, mut events) = Server::bind(config, [definition()]).await.unwrap();
     let address = server.local_addr().unwrap();
     let task = tokio::spawn(server.run());
     let mut phone = TcpStream::connect(address).await.unwrap();
@@ -966,8 +957,10 @@ async fn configured_voicemail_button_creates_an_exact_line_call_before_routing()
     phone
         .write_all(
             &ClientMessage::Stimulus {
-                stimulus: Stimulus::Voicemail,
-                instance: 1,
+                stimulus,
+                // Dedicated Messages keys are not line-template buttons and
+                // the captured 7965G reports instance zero.
+                instance: 0,
                 call_reference: 0,
                 status: 0,
             }
@@ -1001,6 +994,16 @@ async fn configured_voicemail_button_creates_an_exact_line_call_before_routing()
 
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn dedicated_legacy_voicemail_key_routes_without_a_programmable_button() {
+    assert_dedicated_messages_key_creates_an_exact_line_call(Stimulus::Voicemail).await;
+}
+
+#[tokio::test]
+async fn dedicated_messages_key_routes_without_a_programmable_button() {
+    assert_dedicated_messages_key_creates_an_exact_line_call(Stimulus::Messages).await;
 }
 
 #[tokio::test]
