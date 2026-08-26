@@ -10,8 +10,9 @@ use crate::asterisk::sys;
 use crate::media::formats::PbxVideoFormat;
 
 use super::allocation::{
-    NativeAudioFormat, audio_format, channel_private, format_cap_alloc, format_cap_append,
-    private_rtp, private_video_format, private_video_rtp, set_private_audio_format, video_format,
+    NativeAudioFormat, audio_format, channel_private, configure_audio_payload, format_cap_alloc,
+    format_cap_append, private_rtp, private_video_format, private_video_rtp,
+    set_private_audio_format, video_format,
 };
 
 const SOURCE_FILE: &CStr = c"asterisk/native/channel/media.rs";
@@ -180,6 +181,40 @@ pub unsafe fn audio_capability_mask(
     AudioCapabilityMask(mask)
 }
 
+pub unsafe fn identify_audio_format(format: NonNull<sys::ast_format>) -> Option<NativeAudioFormat> {
+    [
+        NativeAudioFormat::G711Ulaw,
+        NativeAudioFormat::G711Alaw,
+        NativeAudioFormat::G722,
+        NativeAudioFormat::G723,
+        NativeAudioFormat::G729,
+        NativeAudioFormat::G726Aal2,
+        NativeAudioFormat::Gsm,
+        NativeAudioFormat::Slin16,
+        NativeAudioFormat::Ilbc,
+        NativeAudioFormat::Siren7,
+        NativeAudioFormat::Opus,
+    ]
+    .into_iter()
+    .find(|candidate| unsafe {
+        sys::ast_format_cmp(audio_format(*candidate), format.as_ptr()) == sys::AST_FORMAT_CMP_EQUAL
+    })
+}
+
+pub unsafe fn set_private_audio_codec(
+    channel: NonNull<sys::ast_channel>,
+    format: NativeAudioFormat,
+) -> Result<(), MediaOperationError> {
+    let _lock =
+        unsafe { ChannelLock::acquire(channel) }.map_err(|_| MediaOperationError::Rejected)?;
+    let private =
+        unsafe { channel_private(channel.as_ptr()) }.ok_or(MediaOperationError::Rejected)?;
+    unsafe { configure_audio_payload(private_rtp(private).as_ptr(), format) }
+        .map_err(|_| MediaOperationError::Rejected)?;
+    unsafe { set_private_audio_format(private, format) };
+    Ok(())
+}
+
 /// Ask Asterisk's translator graph to choose the best station-native format
 /// for an incoming set of source capabilities.
 pub unsafe fn best_translated_audio_format(
@@ -277,6 +312,8 @@ pub unsafe fn set_audio_format(
     {
         return Err(MediaOperationError::CapabilitiesUnavailable);
     }
+    unsafe { configure_audio_payload(private_rtp(private).as_ptr(), format) }
+        .map_err(|_| MediaOperationError::Rejected)?;
     unsafe {
         sys::ast_channel_nativeformats_set(channel.as_ptr(), capabilities.as_ptr());
         sys::ast_channel_set_writeformat(channel.as_ptr(), selected);

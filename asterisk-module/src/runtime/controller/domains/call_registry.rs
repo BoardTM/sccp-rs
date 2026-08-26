@@ -2620,15 +2620,15 @@ impl Controller {
         };
         if let Some(transaction) = transfer {
             let primary = self.call_by_pbx(pbx_id);
+            let terminated_leg = if transaction.source.pbx_call_id == pbx_id {
+                transaction.source
+            } else {
+                transaction
+                    .consultation
+                    .expect("indexed transfer has a consultation leg")
+            };
+            let _ = self.transfers.note_hangup(terminated_leg);
             if transaction.phase == TransferPhase::Completing {
-                let terminated_leg = if transaction.source.pbx_call_id == pbx_id {
-                    transaction.source
-                } else {
-                    transaction
-                        .consultation
-                        .expect("indexed transfer has a consultation leg")
-                };
-                let _ = self.transfers.note_completing_hangup(terminated_leg);
                 return Some(PbxHangupOutcome {
                     primary,
                     effects: Vec::new(),
@@ -2643,13 +2643,6 @@ impl Controller {
             let transfer = self
                 .abort_transfer(&transaction.device_id, transaction.id, reason)
                 .ok()?;
-            if source_hung_up {
-                let mut outcome = self.pbx_hangup_with_effects(pbx_id)?;
-                let mut effects = transfer.effects;
-                effects.append(&mut outcome.effects);
-                outcome.effects = effects;
-                return Some(outcome);
-            }
             return Some(PbxHangupOutcome {
                 primary,
                 effects: transfer.effects,

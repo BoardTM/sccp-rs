@@ -107,8 +107,8 @@ pub use backend::{
 };
 pub use channel::{
     ChannelAllocationError, ChannelAllocationOwner, allocate_channel, channel_binding,
-    configure_pickup_policy, handset_effect_call_id, preferred_codec, preferred_inbound_codec,
-    prepare_channel_allocation_text, remove_channel, retain_two_channels,
+    configure_pickup_policy, handset_effect_call_id, preferred_codec, preferred_codec_upgrade,
+    preferred_inbound_codec, prepare_channel_allocation_text, remove_channel, retain_two_channels,
     take_pending_retrieval_by_pbx, with_channel, with_channels, with_two_channels,
 };
 pub use cli::{

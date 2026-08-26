@@ -951,6 +951,40 @@ fn pre_dial_codec_change_is_guarded_and_updates_the_snapshot() {
 }
 
 #[test]
+fn held_codec_change_is_limited_to_the_closed_active_appearance() {
+    let mut controller = connected_outbound_controller();
+
+    assert_eq!(
+        controller.set_held_codec(PbxCallId(1), CallId(1), Codec::Wideband256k),
+        None
+    );
+    controller.hold(CallId(1));
+    assert_eq!(
+        controller.set_held_codec(PbxCallId(1), CallId(1), Codec::Wideband256k),
+        Some(Codec::Pcmu)
+    );
+    assert_eq!(
+        controller.call(CallId(1)).unwrap().codec,
+        Codec::Wideband256k
+    );
+    assert!(matches!(
+        controller.resume(CallId(1)).last(),
+        Some(DriverEffect::Handset(HandsetEffect::BeginMedia {
+            codec: Codec::Wideband256k,
+            ..
+        }))
+    ));
+    assert_eq!(
+        controller.set_held_codec(PbxCallId(1), CallId(1), Codec::Pcma),
+        None
+    );
+    assert_eq!(
+        controller.set_held_codec(PbxCallId(99), CallId(1), Codec::Pcma),
+        None
+    );
+}
+
+#[test]
 fn call_snapshots_are_derived_from_current_call_and_appearance_state() {
     let now = Instant::now();
     let mut controller = Controller::new(Duration::from_secs(1));
@@ -6530,6 +6564,21 @@ fn transfer_consultation_pbx_hangup_restores_source_once() {
         effect,
         DriverEffect::Backend(PbxEffect::Resume {
             call_id: PbxCallId(1)
+        })
+    )));
+    assert!(!outcome.effects.iter().any(|effect| matches!(
+        effect,
+        DriverEffect::Backend(PbxEffect::Hangup {
+            call_id: PbxCallId(2)
+        })
+    )));
+    assert!(outcome.effects.iter().any(|effect| matches!(
+        effect,
+        DriverEffect::Handset(HandsetEffect::SetCallState {
+            call_id: CallId(2),
+            state: HandsetCallState::OnHook,
+            stop_media: true,
+            ..
         })
     )));
     assert!(

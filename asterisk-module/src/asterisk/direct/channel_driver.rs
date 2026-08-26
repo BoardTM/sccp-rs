@@ -25,7 +25,8 @@ use super::super::exports::{
     channel_security, direct_media_allowed, fixup_channel, hangup_channel, has_active_channels,
     indicate_channel, line_device_state, place_call, reload_module, request_channel,
     resume_channel_operations, send_digit_begin_to_channel, send_digit_end_to_channel,
-    send_text_to_channel, start_module, stop_module, suspend_channel_operations, update_rtp_peer,
+    send_text_to_channel, set_channel_audio_format, start_module, stop_module,
+    suspend_channel_operations, update_rtp_peer,
 };
 use super::handles::{NativeChannelRegistration, TemporarilyUnlockedChannel};
 use super::module_info::module_self;
@@ -484,8 +485,25 @@ unsafe extern "C" fn set_option(
     data_length: c_int,
 ) -> c_int {
     callback_guard(-1, || unsafe {
-        let (Some(channel), Ok(option)) = (NonNull::new(channel), SecurityOption::try_from(option))
-        else {
+        let Some(channel) = NonNull::new(channel) else {
+            return -1;
+        };
+        if matches!(
+            option as u32,
+            sys::AST_OPTION_FORMAT_READ | sys::AST_OPTION_FORMAT_WRITE
+        ) {
+            if usize::try_from(data_length).ok() != Some(mem::size_of::<*mut sys::ast_format>())
+                || data.is_null()
+            {
+                return -1;
+            }
+            let requested = data.cast::<*mut sys::ast_format>().read_unaligned();
+            let result = NonNull::new(requested)
+                .ok_or(())
+                .and_then(|requested| set_channel_audio_format(channel, requested).map_err(|_| ()));
+            return CallbackStatus::from_result(result).as_raw();
+        }
+        let Ok(option) = SecurityOption::try_from(option) else {
             return -1;
         };
         let result = usize::try_from(data_length)

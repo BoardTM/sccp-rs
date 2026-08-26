@@ -540,7 +540,7 @@ unsafe fn configure_rfc2833(rtp: *mut sys::ast_rtp_instance) -> Result<(), ()> {
     Ok(())
 }
 
-unsafe fn configure_audio_payload(
+pub(super) unsafe fn configure_audio_payload(
     rtp: *mut sys::ast_rtp_instance,
     format: NativeAudioFormat,
 ) -> Result<(), ()> {

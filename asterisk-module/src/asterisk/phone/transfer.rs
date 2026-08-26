@@ -140,39 +140,36 @@ pub(super) async fn execute_transfer_start(
         if !transfer_generation_is_active(access, &transaction) {
             return;
         }
-        let milestone = if matches!(
-            &effect,
+        let milestone = match &effect {
             DriverEffect::Backend(PbxEffect::Hold { call_id })
-                if *call_id == transaction.source.pbx_call_id
-        ) {
-            Some(TransferSetupMilestone::SourceBackendHeld)
-        } else if matches!(
-            &effect,
+                if *call_id == transaction.source.pbx_call_id =>
+            {
+                Some(TransferSetupMilestone::SourceBackendHeld)
+            }
             DriverEffect::Handset(HandsetEffect::SetCallState {
                 call_id,
                 state: PhoneCallState::Hold,
                 ..
-            }) if *call_id == transaction.source.handset_call_id
-        ) {
-            Some(TransferSetupMilestone::SourceHandsetHeld)
-        } else if matches!(
-            &effect,
+            }) if *call_id == transaction.source.handset_call_id => {
+                Some(TransferSetupMilestone::SourceHandsetHeld)
+            }
             DriverEffect::Backend(PbxEffect::CreateConsultationChannel { call_id, .. })
-                if transaction.consultation.is_some_and(|leg| leg.pbx_call_id == *call_id)
-        ) {
-            Some(TransferSetupMilestone::ConsultationChannelCreated)
-        } else if matches!(
-            &effect,
+                if transaction
+                    .consultation
+                    .is_some_and(|leg| leg.pbx_call_id == *call_id) =>
+            {
+                Some(TransferSetupMilestone::ConsultationChannelCreated)
+            }
             DriverEffect::Handset(HandsetEffect::BeginTransfer {
                 consultation_call_id,
                 ..
-            }) if transaction.consultation.is_some_and(|leg| {
-                leg.handset_call_id == *consultation_call_id
-            })
-        ) {
-            Some(TransferSetupMilestone::ConsultationHandsetStarted)
-        } else {
-            None
+            }) if transaction
+                .consultation
+                .is_some_and(|leg| leg.handset_call_id == *consultation_call_id) =>
+            {
+                Some(TransferSetupMilestone::ConsultationHandsetStarted)
+            }
+            _ => None,
         };
         if let Err(error) = execute_one_effect(access, &backend, index, effect).await {
             ast_log(

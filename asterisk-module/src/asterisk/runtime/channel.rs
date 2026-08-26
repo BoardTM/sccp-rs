@@ -52,6 +52,31 @@ pub fn preferred_codec(
     )
 }
 
+pub fn preferred_codec_upgrade(
+    access: &Access,
+    device: &DeviceId,
+    line_instance: u32,
+    current: Codec,
+    pbx_formats: &[PbxAudioFormat],
+) -> Option<Codec> {
+    let (codecs, capabilities) = codec_policy(access, device, line_instance)?;
+    let candidate = preferred_codec_from_policy(
+        &codecs,
+        capabilities
+            .as_ref()
+            .map(StationMediaCapabilities::audio)
+            .filter(|capabilities| !capabilities.is_empty()),
+        pbx_formats,
+    )?;
+    codec_upgrade(&codecs, current, candidate)
+}
+
+fn codec_upgrade(configured: &[Codec], current: Codec, candidate: Codec) -> Option<Codec> {
+    let current = configured.iter().position(|codec| *codec == current)?;
+    let candidate_rank = configured.iter().position(|codec| *codec == candidate)?;
+    (candidate_rank < current).then_some(candidate)
+}
+
 fn codec_policy(
     access: &Access,
     device: &DeviceId,
@@ -729,6 +754,20 @@ mod allocation_text_tests {
                 } if actual == field
             ));
         }
+    }
+
+    #[test]
+    fn codec_upgrade_only_moves_toward_the_front_of_the_policy() {
+        let configured = [Codec::Wideband256k, Codec::Pcma, Codec::Pcmu];
+        assert_eq!(
+            codec_upgrade(&configured, Codec::Pcma, Codec::Wideband256k),
+            Some(Codec::Wideband256k)
+        );
+        assert_eq!(
+            codec_upgrade(&configured, Codec::Wideband256k, Codec::Pcma),
+            None
+        );
+        assert_eq!(codec_upgrade(&configured, Codec::Pcma, Codec::Pcma), None);
     }
 }
 

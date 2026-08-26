@@ -779,6 +779,37 @@ impl Controller {
         Ok(previous)
     }
 
+    pub fn set_held_codec(
+        &mut self,
+        pbx_id: PbxCallId,
+        call_id: CallId,
+        codec: Codec,
+    ) -> Option<Codec> {
+        let call = self.call_registry.pbx.get(&pbx_id)?;
+        if call.state != CallState::Held {
+            return None;
+        }
+        let appearance_id = self.call_registry.by_sccp.get(&call_id).copied()?;
+        if call.active_appearance != Some(appearance_id) {
+            return None;
+        }
+        let appearance = self.call_registry.appearances.get(&appearance_id)?;
+        if appearance.pbx_id != pbx_id
+            || appearance.state != CallState::Held
+            || appearance.audio != MediaStreamState::Closed
+            || appearance.audio_transmit != MediaStreamState::Closed
+        {
+            return None;
+        }
+        let previous = appearance.codec;
+        self.call_registry
+            .appearances
+            .get_mut(&appearance_id)?
+            .codec = codec;
+        debug_assert!(self.invariant_error().is_none());
+        Some(previous)
+    }
+
     pub(in crate::runtime::controller) fn device_supports_codec(
         &self,
         device: &DeviceId,

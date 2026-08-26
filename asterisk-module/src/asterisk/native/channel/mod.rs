@@ -26,8 +26,9 @@ pub use control::{
 };
 pub use media::{
     audio_capability_mask, audio_framing, best_translated_audio_format, change_source,
-    local_media_endpoint, release_format_cap, send_digit_begin, send_digit_end, set_audio_format,
-    set_remote_media, update_source, video_capability_mask,
+    identify_audio_format, local_media_endpoint, release_format_cap, send_digit_begin,
+    send_digit_end, set_audio_format, set_private_audio_codec, set_remote_media, update_source,
+    video_capability_mask,
 };
 pub use metadata::{channel_identity, channel_pbx_id, channel_security, take_channel_identity};
 pub use party_metadata::{NativeChannelMetadataAdapter, NativePartyAdapter, copy_channel_variable};

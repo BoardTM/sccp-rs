@@ -305,10 +305,7 @@ impl TransferTransaction {
         self.source == leg || self.consultation == Some(leg)
     }
 
-    fn note_completing_hangup(&mut self, leg: TransferLeg) -> Result<(), TransferRejection> {
-        if self.phase != TransferPhase::Completing {
-            return Err(TransferRejection::InvalidPhase);
-        }
+    fn note_hangup(&mut self, leg: TransferLeg) -> Result<(), TransferRejection> {
         if leg == self.source {
             self.source_terminated = true;
         } else if self.consultation == Some(leg) {
@@ -478,12 +475,12 @@ impl TransferRegistry {
         self.cancel(&device_id, transaction_id, reason, Some(leg))
     }
 
-    pub fn note_completing_hangup(&mut self, leg: TransferLeg) -> Result<(), TransferRejection> {
+    pub fn note_hangup(&mut self, leg: TransferLeg) -> Result<(), TransferRejection> {
         self.by_device
             .values_mut()
             .find(|transaction| transaction.contains(leg))
             .ok_or(TransferRejection::Conflict)?
-            .note_completing_hangup(leg)
+            .note_hangup(leg)
     }
 
     pub fn defer_action(

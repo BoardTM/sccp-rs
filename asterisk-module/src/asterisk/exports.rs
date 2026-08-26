@@ -10,11 +10,11 @@ use super::runtime::{
     configured_audio_processing, configured_dtmf_mode, device_state, direct_media_call,
     direct_media_policy, enqueue_media_retarget, execute_answer_call_transition,
     execute_forwarding_mutation, format_for, handle_runtime_hangup_signal, install_mwi,
-    local_media_endpoint, module_access, preferred_inbound_codec, prepare_channel_allocation_text,
-    publish_line, read_channel_metadata, read_party_snapshot, registered_device_ids, reload,
-    reload_selected, remove_channel, render_runtime_cli_diagnostics, render_runtime_cli_inventory,
-    requestor_auto_answer_mode, retarget_station_to_anchor, state_from_channel, station_nat_active,
-    take_state_from_channel, uninstall_mwi,
+    local_media_endpoint, module_access, preferred_codec_upgrade, preferred_inbound_codec,
+    prepare_channel_allocation_text, publish_line, read_channel_metadata, read_party_snapshot,
+    registered_device_ids, reload, reload_selected, remove_channel, render_runtime_cli_diagnostics,
+    render_runtime_cli_inventory, requestor_auto_answer_mode, retarget_station_to_anchor,
+    state_from_channel, station_nat_active, take_state_from_channel, uninstall_mwi,
 };
 use super::{
     AppearanceRingMode, Arc, AsteriskRealtime, AutoAnswerPolicy, CStr, CallDirection, CallId,
@@ -1067,6 +1067,60 @@ pub unsafe fn channel_security(
     unsafe { native_channel::channel_security(channel) }
         .map(ChannelSecurity::from)
         .ok_or(ChannelOperationError::Invalid)
+}
+
+pub unsafe fn set_channel_audio_format(
+    channel: std::ptr::NonNull<sys::ast_channel>,
+    requested: std::ptr::NonNull<sys::ast_format>,
+) -> Result<(), ChannelOperationError> {
+    let access = module_access().ok_or(ChannelOperationError::Invalid)?;
+    let state =
+        unsafe { state_from_channel(channel.as_ptr()) }.ok_or(ChannelOperationError::Invalid)?;
+    let requested = unsafe { native_channel::identify_audio_format(requested) }
+        .map(super::runtime::pbx_audio_format_from_native)
+        .ok_or(ChannelOperationError::Invalid)?;
+    let call = controller_step(&access.shared.controller, |controller| {
+        controller
+            .call(state.sccp_id)
+            .filter(|call| call.pbx_id == state.pbx_id)
+    })
+    .ok_or(ChannelOperationError::Invalid)?;
+    if pbx_audio_format(call.codec).is_ok_and(|current| current == requested) {
+        return Ok(());
+    }
+    let codec = preferred_codec_upgrade(
+        &access,
+        &call.device_id,
+        call.line_instance,
+        call.codec,
+        &[requested],
+    )
+    .ok_or(ChannelOperationError::Invalid)?;
+    let previous = controller_step(&access.shared.controller, |controller| {
+        controller.set_held_codec(state.pbx_id, state.sccp_id, codec)
+    })
+    .ok_or(ChannelOperationError::Invalid)?;
+    if unsafe {
+        native_channel::set_private_audio_codec(
+            channel,
+            format_for(codec).ok_or(ChannelOperationError::Invalid)?,
+        )
+    }
+    .is_err()
+    {
+        let _ = controller_step(&access.shared.controller, |controller| {
+            controller.set_held_codec(state.pbx_id, state.sccp_id, previous)
+        });
+        return Err(ChannelOperationError::Invalid);
+    }
+    ast_log(
+        LogLevel::Notice,
+        &format!(
+            "upgraded held SCCP call {} from {:?} to {:?} for bridge compatibility",
+            state.sccp_id.0, previous, codec
+        ),
+    );
+    Ok(())
 }
 
 pub unsafe fn update_rtp_peer(
