@@ -3048,6 +3048,10 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         .iter()
         .position(|message_id| *message_id == wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS)
         .unwrap();
+    let stop = ringing_ids
+        .iter()
+        .position(|message_id| *message_id == wire_id::STOP_TONE)
+        .unwrap();
     let tone = ringing_ids
         .iter()
         .position(|message_id| *message_id == wire_id::START_TONE)
@@ -3060,7 +3064,23 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         .iter()
         .position(|message_id| *message_id == wire_id::CALL_INFO_DYNAMIC)
         .unwrap();
-    assert!(state < prompt && prompt < tone && tone < keys && keys < info);
+    assert!(state < prompt && prompt < stop && stop < tone && tone < keys && keys < info);
+    assert!(matches!(
+        ServerMessage::decode(ringing[stop].clone(), protocol),
+        Ok(ServerMessage::StopTone {
+            line_instance: 1,
+            call_reference: 1,
+        })
+    ));
+    assert!(matches!(
+        ServerMessage::decode(ringing[tone].clone(), protocol),
+        Ok(ServerMessage::StartTone {
+            tone: Tone::Alerting,
+            direction: ToneDirection::User,
+            line_instance: 1,
+            call_reference: 1,
+        })
+    ));
     assert_eq!(
         ringing
             .iter()

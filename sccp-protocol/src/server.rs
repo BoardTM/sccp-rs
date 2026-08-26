@@ -6721,6 +6721,10 @@ async fn handle_session_command(
                             line_instance: call.line_instance,
                             call_reference: call.wire_reference,
                         },
+                        ServerMessage::StopTone {
+                            line_instance: call.line_instance,
+                            call_reference: call.wire_reference,
+                        },
                         ServerMessage::StartTone {
                             tone: Tone::Alerting,
                             direction: ToneDirection::User,
