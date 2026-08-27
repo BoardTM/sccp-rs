@@ -123,3 +123,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         ASTERISK_MODULE_DIR=/opt/asterisk-live/lib/asterisk/modules \
         ASTERISK_DATA_DIR=/opt/asterisk-live/var/lib/asterisk \
         ./asterisk-module/ci/realtime/test-live-provider.sh mysql target/release/libchan_sccp2.so
+
+FROM asterisk-live AS sorcery-ari-test
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/workspace/target \
+    cargo build --locked --release -p asterisk-module --no-default-features --features asterisk-22 \
+    && ASTERISK_BIN=/opt/asterisk-live/sbin/asterisk \
+        ASTERISK_MODULE_DIR=/opt/asterisk-live/lib/asterisk/modules \
+        ASTERISK_DATA_DIR=/opt/asterisk-live/var/lib/asterisk \
+        ./asterisk-module/ci/sorcery/test-live-ari.sh target/release/libchan_sccp2.so

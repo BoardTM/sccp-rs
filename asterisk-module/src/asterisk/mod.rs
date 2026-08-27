@@ -147,8 +147,10 @@ use crate::call::transfer::{
 use crate::call::voicemail::{VoicemailOperation, VoicemailTarget};
 use crate::config::provider::{ConfigurationProvider, HybridConfigurationProvider};
 use crate::config::reload::{MwiSubscriptionChange, ReloadPlan, ReloadSelection};
+use crate::config::sorcery::SorceryConfigurationProvider;
 use crate::config::{
-    DndButtonMode, LineBinding, ModuleConfig, NatMode, ParkingRetrievalBehavior, VideoMode,
+    ConfigurationSource, DndButtonMode, LineBinding, ModuleConfig, NatMode,
+    ParkingRetrievalBehavior, VideoMode,
 };
 use crate::http::directory::{
     DirectoryProvider, DirectoryProviderError, DirectoryRecord, records_from_config,
@@ -241,6 +243,7 @@ use adapters::{
 };
 use adapters::{
     AsteriskDatabase, AsteriskParking, AsteriskRealtime, AsteriskRegistrationExtensions,
+    AsteriskSorcerySource,
 };
 
 const NORMAL_CLEARING: c_int = 16;

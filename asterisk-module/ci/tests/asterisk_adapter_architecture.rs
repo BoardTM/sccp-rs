@@ -35,6 +35,8 @@ const RUST_NATIVE_MODULES: &[&str] = &[
     "recording.rs",
     "registry/mod.rs",
     "registry/callback.rs",
+    "sorcery.rs",
+    "sorcery/object.rs",
     "system.rs",
 ];
 
@@ -223,19 +225,15 @@ fn project_owned_internal_c_records_are_absent() {
             .to_string_lossy()
             .replace('\\', "/");
         let records = rust_repr_c_types(&contents);
-        if relative == "native/http.rs" {
-            assert_eq!(
-                records,
-                ["File"],
-                "HTTP may define only its opaque libc FILE"
-            );
-        } else {
-            assert_eq!(
-                records,
-                Vec::<String>::new(),
-                "project-owned C-shaped record returned in {relative}"
-            );
-        }
+        let allowed = match relative.as_str() {
+            "native/http.rs" => vec!["File"],
+            "native/sorcery/object.rs" => vec!["StoredObject"],
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            records, allowed,
+            "unexpected project-owned C-shaped record in {relative}"
+        );
     }
 }
 
@@ -311,6 +309,18 @@ fn every_rust_defined_c_callback_is_an_actual_asterisk_entrypoint() {
             ("native/presence/hints.rs", "hint_update"),
             ("native/presence/hints.rs", "hint_watcher_destroy"),
             ("native/presence/mwi.rs", "mwi_event"),
+            ("native/sorcery/object.rs", "object_alloc"),
+            ("native/sorcery/object.rs", "object_destroy"),
+            ("native/sorcery/object.rs", "object_copy"),
+            ("native/sorcery/object.rs", "object_validate"),
+            ("native/sorcery/object.rs", "field_apply"),
+            ("native/sorcery/object.rs", "fields_export"),
+            ("native/sorcery.rs", "device_created"),
+            ("native/sorcery.rs", "device_updated"),
+            ("native/sorcery.rs", "device_deleted"),
+            ("native/sorcery.rs", "line_created"),
+            ("native/sorcery.rs", "line_updated"),
+            ("native/sorcery.rs", "line_deleted"),
         ]
         .map(|(file, name)| (file.to_owned(), name.to_owned())),
     );
@@ -696,8 +706,12 @@ fn unload_keeps_active_calls_subscriptions_and_conferences_in_one_ordered_drain(
 
     let exports = source("src/asterisk/exports.rs");
     let unload = rust_item(&exports, "fn stop_module");
-    assert!(unload.contains(".take()"));
-    assert!(unload.contains("module.stop()"));
+    assert!(unload.contains_in_order(&[
+        ".take()",
+        "shutdown_observers()",
+        "uninstall_mwi(&module.access)",
+        "module.stop()",
+    ]));
 }
 
 #[test]

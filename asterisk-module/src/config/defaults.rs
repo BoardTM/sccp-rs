@@ -5,6 +5,7 @@ use super::*;
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
+            configuration_source: ConfigurationSource::File,
             bind: SocketAddr::from(([0, 0, 0, 0], 2000)),
             advertised_address: Ipv4Addr::LOCALHOST,
             server_name: "Asterisk SCCP".into(),

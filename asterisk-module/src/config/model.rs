@@ -4,6 +4,7 @@ use super::*;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct GeneralConfig {
+    pub configuration_source: ConfigurationSource,
     pub bind: SocketAddr,
     pub advertised_address: Ipv4Addr,
     pub server_name: String,
@@ -63,6 +64,13 @@ pub struct GeneralConfig {
     /// Both families are required so refreshes always build a complete
     /// device/line candidate before replacing the live snapshot.
     pub realtime_tables: Option<RealtimeTableConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConfigurationSource {
+    #[default]
+    File,
+    Sorcery,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -155,6 +155,10 @@ pub trait ConfigurationProvider: Send + Sync {
     fn refresh(&self) -> Result<ModuleConfig, ConfigurationProviderError> {
         self.load()
     }
+
+    fn activated(&self, _configuration: &ModuleConfig) -> Result<(), ConfigurationProviderError> {
+        Ok(())
+    }
 }
 
 /// Ordered static configuration input. Production uses Asterisk's native
@@ -654,6 +658,7 @@ fn decode_realtime_row(
         source: format!("realtime {} row {row_number}", query.family),
         line: row_number,
         kind: query.section_kind.map(RealtimeSectionKind::overlay_kind),
+        parents: Vec::new(),
         delete,
         values: ordinary,
     })

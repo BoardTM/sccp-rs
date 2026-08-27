@@ -262,6 +262,7 @@ where
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RestartRequiredChange {
+    ConfigurationSource,
     Bind,
     AdvertisedAddress,
     Keepalive,
@@ -277,6 +278,7 @@ pub(crate) enum RestartRequiredChange {
 impl RestartRequiredChange {
     pub(crate) const fn name(self) -> &'static str {
         match self {
+            Self::ConfigurationSource => "configuration source",
             Self::Bind => "bind",
             Self::AdvertisedAddress => "advertised_address",
             Self::Keepalive => "keepalive",
@@ -401,6 +403,9 @@ fn restart_required_changes(
     next: &ModuleConfig,
 ) -> Vec<RestartRequiredChange> {
     let mut changes = Vec::new();
+    if previous.general.configuration_source != next.general.configuration_source {
+        changes.push(RestartRequiredChange::ConfigurationSource);
+    }
     if previous.general.bind != next.general.bind {
         changes.push(RestartRequiredChange::Bind);
     }
@@ -831,6 +836,22 @@ mod tests {
             [RestartRequiredChange::ServerName]
         );
         assert_eq!(RestartRequiredChange::ServerName.name(), "server_name");
+    }
+
+    #[test]
+    fn configuration_source_changes_require_a_module_restart() {
+        let previous = two_devices("", "");
+        let mut next = previous.clone();
+        next.general.configuration_source = crate::config::ConfigurationSource::Sorcery;
+
+        assert_eq!(
+            ReloadPlan::build(&previous, &next).restart_required,
+            [RestartRequiredChange::ConfigurationSource]
+        );
+        assert_eq!(
+            RestartRequiredChange::ConfigurationSource.name(),
+            "configuration source"
+        );
     }
 
     #[test]

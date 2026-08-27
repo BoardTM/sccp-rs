@@ -11,6 +11,13 @@ pub(in crate::config) fn parse_general(
         let raw = &entry.source.value;
         let diagnostic = entry.source.diagnostic_key();
         match entry.key {
+            GeneralOption::ConfigurationSource => set_once(
+                &mut draft.configuration_source,
+                section,
+                key,
+                raw,
+                parse_configuration_source(&diagnostic, raw)?,
+            )?,
             GeneralOption::DateFormat => set_once(
                 &mut draft.date_template,
                 section,
@@ -748,6 +755,7 @@ pub(in crate::config) fn parse_general(
     if let Some(enabled) = draft.conference_enabled {
         config.conference_dialing.enabled = enabled;
     }
+    config.configuration_source = draft.configuration_source.unwrap_or_default();
     if let Some(order) = draft.call_answer_order {
         config.call_answer_order = order;
     }
@@ -1058,5 +1066,23 @@ pub(in crate::config) fn parse_general(
             ));
         }
     };
+    if config.configuration_source == ConfigurationSource::Sorcery
+        && config.realtime_tables.is_some()
+    {
+        return Err(invalid_option(
+            section.section_location(),
+            "configuration_source=sorcery with realtime tables",
+            "sorcery without devicetable or linetable",
+            false,
+        ));
+    }
     Ok(())
+}
+
+fn parse_configuration_source(key: &str, raw: &str) -> Result<ConfigurationSource, ConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "file" => Ok(ConfigurationSource::File),
+        "sorcery" => Ok(ConfigurationSource::Sorcery),
+        _ => Err(invalid_option(key, raw, "file or sorcery", false)),
+    }
 }

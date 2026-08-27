@@ -51,6 +51,7 @@ pub mod realtime;
 pub mod reload;
 mod section_values;
 mod serde_section;
+pub mod sorcery;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -140,6 +141,7 @@ impl fmt::Debug for GeneralConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GeneralConfig")
+            .field("configuration_source", &self.configuration_source)
             .field("bind", &self.bind)
             .field("advertised_address", &self.advertised_address)
             .field("server_name", &self.server_name)
@@ -292,6 +294,7 @@ struct RawValue {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum GeneralOption {
+    ConfigurationSource,
     #[serde(rename = "dateformat")]
     DateFormat,
     #[serde(rename = "tzoffset")]
@@ -652,7 +655,7 @@ enum DeviceOption {
     Button,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ConfigOverlayKind {
     Device,
     Line,
@@ -672,6 +675,7 @@ pub(crate) struct ConfigOverlaySection {
     pub source: String,
     pub line: usize,
     pub kind: Option<ConfigOverlayKind>,
+    pub parents: Vec<String>,
     pub delete: bool,
     pub values: Vec<ConfigOverlayValue>,
 }
@@ -840,6 +844,7 @@ struct DeviceSectionDraft<'a> {
 /// actually supplied them; inherited structures are represented as patches.
 #[derive(Default)]
 struct GeneralSectionDraft<'a> {
+    configuration_source: Option<ConfigurationSource>,
     call_answer_order: Option<CallAnswerOrder>,
     timezone_offset_minutes: Option<i16>,
     date_template: Option<DateTemplate>,
@@ -980,6 +985,50 @@ impl ModuleConfig {
         Ok(general.realtime_tables)
     }
 
+    pub(crate) fn configuration_source_from_source(
+        input: &str,
+    ) -> Result<ConfigurationSource, ConfigError> {
+        let sections = parse_sections(input)?;
+        let mut general = GeneralConfig::default();
+        if let Some(section) = sections
+            .iter()
+            .find(|section| section.name.eq_ignore_ascii_case("general"))
+        {
+            parsing::general::parse_general(&mut general, section)
+                .map_err(|error| locate_section_error(error, section))?;
+        }
+        Ok(general.configuration_source)
+    }
+
+    pub(crate) fn parse_with_sorcery_overlays(
+        input: &str,
+        overlays: &[ConfigOverlaySection],
+    ) -> Result<Self, ConfigError> {
+        let mut sections = parse_sections(input)?;
+        let source_sections = sections.clone();
+        let mut retained = Vec::with_capacity(sections.len());
+        for section in sections.drain(..) {
+            let managed = !section.is_template
+                && !section.name.eq_ignore_ascii_case("general")
+                && matches!(
+                    source_section_kind(&section, &source_sections)?.as_str(),
+                    "device" | "line"
+                );
+            if !managed {
+                retained.push(section);
+            }
+        }
+        if let Some(overlay) = overlays.iter().find(|overlay| {
+            retained
+                .iter()
+                .any(|section| section.name.eq_ignore_ascii_case(&overlay.name))
+        }) {
+            return Err(ConfigError::DuplicateSection(overlay.name.clone()));
+        }
+        apply_config_overlays(&mut retained, overlays)?;
+        Self::from_raw_sections(retained)
+    }
+
     fn from_raw_sections(sections: Vec<RawSection>) -> Result<Self, ConfigError> {
         let sections = resolve_inheritance(sections)?;
         let mut general = GeneralConfig::default();
@@ -1083,7 +1132,9 @@ impl ModuleConfig {
             }
         }
 
-        if devices.is_empty() || lines.is_empty() {
+        if general.configuration_source == ConfigurationSource::File
+            && (devices.is_empty() || lines.is_empty())
+        {
             return Err(ConfigError::Empty);
         }
         if general.bind.port() == 0
@@ -1189,9 +1240,10 @@ impl ModuleConfig {
                 }
             }
         }
-        if let Some(unassigned) = lines
-            .keys()
-            .find(|line| !bindings_by_line.contains_key(*line))
+        if general.configuration_source == ConfigurationSource::File
+            && let Some(unassigned) = lines
+                .keys()
+                .find(|line| !bindings_by_line.contains_key(*line))
         {
             return Err(ConfigError::UnassignedLine(unassigned.clone()));
         }
@@ -1998,6 +2050,9 @@ fn apply_config_overlays(
             sections.len() - 1
         };
         let section = &mut sections[index];
+        if !overlay.parents.is_empty() {
+            section.parents.clone_from(&overlay.parents);
+        }
         let kind = overlay.kind.map(|kind| match kind {
             ConfigOverlayKind::Device => TemplateKind::Device,
             ConfigOverlayKind::Line => TemplateKind::Line,

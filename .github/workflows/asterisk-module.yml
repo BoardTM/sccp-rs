@@ -61,6 +61,17 @@ jobs:
           pull: true
           push: false
 
+      - name: Exercise live Sorcery configuration through ARI
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: asterisk-module/ci/Dockerfile
+          target: sorcery-ari-test
+          cache-from: type=gha,scope=asterisk-ci-22.7.0
+          cache-to: type=gha,mode=max,scope=asterisk-ci-22.7.0
+          pull: true
+          push: false
+
   config-checker:
     runs-on: ubuntu-26.04
     env:

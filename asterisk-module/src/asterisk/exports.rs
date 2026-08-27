@@ -17,23 +17,23 @@ use super::runtime::{
     state_from_channel, station_nat_active, take_state_from_channel, uninstall_mwi,
 };
 use super::{
-    AppearanceRingMode, Arc, AsteriskRealtime, AutoAnswerPolicy, CStr, CallDirection, CallId,
-    CallMetadata, CallState, CliControlError, Codec, ConfigurationProvider,
-    ConfiguredChannelMetadata, ControlOutcome, DeviceId, DeviceState, DirectMediaRoute, DndMode,
-    DriverEffect, Duration, FeatureControlMutation, FeatureControlOutcome, ForwardingContext,
-    ForwardingOperation, HandsetEffect, HashMap, HybridConfigurationProvider,
-    InboundCallDisposition, InboundDialRequest, InboundUnavailableReason, IncomingRing,
-    LineBinding, LineInstance, LogLevel, MAX_ASSIGNED_CHANNEL_ID_BYTES, MAX_BOOLEAN_BYTES,
-    MAX_CALL_ID_BYTES, MAX_DEVICE_SELECTOR_BYTES, MAX_DIAL_DESTINATION_BYTES, MAX_DND_MODE_BYTES,
-    MAX_LINE_SELECTOR_BYTES, MAX_MESSAGE_BYTES, MAX_TIMEOUT_BYTES, MODULE, MediaEndpoint,
-    NoAnswerPolicy, NonNull, PartySnapshot, PbxCallId, PhoneCommand, PhoneCommandAction,
-    REQUESTED_CHANNEL_UNAVAILABLE, ReloadSelection, ResetMode, RingDuration, RingerMode,
-    SharedNoAnswerRoute, USER_BUSY, c_int, canonical_ip_address, complete_cli_device,
-    complete_cli_value, compose_channel_metadata, controller_step, execute_cli_answer,
-    execute_cli_device_control, execute_cli_dnd, execute_cli_end, execute_cli_message,
-    execute_cli_originate, native_channel, parse_cli_forwarding_mutation, pbx_audio_format,
-    pbx_audio_formats_from_mask, pbx_video_formats_from_mask, plan_inbound_bindings,
-    plan_shared_no_answer_route, raw, sys,
+    AppearanceRingMode, Arc, AsteriskRealtime, AsteriskSorcerySource, AutoAnswerPolicy, CStr,
+    CallDirection, CallId, CallMetadata, CallState, CliControlError, Codec, ConfigurationProvider,
+    ConfigurationSource, ConfiguredChannelMetadata, ControlOutcome, DeviceId, DeviceState,
+    DirectMediaRoute, DndMode, DriverEffect, Duration, FeatureControlMutation,
+    FeatureControlOutcome, ForwardingContext, ForwardingOperation, HandsetEffect, HashMap,
+    HybridConfigurationProvider, InboundCallDisposition, InboundDialRequest,
+    InboundUnavailableReason, IncomingRing, LineBinding, LineInstance, LogLevel,
+    MAX_ASSIGNED_CHANNEL_ID_BYTES, MAX_BOOLEAN_BYTES, MAX_CALL_ID_BYTES, MAX_DEVICE_SELECTOR_BYTES,
+    MAX_DIAL_DESTINATION_BYTES, MAX_DND_MODE_BYTES, MAX_LINE_SELECTOR_BYTES, MAX_MESSAGE_BYTES,
+    MAX_TIMEOUT_BYTES, MODULE, MediaEndpoint, ModuleConfig, NoAnswerPolicy, NonNull, PartySnapshot,
+    PbxCallId, PhoneCommand, PhoneCommandAction, REQUESTED_CHANNEL_UNAVAILABLE, ReloadSelection,
+    ResetMode, RingDuration, RingerMode, SharedNoAnswerRoute, SorceryConfigurationProvider,
+    USER_BUSY, c_int, canonical_ip_address, complete_cli_device, complete_cli_value,
+    compose_channel_metadata, controller_step, execute_cli_answer, execute_cli_device_control,
+    execute_cli_dnd, execute_cli_end, execute_cli_message, execute_cli_originate, native_channel,
+    parse_cli_forwarding_mutation, pbx_audio_format, pbx_audio_formats_from_mask,
+    pbx_video_formats_from_mask, plan_inbound_bindings, plan_shared_no_answer_route, raw, sys,
 };
 use crate::config::provider::StaticConfigurationSource as _;
 use crate::runtime::backend::SupplementaryBackend as _;
@@ -270,27 +270,92 @@ impl ControlCliCommand {
     }
 }
 
+struct PreparedConfigurationProvider {
+    provider: Arc<dyn ConfigurationProvider>,
+    sorcery_registration: Option<Arc<raw::sorcery::SorceryRegistration>>,
+    source: ConfigurationSource,
+}
+
+fn prepare_configuration_provider() -> Result<PreparedConfigurationProvider, String> {
+    let file_provider = raw::config::AsteriskConfigurationSource::new(config_path());
+    let source = file_provider
+        .read_source()
+        .and_then(|contents| {
+            ModuleConfig::configuration_source_from_source(&contents).map_err(|error| {
+                crate::config::provider::ConfigurationProviderError::invalid(
+                    file_provider.origin(),
+                    error,
+                )
+            })
+        })
+        .map_err(|error| error.to_string())?;
+
+    let (provider, sorcery_registration): (
+        Arc<dyn ConfigurationProvider>,
+        Option<Arc<raw::sorcery::SorceryRegistration>>,
+    ) = match source {
+        ConfigurationSource::Sorcery => {
+            let registration =
+                raw::sorcery::SorceryRegistration::register(Arc::new(reconcile_sorcery_mutation))
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())?;
+            let provider = SorceryConfigurationProvider::new(
+                file_provider,
+                Arc::new(AsteriskSorcerySource::new(Arc::clone(&registration))),
+            );
+            (Arc::new(provider), Some(registration))
+        }
+        ConfigurationSource::File => {
+            let provider: Arc<dyn ConfigurationProvider> = if let Some(tables) = file_provider
+                .realtime_tables()
+                .map_err(|error| error.to_string())?
+            {
+                Arc::new(HybridConfigurationProvider::from_tables(
+                    file_provider,
+                    Arc::new(AsteriskRealtime::new()),
+                    &tables,
+                ))
+            } else {
+                Arc::new(file_provider)
+            };
+            (provider, None)
+        }
+    };
+
+    Ok(PreparedConfigurationProvider {
+        provider,
+        sorcery_registration,
+        source,
+    })
+}
+
+fn reconcile_sorcery_mutation(mutation: raw::sorcery::SorceryMutation) {
+    let Some(access) = module_access() else {
+        return;
+    };
+    if let Err(error) = reload(&access) {
+        ast_log(
+            LogLevel::Warning,
+            &format!("SCCP Sorcery reconciliation failed after {mutation:?}: {error}"),
+        );
+    }
+}
+
 pub fn start_module() -> Result<(), ModuleLifecycleError> {
     let mut module = MODULE.lock_unpoisoned();
     if module.is_some() {
         return Ok(());
     }
-    let file_provider = raw::config::AsteriskConfigurationSource::new(config_path());
-    let realtime_tables = match file_provider.realtime_tables() {
-        Ok(tables) => tables,
+    let PreparedConfigurationProvider {
+        provider: config_provider,
+        sorcery_registration,
+        source,
+    } = match prepare_configuration_provider() {
+        Ok(prepared) => prepared,
         Err(error) => {
-            ast_log(LogLevel::Error, &error.to_string());
+            ast_log(LogLevel::Error, &error);
             return Err(ModuleLifecycleError);
         }
-    };
-    let config_provider: Arc<dyn ConfigurationProvider> = if let Some(tables) = realtime_tables {
-        Arc::new(HybridConfigurationProvider::from_tables(
-            file_provider,
-            Arc::new(AsteriskRealtime::new()),
-            &tables,
-        ))
-    } else {
-        Arc::new(file_provider)
     };
     let config = match config_provider.load() {
         Ok(config) => config,
@@ -300,7 +365,18 @@ pub fn start_module() -> Result<(), ModuleLifecycleError> {
         }
     };
     match Module::start(config_provider, config) {
-        Ok(started) => {
+        Ok(mut started) => {
+            started.sorcery_registration = sorcery_registration;
+            if let Err(error) = started
+                .access
+                .shared
+                .config_provider
+                .activated(&started.access.config())
+            {
+                ast_log(LogLevel::Error, &error.to_string());
+                started.stop();
+                return Err(ModuleLifecycleError);
+            }
             let access = started.access.clone();
             ast_log(
                 LogLevel::Notice,
@@ -314,6 +390,14 @@ pub fn start_module() -> Result<(), ModuleLifecycleError> {
             *module = Some(started);
             drop(module);
             install_mwi(&access);
+            if source == ConfigurationSource::Sorcery {
+                if let Err(error) = reload(&access) {
+                    ast_log(
+                        LogLevel::Warning,
+                        &format!("initial SCCP Sorcery reconciliation failed: {error}"),
+                    );
+                }
+            }
             Ok(())
         }
         Err(error) => {
@@ -324,12 +408,12 @@ pub fn start_module() -> Result<(), ModuleLifecycleError> {
 }
 
 pub fn stop_module() -> Result<(), ModuleLifecycleError> {
-    let access = module_access();
-    if let Some(access) = &access {
-        uninstall_mwi(access);
-    }
     let module = MODULE.lock_unpoisoned().take();
     if let Some(module) = module {
+        if let Some(registration) = &module.sorcery_registration {
+            registration.shutdown_observers();
+        }
+        uninstall_mwi(&module.access);
         module.stop();
     }
     Ok(())

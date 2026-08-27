@@ -28,7 +28,7 @@ The crate deliberately contains no SIP or PBX policy. It can be used as the phon
 
 In `asterisk-module` you will find a completely new channel driver called `chan_sccp2`, written in Rust. The current production module targets the Asterisk 22+ ABI generation: it is built against Asterisk 22, accepts newer majors, and is currently tested with Asterisk 22 and 23.
 
-The driver exposes SCCP as a native Asterisk channel and connects the protocol server to Asterisk's dialplan, RTP/media, device state, hints, message waiting, parking, pickup, transfers, conferencing, call forwarding, CLI, AMI, and realtime configuration. It is a new **completely new** implementation built on `sccp-protocol`, not a fork of the old `chan_sccp` module.
+The driver exposes SCCP as a native Asterisk channel and connects the protocol server to Asterisk's dialplan, RTP/media, device state, hints, message waiting, parking, pickup, transfers, conferencing, call forwarding, CLI, AMI, realtime configuration, and with [sorcery ARI configuration](docs/DYNAMIC_CONFIGURATION.md). It is a new **completely new** implementation built on `sccp-protocol`, not a fork of the old `chan_sccp` module.
 
 You can find the latest [pre-compiled release](https://github.com/coral/sccp-rs/releases) for Linux x86-64 and ARM64/aarch64. This includes 64-bit Raspberry Pi 4 and 5 systems. If you'd rather build the x86-64 module locally, the easiest path is Docker.
 
@@ -78,7 +78,7 @@ in progress
 | Calling features | Inbound/outbound calls, hold, call waiting, auto-answer, shared lines, transfer, forwarding, pickup, park, barge, DND/privacy, voicemail/MWI, BLF/hints, mobility, call completion, recording, and conferencing | Phone firmware/TFTP provisioning and a built-in PBX or SIP stack |
 | Audio media | Native RTP, early media, jitter buffer, direct RTP, DTMF, and mapped G.711/G.722/G.723/G.729/G.726, GSM, iLBC, Siren7, SLIN16, and Opus | Protected/SRTP media and SCCP codecs with no Asterisk format mapping |
 | Video media | Anchored RTP and handset control for H.261, H.263/H.263+, and H.264, including fast-picture updates | Direct video RTP, H.265 stream setup, H.264 SVC/FEC/UC, and encrypted video |
-| Configuration and control | File and realtime config, transactional reloads, device state/hints, CLI, AMI actions/events, dialplan functions/apps, and an HTTP phone directory | The phone-authentication HTTP route (API only; no credential backend is installed) |
+| Configuration and control | File, realtime, or Sorcery/AstDB config; ARI dynamic objects; transactional reloads; device state/hints; CLI; AMI actions/events; dialplan functions/apps; and an HTTP phone directory | The phone-authentication HTTP route (API only; no credential backend is installed) |
 
 ## Developing
 

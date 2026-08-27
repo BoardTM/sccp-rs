@@ -29,7 +29,9 @@ fn targeted_reload_guards_one_complete_candidate_before_the_shared_transaction()
         .find("*access.shared.config.write_unpoisoned() = Arc::new(next)")
         .expect("single snapshot commit");
     assert!(refresh < plan && plan < guard && guard < stage && stage < commit);
-    assert_eq!(selected.matches("config_provider").count(), 1);
+    assert_eq!(selected.matches("config_provider").count(), 2);
+    assert_eq!(selected.matches(".refresh()").count(), 1);
+    assert_eq!(selected.matches(".activated(&access.config())").count(), 1);
     assert_eq!(selected.matches("reconfigure_station_policy(").count(), 1);
     assert!(!selected.contains("reconfigure_anonymous_hotline("));
     assert_eq!(selected.matches("Arc::new(next)").count(), 1);

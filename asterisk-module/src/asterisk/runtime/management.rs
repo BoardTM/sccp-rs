@@ -50,6 +50,7 @@ pub struct Module {
     pub server_task: JoinHandle<()>,
     pub event_task: JoinHandle<()>,
     pub parking_subscription: ParkingSubscription,
+    pub sorcery_registration: Option<Arc<raw::sorcery::SorceryRegistration>>,
 }
 
 #[derive(Clone)]
@@ -62,6 +63,7 @@ pub struct Access {
 pub struct Shared {
     pub config: RwLock<Arc<ModuleConfig>>,
     pub config_provider: Arc<dyn ConfigurationProvider>,
+    pub config_reloads: Mutex<()>,
     pub controller: Mutex<Controller>,
     pub external_addresses: Mutex<ExternalAddressCache<SystemHostResolver>>,
     pub published_line_states: Mutex<HashMap<String, DeviceState>>,

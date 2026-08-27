@@ -503,6 +503,7 @@ impl Module {
             published_line_states: Mutex::new(HashMap::new()),
             config: RwLock::new(Arc::new(config)),
             config_provider,
+            config_reloads: Mutex::new(()),
             channels: Mutex::new(HashMap::new()),
             assigned_channel_ids: Mutex::new(HashMap::new()),
             audio_packet_ms: Mutex::new(HashMap::new()),
@@ -708,6 +709,7 @@ impl Module {
             server_task,
             event_task,
             parking_subscription,
+            sorcery_registration: None,
         })
     }
 
@@ -933,6 +935,7 @@ pub fn reload(access: &Access) -> Result<(), String> {
 }
 
 pub fn reload_selected(access: &Access, selection: ReloadSelection) -> Result<(), String> {
+    let _reload_guard = access.shared.config_reloads.lock_unpoisoned();
     let _mobility_guard = access
         .handle
         .block_on(access.shared.mobility_mutations.lock());
@@ -1086,6 +1089,11 @@ pub fn reload_selected(access: &Access, selection: ReloadSelection) -> Result<()
             publish_feature_changes(access, &device, previous, current);
         }
     }
+    access
+        .shared
+        .config_provider
+        .activated(&access.config())
+        .map_err(|error| format!("configuration is active but LKG persistence failed: {error}"))?;
     Ok(())
 }
 

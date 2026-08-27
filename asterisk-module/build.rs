@@ -189,6 +189,7 @@ fn generate_bindings(paths: &BuildPaths) {
 #include "asterisk/stasis_channels.h"
 #include "asterisk/stream.h"
 #include "asterisk/strings.h"
+#include "asterisk/sorcery.h"
 #include "asterisk/translate.h"
 #include "asterisk/utils.h"
 "#,

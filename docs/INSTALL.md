@@ -210,6 +210,15 @@ spelling used by the distributed example. `normalize` writes a deterministic,
 template-expanded configuration to standard output and never overwrites the
 source file.
 
+The following device and line sections describe the default file-backed mode.
+Deployments with an authoritative remote control plane can instead set
+`configuration_source = sorcery`, leave concrete devices and lines out of this
+file, and provision them through Asterisk's standard ARI dynamic configuration
+API. General policy and soft-key profiles remain in `sccp.conf`; see
+[Dynamic SCCP configuration through ARI](DYNAMIC_CONFIGURATION.md) for the
+AstDB mapping, HTTP calls, outbound REST-over-WebSocket messages, and safe
+object ordering.
+
 ### Device section
 
 A configured phone has a section whose name is `SEP` followed by the phone's

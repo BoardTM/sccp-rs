@@ -76,3 +76,7 @@ path = "ci/tests/native_media_ownership.rs"
 [[test]]
 name = "targeted_reload_contract"
 path = "ci/tests/targeted_reload_contract.rs"
+
+[[test]]
+name = "sorcery_ari_contract"
+path = "ci/tests/sorcery_ari_contract.rs"

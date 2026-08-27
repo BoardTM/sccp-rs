@@ -13,6 +13,7 @@ mod presence;
 mod realtime;
 mod recording;
 mod registration;
+mod sorcery;
 
 pub use bridging::AsteriskCallFeatures;
 pub use channel_metadata::AsteriskChannelMetadata;
@@ -27,3 +28,4 @@ pub use presence::AsteriskHints;
 pub use realtime::AsteriskRealtime;
 pub use recording::{AsteriskRecording, RecordingSession};
 pub use registration::{AsteriskRegistrationExtensions, config_directory};
+pub use sorcery::AsteriskSorcerySource;

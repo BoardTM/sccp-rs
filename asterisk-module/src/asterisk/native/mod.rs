@@ -15,6 +15,7 @@ pub mod presence;
 pub mod realtime;
 pub mod recording;
 pub mod registry;
+pub mod sorcery;
 pub mod system;
 
 #[cfg(feature = "live-asterisk-tests")]

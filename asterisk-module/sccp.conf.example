@@ -2,6 +2,9 @@
 ; Accepted compatibility aliases are documented in README.md instead of being
 ; duplicated here, because aliases for one setting may not be combined.
 [general]
+; Set to sorcery when concrete devices and lines are managed through Asterisk's
+; dynamic configuration API. General policy and templates remain in this file.
+configuration_source = file
 ; Uncomment both names to overlay ordered realtime device and line rows on
 ; this file. A failed query or invalid merged candidate leaves the live
 ; configuration unchanged. No SQL schemas are bundled; these are Asterisk
