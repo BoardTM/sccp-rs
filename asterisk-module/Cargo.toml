@@ -6,7 +6,7 @@ rust-version = "1.98"
 description = "Rust SCCP channel driver for Asterisk 22 and newer"
 publish = false
 authors.workspace = true
-license.workspace = true
+license = "GPL-2.0-or-later"
 repository.workspace = true
 
 [package.metadata.release]

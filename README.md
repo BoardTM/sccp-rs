@@ -92,4 +92,6 @@ PRs welcome
 
 ## License
 
-MIT
+All workspace packages are licensed under MIT except `asterisk-module`, which is
+licensed under GPL-2.0-or-later. The full GPLv2 terms are included in
+`asterisk-module/asterisk/COPYING`.
