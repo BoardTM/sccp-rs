@@ -145,6 +145,10 @@ use crate::call::transfer::{
     TransferMode, TransferPhase, TransferRejection, TransferSetupMilestone, TransferTrigger,
 };
 use crate::call::voicemail::{VoicemailOperation, VoicemailTarget};
+use crate::config::convergence::{
+    ConfigReconciliation, ConfigReconciliationObjectType, ConfigReconciliationOperation,
+    ConfigReconciliationTrigger,
+};
 use crate::config::provider::{ConfigurationProvider, HybridConfigurationProvider};
 use crate::config::reload::{MwiSubscriptionChange, ReloadPlan, ReloadSelection};
 use crate::config::sorcery::SorceryConfigurationProvider;

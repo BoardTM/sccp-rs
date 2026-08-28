@@ -23,7 +23,7 @@ fn websocket_requests() -> Vec<Value> {
 #[test]
 fn websocket_fixture_uses_the_standard_ari_rest_request_envelope() {
     let requests = websocket_requests();
-    assert_eq!(requests.len(), 7);
+    assert_eq!(requests.len(), 13);
 
     for request in &requests {
         assert_eq!(request["type"], "RESTRequest");
@@ -34,8 +34,18 @@ fn websocket_fixture_uses_the_standard_ari_rest_request_envelope() {
             Some("GET" | "PUT" | "DELETE")
         ));
         let uri = request["uri"].as_str().expect("request URI");
-        assert!(uri.starts_with("/asterisk/config/dynamic/chan_sccp2/"));
         assert!(!uri.starts_with("/ari/"));
+
+        if uri == "/asterisk/variable" {
+            assert_eq!(request["method"], "GET");
+            assert_eq!(request["query_strings"][0]["name"], "variable");
+            assert_eq!(request["query_strings"][0]["value"], "SCCP_CONFIG_STATUS");
+            assert!(request.get("message_body").is_none());
+            assert!(request.get("content_type").is_none());
+            continue;
+        }
+
+        assert!(uri.starts_with("/asterisk/config/dynamic/chan_sccp2/"));
 
         if request["method"] == "PUT" {
             assert_eq!(request["content_type"], "application/json");
@@ -68,30 +78,31 @@ fn websocket_fixture_respects_cross_object_dependency_order() {
         )
     };
 
+    assert_eq!(operation(0), ("GET", "/asterisk/variable"));
     assert_eq!(
-        operation(0),
+        operation(1),
         ("PUT", "/asterisk/config/dynamic/chan_sccp2/line/1001")
     );
     assert_eq!(
-        operation(1),
+        operation(3),
         (
             "PUT",
             "/asterisk/config/dynamic/chan_sccp2/device/SEP001122334455"
         )
     );
     assert_eq!(
-        operation(5),
+        operation(9),
         (
             "DELETE",
             "/asterisk/config/dynamic/chan_sccp2/device/SEP001122334455"
         )
     );
     assert_eq!(
-        operation(6),
+        operation(11),
         ("DELETE", "/asterisk/config/dynamic/chan_sccp2/line/1001")
     );
 
-    let tombstone: Value = serde_json::from_str(requests[2]["message_body"].as_str().unwrap())
+    let tombstone: Value = serde_json::from_str(requests[5]["message_body"].as_str().unwrap())
         .expect("tombstone body");
     assert_eq!(tombstone["fields"][0]["attribute"], "button.0002");
     assert_eq!(tombstone["fields"][0]["value"], "");
@@ -110,6 +121,10 @@ fn distributed_examples_lock_the_public_sorcery_contract() {
         "line = astdb,chan_sccp2",
         "/ari/asterisk/config/dynamic/chan_sccp2/{device|line}/{id}",
         "/asterisk/config/dynamic/chan_sccp2/{device|line}/{id}",
+        "SCCP_CONFIG_STATUS",
+        "/asterisk/variable",
+        "generation",
+        "converged",
         "button.0001",
         "Create or update SCCP lines",
         "Remove obsolete SCCP devices",
@@ -122,6 +137,7 @@ fn distributed_examples_lock_the_public_sorcery_contract() {
 fn vendored_asterisk_supports_dynamic_config_over_rest_websocket() {
     let dynamic_api = source("asterisk/rest-api/api-docs/asterisk.json");
     assert!(dynamic_api.contains("/asterisk/config/dynamic/{configClass}/{objectType}/{id}"));
+    assert!(dynamic_api.contains("/asterisk/variable"));
     assert!(dynamic_api.contains("List[ConfigTuple]"));
 
     let events_api = source("asterisk/rest-api/api-docs/events.json");
@@ -143,6 +159,28 @@ fn vendored_asterisk_supports_dynamic_config_over_rest_websocket() {
 }
 
 #[test]
+fn reconciliation_status_is_ordered_and_published_through_ari_variable_state() {
+    let convergence = source("src/config/convergence.rs");
+    assert!(convergence.contains("pub generation: u64"));
+    assert!(convergence.contains("ConfigReconciliationState::Converged"));
+    assert!(convergence.contains("ConfigReconciliationState::Failed"));
+    assert!(convergence.contains_in_order(&[
+        "let _serial = lock_unpoisoned(&self.serial)",
+        "let result = apply()",
+        "publish(status)",
+    ]));
+
+    let lifecycle = source("src/asterisk/runtime/lifecycle.rs");
+    let tracked = rust_item(&lifecycle, "fn tracked_sorcery_reload");
+    assert!(tracked.contains("reconcile_with"));
+    assert!(tracked.contains("publish_config_reconciliation_status"));
+
+    let system = source("src/asterisk/native/system.rs");
+    assert!(system.contains("CONFIG_STATUS_VARIABLE: &CStr = c\"SCCP_CONFIG_STATUS\""));
+    assert!(system.contains("pbx_builtin_setvar_helper"));
+}
+
+#[test]
 fn live_harness_exercises_real_ari_and_runtime_convergence() {
     let harness = source("ci/sorcery/test-live-ari.sh");
     for required in [
@@ -154,6 +192,9 @@ fn live_harness_exercises_real_ari_and_runtime_convergence() {
         "/asterisk/config/dynamic/chan_sccp2/line/1001",
         "/asterisk/config/dynamic/chan_sccp2/device/SEP001122334455",
         "button.0002",
+        "SCCP_CONFIG_STATUS",
+        "config-status-converged",
+        "config-status-failed",
         "database get SCCP/config last-known-good",
         "sccp show devices",
         "sccp show lines",
@@ -181,7 +222,7 @@ fn sorcery_observers_are_reconciled_at_startup_and_drained_at_unload() {
         "drop(module)",
         "install_mwi(&access)",
         "source == ConfigurationSource::Sorcery",
-        "reload(&access)",
+        "reload_sorcery(",
     ]));
     assert!(stop.contains_in_order(&[".take()", "shutdown_observers()", "module.stop()",]));
 

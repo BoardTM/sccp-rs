@@ -31,8 +31,9 @@ use crate::asterisk::{
     ConferenceAnnouncementOperation, ConferenceDestinationOperation, ConferenceEndRejection,
     ConferenceId, ConferenceParticipantRejection, ConferenceParticipantStatus, ConferencePhase,
     ConferenceStatus, ConferenceTaskCancellation, ConferenceTaskRegistry, ConferenceTaskStartError,
-    ConfigurationProvider, ConfiguredChannelMetadata, ConnectedLineSource, ConnectedLineUpdate,
-    ControlOperation, ControlOutcome, ControlProvider, ControlProviderError, Controller,
+    ConfigReconciliation, ConfigReconciliationTrigger, ConfigurationProvider,
+    ConfiguredChannelMetadata, ConnectedLineSource, ConnectedLineUpdate, ControlOperation,
+    ControlOutcome, ControlProvider, ControlProviderError, Controller,
     DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET, DEFAULT_AUDIO_PACKET_MS, DeviceCallSummary,
     DeviceDndSummary, DeviceFeatureState, DeviceFeatureSummary, DeviceId, DeviceQueryLookupError,
     DeviceQueryProvider, DeviceQuerySnapshot, DeviceQueryTarget, DeviceState, DialplanRegistration,
@@ -119,7 +120,7 @@ pub use diagnostics::{
 };
 pub use lifecycle::{
     ChannelState, DirectMediaCall, config_path, module_access, registered_device_ids, reload,
-    reload_selected, runtime_line_binding,
+    reload_selected, reload_sorcery, runtime_line_binding,
 };
 pub use management::{
     Access, ActiveSystemMessage, ChannelBinding, ChannelOperationPermit, Module, PendingPark,

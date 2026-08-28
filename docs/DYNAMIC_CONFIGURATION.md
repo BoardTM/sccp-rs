@@ -10,6 +10,9 @@ and `line`:
 ```text
 HTTP:      /ari/asterisk/config/dynamic/chan_sccp2/{device|line}/{id}
 WebSocket:      /asterisk/config/dynamic/chan_sccp2/{device|line}/{id}
+Status variable: SCCP_CONFIG_STATUS
+HTTP status query: /ari/asterisk/variable?variable=SCCP_CONFIG_STATUS
+WebSocket status query: /asterisk/variable with variable=SCCP_CONFIG_STATUS
 ```
 
 This mode is intended for deployments where a remote service
@@ -207,6 +210,52 @@ same transactional reload path used by file and realtime configuration. An
 invalid or incomplete desired inventory is retained for correction but is not
 made active and does not replace the local last-known-good snapshot. A
 successful ARI object write therefore confirms persistence of that individual
-desired object, not a multi-object commit. Controllers should read back the
-objects and surface Asterisk reconciliation diagnostics when convergence does
-not occur.
+desired object, not runtime convergence.
+
+`SCCP_CONFIG_STATUS` is the module-published convergence contract. Read it
+through ARI's standard global-variable endpoint:
+
+```sh
+curl --fail-with-body --get --user "$ARI_USER:$ARI_PASSWORD" \
+  --data-urlencode 'variable=SCCP_CONFIG_STATUS' \
+  http://127.0.0.1:8088/ari/asterisk/variable
+```
+
+The ARI response wraps the variable value in `value`. Parse that value as a
+second JSON document:
+
+```json
+{
+  "generation": 6,
+  "state": "converged",
+  "operation": "update",
+  "object_type": "device",
+  "object_id": "SEP001122334455",
+  "diagnostic": null
+}
+```
+
+For an outbound WebSocket, send the equivalent request with structured query
+parameters:
+
+```json
+{
+  "type": "RESTRequest",
+  "transaction_id": "inventory-sync-42",
+  "request_id": "device-status",
+  "method": "GET",
+  "uri": "/asterisk/variable",
+  "query_strings": [
+    {"name": "variable", "value": "SCCP_CONFIG_STATUS"}
+  ]
+}
+```
+
+The controller must serialize SCCP mutations. Before a `PUT` or `DELETE`, read
+the current `generation`. After the persistence response, poll the status until
+the generation advances, the operation and object identity match the request,
+and `state` is either `converged` or `failed`. `converged` means the complete
+desired SCCP inventory became active. `failed` means the previous active
+configuration remains in use; `diagnostic` contains the bounded reload error.
+The observer receives no ARI transaction or request ID, so concurrent SCCP
+writes cannot be correlated through Asterisk's generic Sorcery endpoint.

@@ -7,6 +7,7 @@ use crate::asterisk::sys;
 
 const SOURCE_FILE: &CStr = c"asterisk/native/system.rs";
 const SOURCE_FUNCTION: &CStr = c"sccp_system";
+pub const CONFIG_STATUS_VARIABLE: &CStr = c"SCCP_CONFIG_STATUS";
 
 pub fn log_message(level: LogLevel, message: &str) {
     let level = match level {
@@ -35,6 +36,21 @@ pub fn cli_write(fd: c_int, message: &str) {
         return;
     };
     unsafe { sys::ast_cli(fd, c"%s".as_ptr(), message.as_ptr()) };
+}
+
+pub fn set_global_variable(name: &CStr, value: Option<&str>) -> Result<(), ()> {
+    if name.to_bytes().is_empty() {
+        return Err(());
+    }
+    let value = value.map(native_c_string).transpose().map_err(|_| ())?;
+    let value = value
+        .as_ref()
+        .map_or(std::ptr::null(), |value| value.as_ptr());
+    if unsafe { sys::pbx_builtin_setvar_helper(std::ptr::null_mut(), name.as_ptr(), value) } == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Copy a completion into memory owned by the native CLI.

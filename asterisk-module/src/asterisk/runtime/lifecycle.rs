@@ -2,25 +2,25 @@ use super::{
     Access, AmiEventPublisher, Arc, AsteriskDatabase, AsteriskDialplan, AsteriskHints,
     AsteriskHttp, AsteriskManager, AsteriskParking, AsyncMutex, AtomicU64, BTreeMap,
     BlfSubscriptions, Builder, CallId, CallSelectionOrder, Codec, ConferenceTaskRegistry,
-    ConfigurationProvider, Controller, DeviceId, Duration, ExternalAddressCache, FeatureStore,
-    ForwardingEntryRegistry, HashMap, HashSet, Instant, LineBinding, LineInstance, LogLevel,
-    MODULE, MediaAnchorRegistry, MediaAnchorRestores, MediaEndpoint, MobilityRegistry, Module,
-    ModuleConfig, Mutex, MutexExt as _, NoAnswerTimerRegistry, ParkingRegistry, PbxCallId,
-    PhoneCommand, PhoneCommandAction, RegistrationFallback, RegistrationRegistryError,
-    RegistrationTokenPolicy, ReloadPlan, ReloadSelection, RuntimeCallSignal,
-    RuntimeCallSignalDeliveryResult, RuntimeCallSignalKind, RuntimeCallSignalQueue,
-    RuntimeCalledPartyProvider, RuntimeChannelQueryProvider, RuntimeCodecPreferenceProvider,
-    RuntimeControlProvider, RuntimeDeviceQueryProvider, RuntimeDirectoryProvider,
-    RuntimeFeatureControlProvider, RuntimeHandsetMessageProvider, RuntimeInventoryProvider,
-    RuntimeLineQueryProvider, RuntimeRegistrationContexts, RuntimeServiceProvider, RwLock,
-    RwLockExt as _, Semaphore, Server, ServerConfig, ServerIngress, Shared, SignalingQos,
-    SignalingSocket, StagedMwiSubscriptions, StationIo, StationTransport, SystemHostResolver,
-    adapters, anonymous_hotline_definition, ast_log, configured_mobility_button, controller_step,
-    dial_terminator_digit, log_feature_store_error, mobility_device_registered, mpsc,
-    native_channel, publish_device_features, publish_feature_changes, publish_line,
-    register_called_party_application, register_channel_query,
-    register_codec_preference_application, register_control_actions, register_device_query,
-    register_directory_http, register_feature_control_actions,
+    ConfigReconciliation, ConfigReconciliationTrigger, ConfigurationProvider, Controller, DeviceId,
+    Duration, ExternalAddressCache, FeatureStore, ForwardingEntryRegistry, HashMap, HashSet,
+    Instant, LineBinding, LineInstance, LogLevel, MODULE, MediaAnchorRegistry, MediaAnchorRestores,
+    MediaEndpoint, MobilityRegistry, Module, ModuleConfig, Mutex, MutexExt as _,
+    NoAnswerTimerRegistry, ParkingRegistry, PbxCallId, PhoneCommand, PhoneCommandAction,
+    RegistrationFallback, RegistrationRegistryError, RegistrationTokenPolicy, ReloadPlan,
+    ReloadSelection, RuntimeCallSignal, RuntimeCallSignalDeliveryResult, RuntimeCallSignalKind,
+    RuntimeCallSignalQueue, RuntimeCalledPartyProvider, RuntimeChannelQueryProvider,
+    RuntimeCodecPreferenceProvider, RuntimeControlProvider, RuntimeDeviceQueryProvider,
+    RuntimeDirectoryProvider, RuntimeFeatureControlProvider, RuntimeHandsetMessageProvider,
+    RuntimeInventoryProvider, RuntimeLineQueryProvider, RuntimeRegistrationContexts,
+    RuntimeServiceProvider, RwLock, RwLockExt as _, Semaphore, Server, ServerConfig, ServerIngress,
+    Shared, SignalingQos, SignalingSocket, StagedMwiSubscriptions, StationIo, StationTransport,
+    SystemHostResolver, adapters, anonymous_hotline_definition, ast_log,
+    configured_mobility_button, controller_step, dial_terminator_digit, log_feature_store_error,
+    mobility_device_registered, mpsc, native_channel, publish_device_features,
+    publish_feature_changes, publish_line, raw, register_called_party_application,
+    register_channel_query, register_codec_preference_application, register_control_actions,
+    register_device_query, register_directory_http, register_feature_control_actions,
     register_handset_message_application, register_inventory_actions, register_line_query,
     register_runtime_status_actions, register_service_control_actions, run_call_signals,
     run_events, shutdown_conferences, shutdown_one_way_microphones, shutdown_remote_hangups,
@@ -503,6 +503,7 @@ impl Module {
             published_line_states: Mutex::new(HashMap::new()),
             config: RwLock::new(Arc::new(config)),
             config_provider,
+            config_reconciliation: Arc::new(ConfigReconciliation::default()),
             config_reloads: Mutex::new(()),
             channels: Mutex::new(HashMap::new()),
             assigned_channel_ids: Mutex::new(HashMap::new()),
@@ -935,6 +936,56 @@ pub fn reload(access: &Access) -> Result<(), String> {
 }
 
 pub fn reload_selected(access: &Access, selection: ReloadSelection) -> Result<(), String> {
+    if access.config().general.configuration_source == crate::config::ConfigurationSource::Sorcery {
+        return tracked_sorcery_reload(access, ConfigReconciliationTrigger::reload(), || {
+            reload_selected_inner(access, selection)
+        });
+    }
+    reload_selected_inner(access, selection)
+}
+
+pub fn reload_sorcery(access: &Access, trigger: ConfigReconciliationTrigger) -> Result<(), String> {
+    tracked_sorcery_reload(access, trigger, || {
+        reload_selected_inner(access, ReloadSelection::Complete)
+    })
+}
+
+fn tracked_sorcery_reload<F>(
+    access: &Access,
+    trigger: ConfigReconciliationTrigger,
+    apply: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let reconciliation = Arc::clone(&access.shared.config_reconciliation);
+    reconciliation.reconcile_with(trigger, apply, |status| {
+        publish_config_reconciliation_status(&status)
+    })
+}
+
+fn publish_config_reconciliation_status(
+    status: &crate::config::convergence::ConfigReconciliationStatus,
+) {
+    match serde_json::to_string(status) {
+        Ok(status) => {
+            if raw::system::set_global_variable(raw::system::CONFIG_STATUS_VARIABLE, Some(&status))
+                .is_err()
+            {
+                ast_log(
+                    LogLevel::Warning,
+                    "unable to publish SCCP configuration convergence status",
+                );
+            }
+        }
+        Err(error) => ast_log(
+            LogLevel::Warning,
+            &format!("unable to serialize SCCP configuration convergence status: {error}"),
+        ),
+    }
+}
+
+fn reload_selected_inner(access: &Access, selection: ReloadSelection) -> Result<(), String> {
     let _reload_guard = access.shared.config_reloads.lock_unpoisoned();
     let _mobility_guard = access
         .handle
@@ -1089,11 +1140,12 @@ pub fn reload_selected(access: &Access, selection: ReloadSelection) -> Result<()
             publish_feature_changes(access, &device, previous, current);
         }
     }
-    access
-        .shared
-        .config_provider
-        .activated(&access.config())
-        .map_err(|error| format!("configuration is active but LKG persistence failed: {error}"))?;
+    if let Err(error) = access.shared.config_provider.activated(&access.config()) {
+        ast_log(
+            LogLevel::Warning,
+            &format!("SCCP configuration converged but activation persistence failed: {error}"),
+        );
+    }
     Ok(())
 }
 

@@ -189,19 +189,6 @@ wait_cli_not_contains() {
 	return 1
 }
 
-wait_log_contains() {
-	expected=$1
-	attempt=0
-	while [ "$attempt" -lt 100 ]; do
-		if grep -Fq "$expected" "$asterisk_log"; then
-			return 0
-		fi
-		attempt=$((attempt + 1))
-		sleep 0.1
-	done
-	return 1
-}
-
 ari_request() {
 	method=$1
 	path=$2
@@ -227,6 +214,26 @@ ari_request() {
 	fi
 }
 
+wait_config_status() {
+	label=$1
+	expected_state=$2
+	expected_operation=$3
+	expected_type=$4
+	expected_id=$5
+	attempt=0
+	while [ "$attempt" -lt 100 ]; do
+		ari_request GET '/asterisk/variable?variable=SCCP_CONFIG_STATUS' 200
+		case "$ARI_RESPONSE" in
+		*state*"$expected_state"*operation*"$expected_operation"*object_type*"$expected_type"*object_id*"$expected_id"*) return 0 ;;
+		esac
+		attempt=$((attempt + 1))
+		sleep 0.1
+	done
+	printf '%s did not observe matching SCCP config status\nactual:\n%s\n' \
+		"$label" "$ARI_RESPONSE" >&2
+	exit 1
+}
+
 if ! sccp_sandbox_wait_ready "$asterisk_bin"; then
 	if [ "$SCCP_SANDBOX_READY_FAILURE" = exited ]; then
 		printf 'Asterisk exited during startup (status %s)\n' \
@@ -242,6 +249,7 @@ assert_contains module-load "$module_load" 'Loaded chan_sccp2.so'
 
 ari_request PUT '/asterisk/config/dynamic/chan_sccp2/line/1001' 200 \
 	'{"fields":[{"attribute":"label","value":"Reception"},{"attribute":"context","value":"from-sccp"},{"attribute":"callerid","value":"Reception <1001>"}]}'
+wait_config_status config-status-converged converged create line 1001
 wait_cli_contains 'sccp show lines' '1001' || {
 	printf 'Sorcery line did not converge\n' >&2
 	exit 1
@@ -250,6 +258,7 @@ assert_contains line-label "$WAIT_OUTPUT" 'Reception'
 
 ari_request PUT '/asterisk/config/dynamic/chan_sccp2/device/SEP001122334455' 200 \
 	'{"fields":[{"attribute":"description","value":"Reception phone"},{"attribute":"button.0001","value":"line, 1001, label=Reception"},{"attribute":"button.0002","value":"speed_dial, Helpdesk, 2000"}]}'
+wait_config_status config-status-converged converged create device SEP001122334455
 wait_cli_contains 'sccp show devices' 'SEP001122334455' || {
 	printf 'Sorcery device did not converge\n' >&2
 	exit 1
@@ -266,6 +275,7 @@ assert_contains ari-get-device "$ARI_RESPONSE" 'button.0002'
 
 ari_request PUT '/asterisk/config/dynamic/chan_sccp2/device/SEP001122334455' 200 \
 	'{"fields":[{"attribute":"button.0002","value":""}]}'
+wait_config_status config-status-converged converged update device SEP001122334455
 wait_cli_not_contains 'sccp show devices SEP001122334455 buttons' 'Helpdesk' || {
 	printf 'Indexed Sorcery tombstone did not converge\n' >&2
 	exit 1
@@ -279,10 +289,7 @@ assert_contains lkg-before "$lkg_before" 'SEP001122334455'
 
 ari_request PUT '/asterisk/config/dynamic/chan_sccp2/device/SEP001122334455' 200 \
 	'{"fields":[{"attribute":"button.0001","value":"line, 9999, label=Invalid"}]}'
-wait_log_contains 'SCCP Sorcery reconciliation failed after' || {
-	printf 'Invalid Sorcery candidate did not report reconciliation failure\n' >&2
-	exit 1
-}
+wait_config_status config-status-failed failed update device SEP001122334455
 ari_request GET '/asterisk/config/dynamic/chan_sccp2/device/SEP001122334455' 200
 assert_contains invalid-desired-retained "$ARI_RESPONSE" '9999'
 live_device=$(cli 'sccp show devices SEP001122334455')
@@ -298,11 +305,13 @@ if [ "$lkg_after" != "$lkg_before" ]; then
 fi
 
 ari_request DELETE '/asterisk/config/dynamic/chan_sccp2/device/SEP001122334455' 204
+wait_config_status config-status-converged converged delete device SEP001122334455
 wait_cli_not_contains 'sccp show devices' 'SEP001122334455' || {
 	printf 'Deleted Sorcery device remained live\n' >&2
 	exit 1
 }
 ari_request DELETE '/asterisk/config/dynamic/chan_sccp2/line/1001' 204
+wait_config_status config-status-converged converged delete line 1001
 wait_cli_not_contains 'sccp show lines' '1001' || {
 	printf 'Deleted Sorcery line remained live\n' >&2
 	exit 1

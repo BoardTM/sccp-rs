@@ -40,6 +40,7 @@
 //! provider values do not appear in validation diagnostics.
 
 mod canonical;
+pub mod convergence;
 mod defaults;
 mod inheritance;
 mod model;

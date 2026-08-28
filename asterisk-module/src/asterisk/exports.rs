@@ -12,26 +12,29 @@ use super::runtime::{
     execute_forwarding_mutation, format_for, handle_runtime_hangup_signal, install_mwi,
     local_media_endpoint, module_access, preferred_codec_upgrade, preferred_inbound_codec,
     prepare_channel_allocation_text, publish_line, read_channel_metadata, read_party_snapshot,
-    registered_device_ids, reload, reload_selected, remove_channel, render_runtime_cli_diagnostics,
-    render_runtime_cli_inventory, requestor_auto_answer_mode, retarget_station_to_anchor,
-    state_from_channel, station_nat_active, take_state_from_channel, uninstall_mwi,
+    registered_device_ids, reload, reload_selected, reload_sorcery, remove_channel,
+    render_runtime_cli_diagnostics, render_runtime_cli_inventory, requestor_auto_answer_mode,
+    retarget_station_to_anchor, state_from_channel, station_nat_active, take_state_from_channel,
+    uninstall_mwi,
 };
 use super::{
     AppearanceRingMode, Arc, AsteriskRealtime, AsteriskSorcerySource, AutoAnswerPolicy, CStr,
-    CallDirection, CallId, CallMetadata, CallState, CliControlError, Codec, ConfigurationProvider,
-    ConfigurationSource, ConfiguredChannelMetadata, ControlOutcome, DeviceId, DeviceState,
-    DirectMediaRoute, DndMode, DriverEffect, Duration, FeatureControlMutation,
-    FeatureControlOutcome, ForwardingContext, ForwardingOperation, HandsetEffect, HashMap,
-    HybridConfigurationProvider, InboundCallDisposition, InboundDialRequest,
-    InboundUnavailableReason, IncomingRing, LineBinding, LineInstance, LogLevel,
-    MAX_ASSIGNED_CHANNEL_ID_BYTES, MAX_BOOLEAN_BYTES, MAX_CALL_ID_BYTES, MAX_DEVICE_SELECTOR_BYTES,
-    MAX_DIAL_DESTINATION_BYTES, MAX_DND_MODE_BYTES, MAX_LINE_SELECTOR_BYTES, MAX_MESSAGE_BYTES,
-    MAX_TIMEOUT_BYTES, MODULE, MediaEndpoint, ModuleConfig, NoAnswerPolicy, NonNull, PartySnapshot,
-    PbxCallId, PhoneCommand, PhoneCommandAction, REQUESTED_CHANNEL_UNAVAILABLE, ReloadSelection,
-    ResetMode, RingDuration, RingerMode, SharedNoAnswerRoute, SorceryConfigurationProvider,
-    USER_BUSY, c_int, canonical_ip_address, complete_cli_device, complete_cli_value,
-    compose_channel_metadata, controller_step, execute_cli_answer, execute_cli_device_control,
-    execute_cli_dnd, execute_cli_end, execute_cli_message, execute_cli_originate, native_channel,
+    CallDirection, CallId, CallMetadata, CallState, CliControlError, Codec,
+    ConfigReconciliationObjectType, ConfigReconciliationOperation, ConfigReconciliationTrigger,
+    ConfigurationProvider, ConfigurationSource, ConfiguredChannelMetadata, ControlOutcome,
+    DeviceId, DeviceState, DirectMediaRoute, DndMode, DriverEffect, Duration,
+    FeatureControlMutation, FeatureControlOutcome, ForwardingContext, ForwardingOperation,
+    HandsetEffect, HashMap, HybridConfigurationProvider, InboundCallDisposition,
+    InboundDialRequest, InboundUnavailableReason, IncomingRing, LineBinding, LineInstance,
+    LogLevel, MAX_ASSIGNED_CHANNEL_ID_BYTES, MAX_BOOLEAN_BYTES, MAX_CALL_ID_BYTES,
+    MAX_DEVICE_SELECTOR_BYTES, MAX_DIAL_DESTINATION_BYTES, MAX_DND_MODE_BYTES,
+    MAX_LINE_SELECTOR_BYTES, MAX_MESSAGE_BYTES, MAX_TIMEOUT_BYTES, MODULE, MediaEndpoint,
+    ModuleConfig, NoAnswerPolicy, NonNull, PartySnapshot, PbxCallId, PhoneCommand,
+    PhoneCommandAction, REQUESTED_CHANNEL_UNAVAILABLE, ReloadSelection, ResetMode, RingDuration,
+    RingerMode, SharedNoAnswerRoute, SorceryConfigurationProvider, USER_BUSY, c_int,
+    canonical_ip_address, complete_cli_device, complete_cli_value, compose_channel_metadata,
+    controller_step, execute_cli_answer, execute_cli_device_control, execute_cli_dnd,
+    execute_cli_end, execute_cli_message, execute_cli_originate, native_channel,
     parse_cli_forwarding_mutation, pbx_audio_format, pbx_audio_formats_from_mask,
     pbx_video_formats_from_mask, plan_inbound_bindings, plan_shared_no_answer_route, raw, sys,
 };
@@ -333,7 +336,18 @@ fn reconcile_sorcery_mutation(mutation: raw::sorcery::SorceryMutation) {
     let Some(access) = module_access() else {
         return;
     };
-    if let Err(error) = reload(&access) {
+    let operation = match mutation.kind {
+        raw::sorcery::SorceryMutationKind::Created => ConfigReconciliationOperation::Create,
+        raw::sorcery::SorceryMutationKind::Updated => ConfigReconciliationOperation::Update,
+        raw::sorcery::SorceryMutationKind::Deleted => ConfigReconciliationOperation::Delete,
+    };
+    let object_type = match mutation.object_type {
+        raw::sorcery::SorceryObjectType::Device => ConfigReconciliationObjectType::Device,
+        raw::sorcery::SorceryObjectType::Line => ConfigReconciliationObjectType::Line,
+    };
+    let trigger =
+        ConfigReconciliationTrigger::mutation(operation, object_type, mutation.id.clone());
+    if let Err(error) = reload_sorcery(&access, trigger) {
         ast_log(
             LogLevel::Warning,
             &format!("SCCP Sorcery reconciliation failed after {mutation:?}: {error}"),
@@ -391,7 +405,8 @@ pub fn start_module() -> Result<(), ModuleLifecycleError> {
             drop(module);
             install_mwi(&access);
             if source == ConfigurationSource::Sorcery {
-                if let Err(error) = reload(&access) {
+                if let Err(error) = reload_sorcery(&access, ConfigReconciliationTrigger::startup())
+                {
                     ast_log(
                         LogLevel::Warning,
                         &format!("initial SCCP Sorcery reconciliation failed: {error}"),
@@ -416,6 +431,7 @@ pub fn stop_module() -> Result<(), ModuleLifecycleError> {
         uninstall_mwi(&module.access);
         module.stop();
     }
+    let _ = raw::system::set_global_variable(raw::system::CONFIG_STATUS_VARIABLE, None);
     Ok(())
 }
 
