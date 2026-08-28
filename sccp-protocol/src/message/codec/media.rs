@@ -2,44 +2,117 @@
 
 use super::*;
 
+fn decode_connection_statistics_v22_quality(
+    payload: &[u8],
+    message_id: u32,
+) -> Result<Vec<u8>, CodecError> {
+    const PREFIX_BYTES: usize = 61;
+    if payload.len() < PREFIX_BYTES {
+        return Err(CodecError::Truncated {
+            message_id,
+            needed: PREFIX_BYTES,
+            actual: payload.len(),
+        });
+    }
+    let suffix = &payload[PREFIX_BYTES..];
+    if suffix.len() < 4 {
+        if suffix.iter().any(|byte| *byte != 0) {
+            return Err(CodecError::Truncated {
+                message_id,
+                needed: PREFIX_BYTES + 4,
+                actual: payload.len(),
+            });
+        }
+        return Ok(Vec::new());
+    }
+    let quality_size = usize_from_wire(
+        message_id,
+        "quality statistics",
+        u32::from_le_bytes(suffix[..4].try_into().expect("validated quality-size word")),
+    )?;
+    if quality_size > CONNECTION_QUALITY_MAX_BYTES {
+        return Err(CodecError::CountTooLarge {
+            message_id,
+            field: "quality statistics",
+            count: quality_size,
+            maximum: CONNECTION_QUALITY_MAX_BYTES,
+        });
+    }
+    let needed = PREFIX_BYTES + 4 + quality_size;
+    if payload.len() < needed {
+        return Err(CodecError::Truncated {
+            message_id,
+            needed,
+            actual: payload.len(),
+        });
+    }
+    let padding = &payload[needed..];
+    if padding.len() > 3 || padding.iter().any(|byte| *byte != 0) {
+        return Err(CodecError::TrailingBytes {
+            message_id,
+            count: padding.len(),
+        });
+    }
+    Ok(payload[PREFIX_BYTES + 4..needed].to_vec())
+}
+
 pub(super) fn decode_connection_statistics(
     payload: &[u8],
     protocol: u32,
     message_id: u32,
 ) -> Result<ConnectionStatistics, CodecError> {
-    let (directory_number, call_reference, processing, statistics, quality) = if protocol >= 19 {
-        let value: WireConnectionStatisticsV19 = decode_zero_padded(message_id, payload)?;
-        validate_zero_payload(&value.alignment, message_id, 3)?;
-        (
-            value.directory_number.text()?,
-            value.call_reference,
-            StatisticsProcessing::from(value.processing),
-            value.statistics,
-            value.quality,
-        )
-    } else {
-        let value: WireConnectionStatisticsV3 = decode_zero_padded(message_id, payload)?;
-        (
-            value.directory_number.text()?,
-            value.call_reference,
-            StatisticsProcessing::from(value.processing),
-            value.statistics,
-            value.quality,
-        )
-    };
-    Ok(ConnectionStatistics {
-        directory_number,
-        call_reference,
-        processing,
-        packets_sent: statistics.packets_sent,
-        octets_sent: statistics.octets_sent,
-        packets_received: statistics.packets_received,
-        octets_received: statistics.octets_received,
-        packets_lost: statistics.packets_lost,
-        jitter_millis: statistics.jitter_millis,
-        latency_millis: statistics.latency_millis,
-        quality: ConnectionQualityStatistics::new(quality)?,
-    })
+    match protocol {
+        22.. => {
+            let value: WireConnectionStatisticsV22Prefix = decode_prefix(message_id, payload)?;
+            let quality = decode_connection_statistics_v22_quality(payload, message_id)?;
+            Ok(ConnectionStatistics {
+                directory_number: value.directory_number.text()?,
+                call_reference: value.call_reference,
+                processing: StatisticsProcessing::from(u32::from(value.processing)),
+                packets_sent: value.packets_sent,
+                octets_sent: value.octets_sent,
+                packets_received: value.packets_received,
+                octets_received: value.octets_received,
+                packets_lost: value.packets_lost,
+                jitter_millis: value.jitter_millis,
+                latency_millis: value.latency_millis,
+                quality: ConnectionQualityStatistics::new(quality)?,
+            })
+        }
+        19..=21 => {
+            let value: WireConnectionStatisticsV19 = decode_zero_padded(message_id, payload)?;
+            validate_zero_payload(&value.alignment, message_id, 3)?;
+            Ok(ConnectionStatistics {
+                directory_number: value.directory_number.text()?,
+                call_reference: value.call_reference,
+                processing: StatisticsProcessing::from(value.processing),
+                packets_sent: value.statistics.packets_sent,
+                octets_sent: value.statistics.octets_sent,
+                packets_received: value.statistics.packets_received,
+                octets_received: value.statistics.octets_received,
+                packets_lost: value.statistics.packets_lost,
+                jitter_millis: value.statistics.jitter_millis,
+                latency_millis: value.statistics.latency_millis,
+                quality: ConnectionQualityStatistics::new(value.quality)?,
+            })
+        }
+        _ => {
+            let value: WireConnectionStatisticsV3 = decode_zero_padded(message_id, payload)?;
+            Ok(ConnectionStatistics {
+                directory_number: value.directory_number.text()?,
+                call_reference: value.call_reference,
+                processing: StatisticsProcessing::from(value.processing),
+                packets_sent: value.statistics.packets_sent,
+                octets_sent: value.statistics.octets_sent,
+                packets_received: value.statistics.packets_received,
+                octets_received: value.statistics.octets_received,
+                packets_lost: value.statistics.packets_lost,
+                jitter_millis: value.statistics.jitter_millis,
+                latency_millis: value.statistics.latency_millis,
+                quality: ConnectionQualityStatistics::new(value.quality)?,
+            })
+        }
+    }
 }
 
 pub(super) fn decode_start_media_ack(

@@ -1644,6 +1644,32 @@ struct WireConnectionStatisticsV19 {
     quality: Vec<u8>,
 }
 
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsV22 {
+    directory_number: WireFixedText<28>,
+    call_reference: u32,
+    processing: u8,
+    statistics: WireConnectionStatisticsTail,
+    #[br(count = statistics.quality_size)]
+    quality: Vec<u8>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsV22Prefix {
+    directory_number: WireFixedText<28>,
+    call_reference: u32,
+    processing: u8,
+    packets_sent: u32,
+    octets_sent: u32,
+    packets_received: u32,
+    octets_received: u32,
+    packets_lost: u32,
+    jitter_millis: u32,
+    latency_millis: u32,
+}
+
 impl ClientMessage {
     /// Decodes a station-originated frame with an explicit negotiated version.
     ///
@@ -3107,8 +3133,31 @@ fn encode_connection_statistics(
             }
         })?,
     };
-    if protocol.wire() >= 19 {
-        encode(
+    match protocol.wire() {
+        22.. => {
+            let processing = u8::try_from(statistics.processing.wire_value()).map_err(|_| {
+                CodecError::InvalidValue {
+                    message_id: wire_id::CONNECTION_STATISTICS_RES,
+                    field: "processing",
+                    value: u64::from(statistics.processing.wire_value()),
+                }
+            })?;
+            encode(
+                wire_id::CONNECTION_STATISTICS_RES,
+                &WireConnectionStatisticsV22 {
+                    directory_number: WireFixedText::new(
+                        wire_id::CONNECTION_STATISTICS_RES,
+                        "directory number",
+                        &statistics.directory_number,
+                    )?,
+                    call_reference: statistics.call_reference,
+                    processing,
+                    statistics: tail,
+                    quality: statistics.quality.as_bytes().to_vec(),
+                },
+            )
+        }
+        19..=21 => encode(
             wire_id::CONNECTION_STATISTICS_RES,
             &WireConnectionStatisticsV19 {
                 directory_number: WireFixedText::new(
@@ -3122,9 +3171,8 @@ fn encode_connection_statistics(
                 statistics: tail,
                 quality: statistics.quality.as_bytes().to_vec(),
             },
-        )
-    } else {
-        encode(
+        ),
+        _ => encode(
             wire_id::CONNECTION_STATISTICS_RES,
             &WireConnectionStatisticsV3 {
                 directory_number: WireFixedText::new(
@@ -3137,7 +3185,7 @@ fn encode_connection_statistics(
                 statistics: tail,
                 quality: statistics.quality.as_bytes().to_vec(),
             },
-        )
+        ),
     }
 }
 
@@ -7414,16 +7462,15 @@ mod tests {
 
     #[test]
     fn connection_statistics_reject_oversized_quality_payloads() {
-        let payload = WireConnectionStatisticsV19 {
+        let payload = WireConnectionStatisticsV22 {
             directory_number: WireFixedText::new(
                 wire_id::CONNECTION_STATISTICS_RES,
                 "directory number",
                 "2002",
             )
             .unwrap(),
-            alignment: [0; 3],
             call_reference: 42,
-            processing: StatisticsProcessing::Clear.wire_value(),
+            processing: StatisticsProcessing::Clear.wire_value() as u8,
             statistics: WireConnectionStatisticsTail {
                 packets_sent: 1,
                 octets_sent: 2,
@@ -7451,6 +7498,95 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn connection_statistics_v22_decodes_7961_payload_without_quality_size() {
+        let mut payload = encode(
+            wire_id::CONNECTION_STATISTICS_RES,
+            &WireConnectionStatisticsV22Prefix {
+                directory_number: WireFixedText::new(
+                    wire_id::CONNECTION_STATISTICS_RES,
+                    "directory number",
+                    "2002",
+                )
+                .unwrap(),
+                call_reference: 0x1122_3344,
+                processing: StatisticsProcessing::DoNotClear.wire_value() as u8,
+                packets_sent: 0x0102_0304,
+                octets_sent: 0x1112_1314,
+                packets_received: 0x2122_2324,
+                octets_received: 0x3132_3334,
+                packets_lost: 0x4142_4344,
+                jitter_millis: 0x5152_5354,
+                latency_millis: 0x6162_6364,
+            },
+        )
+        .unwrap();
+        assert_eq!(payload.len(), 61);
+        payload.extend_from_slice(&[0; 3]);
+
+        let message = ClientMessage::decode_with_version(
+            Frame::new(
+                ProtocolVersion::V22.wire(),
+                wire_id::CONNECTION_STATISTICS_RES,
+                payload,
+            ),
+            ProtocolVersion::V22,
+        )
+        .unwrap();
+        assert_eq!(
+            message,
+            ClientMessage::ConnectionStatisticsResponse(ConnectionStatistics {
+                directory_number: "2002".into(),
+                call_reference: 0x1122_3344,
+                processing: StatisticsProcessing::DoNotClear,
+                packets_sent: 0x0102_0304,
+                octets_sent: 0x1112_1314,
+                packets_received: 0x2122_2324,
+                octets_received: 0x3132_3334,
+                packets_lost: 0x4142_4344,
+                jitter_millis: 0x5152_5354,
+                latency_millis: 0x6162_6364,
+                quality: ConnectionQualityStatistics::new(Vec::new()).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn connection_statistics_v22_uses_packed_handset_offsets() {
+        let quality = vec![0xa1, 0xb2, 0xc3];
+        let message = ClientMessage::ConnectionStatisticsResponse(ConnectionStatistics {
+            directory_number: "2002".into(),
+            call_reference: 0x1122_3344,
+            processing: StatisticsProcessing::DoNotClear,
+            packets_sent: 0x0102_0304,
+            octets_sent: 0x1112_1314,
+            packets_received: 0x2122_2324,
+            octets_received: 0x3132_3334,
+            packets_lost: 0x4142_4344,
+            jitter_millis: 0x5152_5354,
+            latency_millis: 0x6162_6364,
+            quality: ConnectionQualityStatistics::new(quality.clone()).unwrap(),
+        });
+        let encoded = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&encoded).unwrap().remove(0);
+
+        assert_eq!(&frame.payload[28..32], &0x1122_3344_u32.to_le_bytes());
+        assert_eq!(frame.payload[32], 1);
+        assert_eq!(&frame.payload[33..37], &0x0102_0304_u32.to_le_bytes());
+        assert_eq!(&frame.payload[37..41], &0x1112_1314_u32.to_le_bytes());
+        assert_eq!(&frame.payload[41..45], &0x2122_2324_u32.to_le_bytes());
+        assert_eq!(&frame.payload[45..49], &0x3132_3334_u32.to_le_bytes());
+        assert_eq!(&frame.payload[49..53], &0x4142_4344_u32.to_le_bytes());
+        assert_eq!(&frame.payload[53..57], &0x5152_5354_u32.to_le_bytes());
+        assert_eq!(&frame.payload[57..61], &0x6162_6364_u32.to_le_bytes());
+        assert_eq!(&frame.payload[61..65], &3_u32.to_le_bytes());
+        assert_eq!(&frame.payload[65..68], quality.as_slice());
+        assert_eq!(
+            ClientMessage::decode_with_version(frame, ProtocolVersion::V22).unwrap(),
+            message
+        );
     }
 
     #[test]
@@ -8920,11 +9056,11 @@ mod tests {
         assert!(
             ClientMessage::decode_with_version(
                 Frame::new(
-                    ProtocolVersion::V22.wire(),
+                    ProtocolVersion::V20.wire(),
                     wire_id::CONNECTION_STATISTICS_RES,
                     encode(wire_id::CONNECTION_STATISTICS_RES, &connection_statistics).unwrap(),
                 ),
-                ProtocolVersion::V22,
+                ProtocolVersion::V20,
             )
             .is_err()
         );

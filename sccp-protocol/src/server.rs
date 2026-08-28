@@ -2707,7 +2707,19 @@ async fn run_session(
             read = stream.read(&mut read_buffer) => {
                 let count = read?;
                 if count == 0 { break; }
-                for frame in decoder.push(&read_buffer[..count])? {
+                let frames = match decoder.push(&read_buffer[..count]) {
+                    Ok(frames) => frames,
+                    Err(error) if state.is_none() => {
+                        debug!(
+                            peer = %context.peer,
+                            %error,
+                            "discarding malformed pre-registration SCCP stream"
+                        );
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                for frame in frames {
                     let decode_protocol = state
                         .as_ref()
                         .map_or(ProtocolVersion::V3, |state| state.registration.protocol);

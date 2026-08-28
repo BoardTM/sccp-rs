@@ -1321,6 +1321,39 @@ async fn reconfiguration_disconnects_a_removed_device_without_touching_its_peer(
 }
 
 #[tokio::test]
+async fn malformed_pre_registration_frame_is_quietly_disconnected() {
+    let config = ServerConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        advertised_address: Ipv4Addr::LOCALHOST,
+        ..ServerConfig::default()
+    };
+    let (server, handle, mut events) = Server::bind(config, [definition()]).await.unwrap();
+    let address = server.local_addr().unwrap();
+    let task = tokio::spawn(server.run());
+    let mut peer = TcpStream::connect(address).await.unwrap();
+    let mut malformed_header = [0_u8; 12];
+    malformed_header[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    peer.write_all(&malformed_header).await.unwrap();
+
+    let mut byte = [0_u8; 1];
+    let count = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+        .await
+        .expect("server did not close malformed pre-registration stream")
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), events.recv())
+            .await
+            .is_err(),
+        "pre-registration scanner traffic emitted a public session error"
+    );
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn standalone_server_registers_and_serves_line_status() {
     for protocol in [
         ProtocolVersion::V3,
