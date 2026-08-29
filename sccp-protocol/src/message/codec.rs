@@ -74,6 +74,18 @@ fn ensure_station_route(
     }
 }
 
+fn validate_media_port_count(message_id: u32, count: usize) -> Result<(), CodecError> {
+    match count {
+        0..=MEDIA_PORT_LIST_MAX_PORTS => Ok(()),
+        _ => Err(CodecError::CountTooLarge {
+            message_id,
+            field: "RTP ports",
+            count,
+            maximum: MEDIA_PORT_LIST_MAX_PORTS,
+        }),
+    }
+}
+
 fn preserve_known_message(frame: Frame, id: MessageId) -> Result<KnownOpaqueMessage, CodecError> {
     ensure_preserve_only(id)?;
     let payload = BoundedBytes::try_from(frame.payload).map_err(|error| {
@@ -1196,6 +1208,13 @@ struct WireCapabilitiesResponse {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
+struct WireMediaPortList {
+    count: u32,
+    ports: [u32; MEDIA_PORT_LIST_MAX_PORTS],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
 struct WireAlarmBase {
     severity: u32,
     text: WireFixedText<80>,
@@ -1245,6 +1264,22 @@ struct WireRegisterToken {
     ipv6_address: [u8; 16],
     flags: u32,
 }
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireSpcpRegisterToken {
+    device_id: WireFixedText<16>,
+    reserved: u32,
+    device_instance: u32,
+    ipv4_address: u32,
+    device_type: u32,
+    max_streams: u32,
+}
+
+words!(WireStopMediaReception {
+    conference_id,
+    passthrough_party_id
+});
 
 words!(WireMediaResourceNotification {
     device_type,
@@ -1938,6 +1973,23 @@ impl ClientMessage {
                     .collect();
                 Ok(Self::CapabilitiesResponse(caps))
             }
+            wire_id::MEDIA_PORT_LIST => {
+                let value: WireMediaPortList = decode(frame.message_id, p)?;
+                let count = usize_from_wire(frame.message_id, "RTP ports", value.count)?;
+                validate_media_port_count(frame.message_id, count)?;
+                let rtp_ports = value.ports[..count]
+                    .iter()
+                    .copied()
+                    .map(|port| {
+                        u16::try_from(port).map_err(|_| CodecError::InvalidValue {
+                            message_id: frame.message_id,
+                            field: "RTP port",
+                            value: u64::from(port),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::MediaPortList(MediaPortList { rtp_ports }))
+            }
             wire_id::UPDATE_CAPABILITIES => {
                 let expanded_layout = CapabilityUpdateVariant::Version1ExpandedVideo;
                 let variant = match (
@@ -2043,6 +2095,16 @@ impl ClientMessage {
                     address,
                     device_type: DeviceType::from(value.device_type),
                     flags: value.flags,
+                }))
+            }
+            wire_id::SPCP_REGISTER_TOKEN_REQ => {
+                let value: WireSpcpRegisterToken = decode(frame.message_id, p)?;
+                Ok(Self::SpcpRegisterToken(SpcpRegisterTokenMessage {
+                    device_id: DeviceId::new(value.device_id.text()?)?,
+                    device_instance: value.device_instance,
+                    address: Ipv4Addr::from(value.ipv4_address),
+                    device_type: DeviceType::from(value.device_type),
+                    max_streams: value.max_streams,
                 }))
             }
             wire_id::HOOK_FLASH => {
@@ -2630,6 +2692,25 @@ impl ClientMessage {
                 )?;
                 wire_id::CAPABILITIES_RES
             }
+            Self::MediaPortList(message) => {
+                validate_media_port_count(wire_id::MEDIA_PORT_LIST, message.rtp_ports.len())?;
+                let mut ports = [0; MEDIA_PORT_LIST_MAX_PORTS];
+                for (target, port) in ports.iter_mut().zip(&message.rtp_ports) {
+                    *target = u32::from(*port);
+                }
+                payload = encode(
+                    wire_id::MEDIA_PORT_LIST,
+                    &WireMediaPortList {
+                        count: wire_count(
+                            wire_id::MEDIA_PORT_LIST,
+                            "RTP ports",
+                            message.rtp_ports.len(),
+                        )?,
+                        ports,
+                    },
+                )?;
+                wire_id::MEDIA_PORT_LIST
+            }
             Self::CapabilitiesUpdate(update) => {
                 payload.extend_from_slice(update.raw_payload());
                 update.variant().message_id()
@@ -2754,6 +2835,24 @@ impl ClientMessage {
                     },
                 )?;
                 wire_id::REGISTER_TOKEN_REQ
+            }
+            Self::SpcpRegisterToken(token) => {
+                payload = encode(
+                    wire_id::SPCP_REGISTER_TOKEN_REQ,
+                    &WireSpcpRegisterToken {
+                        device_id: WireFixedText::new(
+                            wire_id::SPCP_REGISTER_TOKEN_REQ,
+                            "device ID",
+                            token.device_id.as_str(),
+                        )?,
+                        reserved: 0,
+                        device_instance: token.device_instance,
+                        ipv4_address: u32::from(token.address),
+                        device_type: token.device_type.wire_value(),
+                        max_streams: token.max_streams,
+                    },
+                )?;
+                wire_id::SPCP_REGISTER_TOKEN_REQ
             }
             Self::ConnectionStatisticsResponse(statistics) => {
                 payload = encode_connection_statistics(statistics, protocol)?;
@@ -3258,6 +3357,10 @@ impl ServerMessage {
                 Ok(Self::UnregisterAck)
             }
             wire_id::CAPABILITIES_REQ => Ok(Self::CapabilitiesRequest),
+            wire_id::ENUNCIATOR_COMMAND => {
+                validate_exact_payload(p, frame.message_id, 0)?;
+                Ok(Self::EnunciatorCommand)
+            }
             wire_id::CONFIG_STAT => {
                 let value: WireConfigStatus = decode(frame.message_id, p)?;
                 Ok(Self::ConfigStatus(ConfigurationStatus {
@@ -3721,6 +3824,18 @@ impl ServerMessage {
                     backoff_seconds: value.value,
                 })
             }
+            wire_id::SPCP_REGISTER_TOKEN_ACK => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::SpcpRegisterTokenAck {
+                    features: value.value,
+                })
+            }
+            wire_id::SPCP_REGISTER_TOKEN_REJECT => {
+                let value: WireOneWord = decode(frame.message_id, p)?;
+                Ok(Self::SpcpRegisterTokenReject {
+                    backoff_seconds: value.value,
+                })
+            }
             wire_id::SET_RINGER => {
                 let value: WireModeLineCall = decode(frame.message_id, p)?;
                 Ok(Self::SetRinger {
@@ -3737,6 +3852,10 @@ impl ServerMessage {
                     instance: value.instance,
                     mode: LampMode::from(value.mode),
                 })
+            }
+            wire_id::SET_HOOK_FLASH_DETECT => {
+                validate_exact_payload(p, frame.message_id, 0)?;
+                Ok(Self::SetHookFlashDetect)
             }
             wire_id::START_TONE => {
                 let value: WireToneLineCall = decode(frame.message_id, p)?;
@@ -3812,6 +3931,17 @@ impl ServerMessage {
                     call_reference: value.call_reference.into(),
                     port_handling_flag: value.port_handling_flag,
                 }))
+            }
+            wire_id::START_MEDIA_RECEPTION => {
+                validate_exact_payload(p, frame.message_id, 0)?;
+                Ok(Self::StartMediaReception)
+            }
+            wire_id::STOP_MEDIA_RECEPTION => {
+                let value: WireStopMediaReception = decode(frame.message_id, p)?;
+                Ok(Self::StopMediaReception {
+                    conference_id: value.conference_id.into(),
+                    passthrough_party_id: value.passthrough_party_id.into(),
+                })
             }
             wire_id::SET_SPEAKER_MODE => {
                 let value: WireOneWord = decode(frame.message_id, p)?;
@@ -4148,6 +4278,7 @@ impl ServerMessage {
                 return Ok((wire_id::UNREGISTER_ACK, p, 0));
             }
             Self::CapabilitiesRequest => wire_id::CAPABILITIES_REQ,
+            Self::EnunciatorCommand => wire_id::ENUNCIATOR_COMMAND,
             Self::ConfigStatus(status) => {
                 if session.uses_dynamic_general_ui() {
                     p = encode_dynamic_config_status(status)?;
@@ -5025,6 +5156,22 @@ impl ServerMessage {
                 )?;
                 wire_id::REGISTER_TOKEN_REJECT
             }
+            Self::SpcpRegisterTokenAck { features } => {
+                p = encode(
+                    wire_id::SPCP_REGISTER_TOKEN_ACK,
+                    &WireOneWord { value: *features },
+                )?;
+                wire_id::SPCP_REGISTER_TOKEN_ACK
+            }
+            Self::SpcpRegisterTokenReject { backoff_seconds } => {
+                p = encode(
+                    wire_id::SPCP_REGISTER_TOKEN_REJECT,
+                    &WireOneWord {
+                        value: *backoff_seconds,
+                    },
+                )?;
+                wire_id::SPCP_REGISTER_TOKEN_REJECT
+            }
             Self::SetRinger {
                 mode,
                 duration,
@@ -5057,6 +5204,7 @@ impl ServerMessage {
                 )?;
                 wire_id::SET_LAMP
             }
+            Self::SetHookFlashDetect => wire_id::SET_HOOK_FLASH_DETECT,
             Self::StartTone {
                 tone,
                 direction,
@@ -5224,6 +5372,20 @@ impl ServerMessage {
                     },
                 )?;
                 wire_id::STOP_MEDIA_TRANSMISSION
+            }
+            Self::StartMediaReception => wire_id::START_MEDIA_RECEPTION,
+            Self::StopMediaReception {
+                conference_id,
+                passthrough_party_id,
+            } => {
+                p = encode(
+                    wire_id::STOP_MEDIA_RECEPTION,
+                    &WireStopMediaReception {
+                        conference_id: conference_id.get(),
+                        passthrough_party_id: passthrough_party_id.get(),
+                    },
+                )?;
+                wire_id::STOP_MEDIA_RECEPTION
             }
             Self::SetSpeakerMode(mode) => {
                 p = encode(

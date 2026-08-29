@@ -3330,6 +3330,9 @@ async fn handle_pre_registration_message(
                 );
             }
         },
+        message @ (ClientMessage::MediaPortList(_) | ClientMessage::SpcpRegisterToken(_)) => {
+            debug!(peer = %context.peer, message = ?message, "pre-registration deferred SCCP message");
+        }
         ClientMessage::KnownOpaque(message) => {
             debug!(peer = %context.peer, message = ?message, "pre-registration deferred SCCP message");
         }
@@ -4939,7 +4942,9 @@ async fn handle_client_message(
                 .await
                 .map_err(|_| ServerError::Stopped)?;
         }
-        message @ (ClientMessage::ExtensionDeviceCapabilities(_)
+        message @ (ClientMessage::MediaPortList(_)
+        | ClientMessage::SpcpRegisterToken(_)
+        | ClientMessage::ExtensionDeviceCapabilities(_)
         | ClientMessage::CreateConferenceResponse(_)
         | ClientMessage::DeleteConferenceResponse { .. }
         | ClientMessage::ModifyConferenceResponse(_)

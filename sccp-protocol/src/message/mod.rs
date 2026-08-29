@@ -221,6 +221,13 @@ pub struct MediaCapability {
     pub codec_parameters: [u8; 8],
 }
 
+pub const MEDIA_PORT_LIST_MAX_PORTS: usize = 16;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaPortList {
+    pub rtp_ports: Vec<u16>,
+}
+
 /// SRTP keying material. Debug output intentionally exposes metadata only.
 #[derive(Clone, Eq, PartialEq)]
 pub struct MediaEncryption {
@@ -535,6 +542,15 @@ pub struct RegisterTokenMessage {
     pub device_type: DeviceType,
     /// Firmware flags whose meaning is not fully documented.
     pub flags: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpcpRegisterTokenMessage {
+    pub device_id: DeviceId,
+    pub device_instance: u32,
+    pub address: Ipv4Addr,
+    pub device_type: DeviceType,
+    pub max_streams: u32,
 }
 
 /// Maximum endpoints carried by one station server-list response.
@@ -1648,6 +1664,9 @@ pub enum ClientMessage {
     /// Reports the station's supported media capabilities.
     /// Answers a server capability request with codec and media details.
     CapabilitiesResponse(Vec<MediaCapability>),
+    /// Reports the RTP ports the station has allocated for media streams.
+    /// Carries up to sixteen port numbers for use by call control.
+    MediaPortList(MediaPortList),
     /// Reports a changed set of station media capabilities.
     /// Lets the server refresh capabilities after initial negotiation.
     CapabilitiesUpdate(CapabilityUpdate),
@@ -1703,6 +1722,9 @@ pub enum ClientMessage {
     /// Requests a registration token before full station registration.
     /// Supplies the station identity used for token admission control.
     RegisterToken(RegisterTokenMessage),
+    /// Requests an SPCP registration token before full station registration.
+    /// Supplies the station identity, address, device type, and stream capacity.
+    SpcpRegisterToken(SpcpRegisterTokenMessage),
     /// Reports a hook-flash action on an analog-style call.
     /// Associates the flash with its line and call context.
     HookFlash {
@@ -1877,6 +1899,9 @@ pub enum ServerMessage {
     /// Requests the station's supported media capabilities.
     /// Prompts a capability response used for media negotiation.
     CapabilitiesRequest,
+    /// Invokes the station's legacy announcement enunciator.
+    /// Applies to the station rather than a particular line or call.
+    EnunciatorCommand,
     /// Supplies the station's provisioned device configuration.
     /// Carries user, service, and device settings needed after registration.
     ConfigStatus(ConfigurationStatus),
@@ -2090,6 +2115,16 @@ pub enum ServerMessage {
     RegisterTokenReject {
         backoff_seconds: u32,
     },
+    /// Accepts an SPCP registration-token request with a feature word.
+    /// Allows the station to continue its SPCP registration sequence.
+    SpcpRegisterTokenAck {
+        features: u32,
+    },
+    /// Rejects an SPCP registration-token request temporarily.
+    /// Supplies the delay before the station should request another token.
+    SpcpRegisterTokenReject {
+        backoff_seconds: u32,
+    },
     /// Sets the station ringer behavior for a call.
     /// Carries mode, duration, line, and call context.
     SetRinger {
@@ -2105,6 +2140,9 @@ pub enum ServerMessage {
         instance: u32,
         mode: LampMode,
     },
+    /// Enables hook-flash detection on stations that expose that capability.
+    /// Causes subsequent hook-flash actions to be reported to call control.
+    SetHookFlashDetect,
     /// Starts local tone generation on the station.
     /// Selects the tone, direction, line, and call context.
     StartTone {
@@ -2183,6 +2221,15 @@ pub enum ServerMessage {
     /// Stops a station audio transmit stream.
     /// Identifies the conference, party, and call owning the stream.
     StopMediaTransmission(AudioStreamControl),
+    /// Starts the station's legacy receive-side media function.
+    /// Carries no stream identity, endpoint, or codec parameters.
+    StartMediaReception,
+    /// Stops a legacy media-reception path for one conference party.
+    /// Identifies the active reception by conference and passthrough party.
+    StopMediaReception {
+        conference_id: ConferenceId,
+        passthrough_party_id: crate::types::PassthroughPartyId,
+    },
     /// Requests subscription to an RTP DTMF payload.
     /// Carries the payload and transaction identity to subscribe.
     SubscribeDtmfPayloadRequest(DtmfPayloadRequest),
@@ -3628,44 +3675,124 @@ mod tests {
     }
 
     #[test]
-    fn opaque_and_unknown_messages_are_byte_lossless() {
-        let known_payload = vec![0, 1, 2, 0xff, 4];
-        for id in [
-            MessageId::MediaPortList,
-            MessageId::SpcpRegisterTokenRequest,
-        ] {
-            let known = ClientMessage::decode_with_version(
-                Frame::new(19, id.wire_value(), known_payload.clone()),
+    fn supplemental_client_messages_have_typed_layouts() {
+        let ports = ClientMessage::MediaPortList(MediaPortList {
+            rtp_ports: vec![16_000, 16_002],
+        });
+        let frame = decode_frame(&ports.encode(ProtocolVersion::V22).unwrap());
+        assert_eq!(frame.message_id, wire_id::MEDIA_PORT_LIST);
+        assert_eq!(frame.payload.len(), 68);
+        assert_eq!(
+            &frame.payload[..12],
+            &[2, 0, 0, 0, 0x80, 0x3e, 0, 0, 0x82, 0x3e, 0, 0]
+        );
+        assert_eq!(
+            ClientMessage::decode_with_version(frame, ProtocolVersion::V22).unwrap(),
+            ports
+        );
+
+        let token = ClientMessage::SpcpRegisterToken(SpcpRegisterTokenMessage {
+            device_id: DeviceId::new("SEP001122334455").unwrap(),
+            device_instance: 2,
+            address: Ipv4Addr::new(192, 0, 2, 10),
+            device_type: DeviceType::Cisco7962,
+            max_streams: 0x0102_0304,
+        });
+        let frame = decode_frame(&token.encode(ProtocolVersion::V22).unwrap());
+        assert_eq!(frame.message_id, wire_id::SPCP_REGISTER_TOKEN_REQ);
+        assert_eq!(frame.payload.len(), 36);
+        assert_eq!(&frame.payload[16..20], &[0; 4]);
+        assert_eq!(&frame.payload[24..28], &[10, 2, 0, 192]);
+        assert_eq!(&frame.payload[32..36], &[4, 3, 2, 1]);
+        assert_eq!(
+            ClientMessage::decode_with_version(frame, ProtocolVersion::V22).unwrap(),
+            token
+        );
+
+        let oversized = ClientMessage::MediaPortList(MediaPortList {
+            rtp_ports: vec![16_000; MEDIA_PORT_LIST_MAX_PORTS + 1],
+        });
+        assert!(matches!(
+            oversized.encode(ProtocolVersion::V22),
+            Err(CodecError::CountTooLarge { .. })
+        ));
+
+        let mut invalid_port = vec![0; 68];
+        invalid_port[..4].copy_from_slice(&1_u32.to_le_bytes());
+        invalid_port[4..8].copy_from_slice(&65_536_u32.to_le_bytes());
+        assert!(matches!(
+            ClientMessage::decode_with_version(
+                Frame::new(22, wire_id::MEDIA_PORT_LIST, invalid_port),
                 ProtocolVersion::V22,
-            )
-            .unwrap();
-            assert!(matches!(known, ClientMessage::KnownOpaque(_)));
-            let known_frame = decode_frame(&known.encode(ProtocolVersion::V22).unwrap());
-            assert_eq!(known_frame.protocol_version, 19);
-            assert_eq!(known_frame.message_id, id.wire_value());
-            assert_eq!(known_frame.payload, known_payload);
+            ),
+            Err(CodecError::InvalidValue {
+                field: "RTP port",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn supplemental_server_messages_have_typed_layouts() {
+        for (message, id, payload) in [
+            (
+                ServerMessage::SetHookFlashDetect,
+                wire_id::SET_HOOK_FLASH_DETECT,
+                vec![],
+            ),
+            (
+                ServerMessage::StartMediaReception,
+                wire_id::START_MEDIA_RECEPTION,
+                vec![],
+            ),
+            (
+                ServerMessage::StopMediaReception {
+                    conference_id: 0x0102_0304.into(),
+                    passthrough_party_id: 0x0506_0708.into(),
+                },
+                wire_id::STOP_MEDIA_RECEPTION,
+                vec![4, 3, 2, 1, 8, 7, 6, 5],
+            ),
+            (
+                ServerMessage::EnunciatorCommand,
+                wire_id::ENUNCIATOR_COMMAND,
+                vec![],
+            ),
+            (
+                ServerMessage::SpcpRegisterTokenAck {
+                    features: 0x0102_0304,
+                },
+                wire_id::SPCP_REGISTER_TOKEN_ACK,
+                vec![4, 3, 2, 1],
+            ),
+            (
+                ServerMessage::SpcpRegisterTokenReject {
+                    backoff_seconds: 60,
+                },
+                wire_id::SPCP_REGISTER_TOKEN_REJECT,
+                vec![60, 0, 0, 0],
+            ),
+        ] {
+            let frame = decode_frame(&message.encode(ProtocolVersion::V22).unwrap());
+            assert_eq!(frame.message_id, id);
+            assert_eq!(frame.payload, payload);
+            assert_eq!(
+                ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+                message
+            );
         }
 
-        for id in [
-            MessageId::SetHookFlashDetect,
-            MessageId::StartMediaReception,
-            MessageId::StopMediaReception,
-            MessageId::EnunciatorCommand,
-            MessageId::SpcpRegisterTokenAck,
-            MessageId::SpcpRegisterTokenReject,
-        ] {
-            let known = ServerMessage::decode(
-                Frame::new(19, id.wire_value(), known_payload.clone()),
+        assert!(
+            ServerMessage::decode(
+                Frame::new(22, wire_id::SET_HOOK_FLASH_DETECT, vec![0; 4]),
                 ProtocolVersion::V22,
             )
-            .unwrap();
-            assert!(matches!(known, ServerMessage::KnownOpaque(_)));
-            let known_frame = decode_frame(&known.encode(ProtocolVersion::V22).unwrap());
-            assert_eq!(known_frame.protocol_version, 19);
-            assert_eq!(known_frame.message_id, id.wire_value());
-            assert_eq!(known_frame.payload, known_payload);
-        }
+            .is_err()
+        );
+    }
 
+    #[test]
+    fn unknown_messages_are_byte_lossless() {
         let unknown_payload = vec![9, 8, 7, 6];
         let unknown = ServerMessage::decode(
             Frame::new(19, 0xdead_beef, unknown_payload.clone()),
@@ -3677,21 +3804,6 @@ mod tests {
         assert_eq!(unknown_frame.message_id, 0xdead_beef);
         assert_eq!(unknown_frame.protocol_version, 19);
         assert_eq!(unknown_frame.payload, unknown_payload);
-    }
-
-    #[test]
-    fn preserve_only_payloads_obey_the_frame_bound() {
-        let error = ClientMessage::decode_with_version(
-            Frame::new(
-                ProtocolVersion::V22.wire(),
-                MessageId::MediaPortList.wire_value(),
-                vec![0; MAX_OPAQUE_MESSAGE_BYTES + 1],
-            ),
-            ProtocolVersion::V22,
-        )
-        .unwrap_err();
-
-        assert_eq!(error, CodecError::FrameTooLarge(wire::MAX_FRAME_SIZE + 1));
     }
 
     #[test]

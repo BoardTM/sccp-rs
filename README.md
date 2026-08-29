@@ -63,7 +63,7 @@ in progress
 
 | Area | Implemented | Not implemented / out of scope |
 | --- | --- | --- |
-| Wire protocol | Checked framing and typed codecs for the SCCP/SPCP catalog; unknown payloads are bounded and preserved | Typed codecs for `MediaPortList`, `SetHookFlashDetect`, `Start/StopMediaReception`, `EnunciatorCommand`, and the three `SpcpRegisterToken*` messages |
+| Wire protocol | Checked framing and typed codecs for the SCCP/SPCP catalog; unknown payloads are bounded and preserved | — |
 | Station sessions | Async TCP server, injected clear/TLS streams, registration, keepalives, token fallback, failover advertisement, and live reconfiguration | Built-in TLS certificate/listener management and network ACLs |
 | Phone UI and services | Lines, buttons, soft keys, lamps, tones, prompts, MWI/BLF, call state, provisioning models, and typed Cisco IP Phone XML | TFTP/HTTP boot server, firmware distribution, and arbitrary proprietary XML schemas |
 | Media signaling | Audio and video channel control, DTMF, multicast, statistics, announcements, conferencing, and QoS/RSVP messages | RTP transport, codecs/transcoding, recording, and conference mixing |
