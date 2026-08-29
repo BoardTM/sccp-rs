@@ -659,63 +659,93 @@ impl DeviceEvent {
 /// correlation against the current request generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeviceEventKind {
+    /// Reports a station that completed registration and session initialization.
+    /// Carries the accepted device definition, peer details, and negotiated state.
     Registered(DeviceRegistration),
+    /// Reports that the station session ended or was replaced by a newer session.
+    /// Consumers should retire state associated with this event's generation.
     Disconnected {},
+    /// Replaces the station's advertised audio and multimedia capabilities.
+    /// The snapshot is scoped to the connection generation that reported it.
     Capabilities {
         capabilities: StationMediaCapabilities,
     },
+    /// Reports that the handset went off hook on a resolved line and call.
+    /// The server has already allocated or selected the addressable call identity.
     OffHook {
         call_id: CallId,
         line_instance: LineInstance,
     },
+    /// Reports that the handset went on hook for a resolved line and call.
+    /// Integrations can use it to request hangup or complete hook-driven actions.
     OnHook {
         call_id: CallId,
         line_instance: LineInstance,
     },
+    /// Reports one keypad digit associated with an addressable handset call.
+    /// The digit is decoded but no dialing or in-call policy is applied here.
     Digit {
         call_id: CallId,
         digit: Digit,
     },
+    /// Reports a complete en-bloc number submitted for a newly allocated call.
+    /// The line and server-owned call identity are resolved before emission.
     EnblocCall {
         call_id: CallId,
         line_instance: LineInstance,
         number: String,
     },
+    /// Reports activation of a configured speed dial on a resolved call and line.
+    /// Indicates whether the configuration permits collecting additional digits.
     SpeedDial {
         call_id: CallId,
         line_instance: LineInstance,
         number: String,
         await_further_digits: bool,
     },
+    /// Reports a decoded soft-key press with its resolved station context.
+    /// Call identity is present only when the selected key is call-scoped.
     SoftKey {
         /// Active call when the key is call-scoped.
         call_id: Option<CallId>,
         line_instance: LineInstance,
         soft_key: SoftKey,
     },
+    /// Reports a physical line-button press and any call selected on that line.
+    /// The line is always resolved even when no addressable call is active.
     LineButton {
         line_instance: LineInstance,
         call_id: Option<CallId>,
     },
+    /// Reports a handset hook-flash gesture on the resolved line context.
+    /// Call identity is included when the gesture belongs to an active call.
     HookFlash {
         call_id: Option<CallId>,
         line_instance: LineInstance,
     },
+    /// Reports activation of a configured generic feature button.
+    /// The instance identifies the exact feature definition on the station.
     FeatureButton {
         instance: LineInstance,
     },
+    /// Reports activation of a configured do-not-disturb feature button.
+    /// The instance identifies which station feature definition was pressed.
     DoNotDisturbButton {
         instance: LineInstance,
     },
+    /// Reports activation of a configured mobility feature button.
+    /// The instance identifies the owner of any temporary mobility appearance.
     MobilityButton {
         instance: LineInstance,
     },
-    /// Press of a configured voicemail button, resolved to an exact line and
-    /// addressable handset call before application dispatch.
+    /// Reports a configured voicemail-button press on an exact line and call.
+    /// The server allocates or resolves the addressable call before emission.
     VoicemailButton {
         call_id: CallId,
         line_instance: LineInstance,
     },
+    /// Reports activation of a configured parking-lot feature button.
+    /// Includes its feature instance, line context, and active call when present.
     ParkingLotButton {
         /// Feature-button instance, distinct from the call line instance.
         instance: LineInstance,
@@ -723,28 +753,39 @@ pub enum DeviceEventKind {
         call_id: Option<CallId>,
         line_instance: LineInstance,
     },
+    /// Reports a parking slot selected from the station parking menu.
+    /// Carries the configured lot identity and numeric slot chosen by the user.
     ParkingMenuSelection {
         lot: String,
         slot: u32,
     },
+    /// Reports a correlated response submitted by a station phone service.
+    /// The typed response retains application routing and submitted form values.
     PhoneServiceResponse {
         response: PhoneServiceEvent,
     },
+    /// Reports an action selected from a station conference service document.
+    /// The typed action identifies its conference, participant, and operation.
     ConferenceListAction {
         action: ConferenceListAction,
     },
-    /// The receive-channel acknowledgement matched the current request.
+    /// Reports that the current audio receive request was acknowledged.
+    /// Carries the correlated call, media status, and allocated station endpoint.
     ReceiveChannelOpened {
         call_id: CallId,
         status: MediaStatus,
         endpoint: MediaEndpoint,
     },
+    /// Reports that the current multimedia receive channel opened successfully.
+    /// Carries the correlated call, codec, endpoint, and passthrough identity.
     MultimediaReceiveChannelOpened {
         call_id: CallId,
         codec: Codec,
         endpoint: MediaEndpointAddress,
         passthrough_party_id: PassthroughPartyId,
     },
+    /// Reports a negative acknowledgement for the current multimedia receive request.
+    /// Carries the failed endpoint, codec, status, and correlated passthrough identity.
     MultimediaReceiveChannelFailed {
         call_id: CallId,
         codec: Codec,
@@ -752,17 +793,23 @@ pub enum DeviceEventKind {
         endpoint: MediaEndpointAddress,
         passthrough_party_id: PassthroughPartyId,
     },
+    /// Reports expiry of the current multimedia receive acknowledgement deadline.
+    /// Carries the call, codec, and passthrough identity of the retired request.
     MultimediaReceiveChannelTimedOut {
         call_id: CallId,
         codec: Codec,
         passthrough_party_id: PassthroughPartyId,
     },
+    /// Reports that the current multimedia transmit request started successfully.
+    /// Carries the correlated call, codec, endpoint, and passthrough identity.
     MultimediaTransmitStarted {
         call_id: CallId,
         codec: Codec,
         endpoint: MediaEndpointAddress,
         passthrough_party_id: PassthroughPartyId,
     },
+    /// Reports a negative acknowledgement for the current multimedia transmit request.
+    /// Carries the failed endpoint, codec, status, and correlated passthrough identity.
     MultimediaTransmitFailed {
         call_id: CallId,
         codec: Codec,
@@ -770,57 +817,68 @@ pub enum DeviceEventKind {
         endpoint: MediaEndpointAddress,
         passthrough_party_id: PassthroughPartyId,
     },
+    /// Reports expiry of the current multimedia transmit acknowledgement deadline.
+    /// Carries the call, codec, and passthrough identity of the retired request.
     MultimediaTransmitTimedOut {
         call_id: CallId,
         codec: Codec,
         passthrough_party_id: PassthroughPartyId,
     },
-    /// The transmit half of a coupled outbound media transaction became open
-    /// when the station acknowledged the matching receive request.
-    ///
-    /// The adjacent StartMediaTransmission request may omit its separate
-    /// acknowledgement. This event is
-    /// deliberately distinct from [`DeviceEventKind::TransmitChannelStarted`]: callers
-    /// can preserve the acknowledgement relationship while settling
-    /// both halves of the one coupled transaction exactly once.
+    /// Reports transmit success implied by a coupled receive acknowledgement.
+    /// Lets callers settle both outbound media halves once without a second ACK.
     TransmitChannelImplied {
         call_id: CallId,
         endpoint: MediaEndpoint,
     },
-    /// The transmit-channel acknowledgement matched the current request.
+    /// Reports that the current audio transmit request was acknowledged directly.
+    /// Carries the correlated call, media status, and destination endpoint.
     TransmitChannelStarted {
         call_id: CallId,
         status: MediaStatus,
         endpoint: MediaEndpoint,
     },
+    /// Reports expiry of an audio receive or transmit acknowledgement deadline.
+    /// Identifies the correlated call and the acknowledgement type that expired.
     HandsetAcknowledgementTimedOut {
         call_id: CallId,
         acknowledgement: HandsetAcknowledgement,
     },
+    /// Reports a station-declared failure of an active audio transmission.
+    /// Carries the correlated call, media status, and failed remote endpoint.
     MediaTransmissionFailed {
         call_id: CallId,
         status: MediaStatus,
         endpoint: MediaEndpoint,
     },
+    /// Reports that the current multicast receive request started successfully.
+    /// Carries the exact conference, call, and admitted multicast route.
     MulticastReceptionStarted {
         conference_id: ConferenceId,
         call_id: CallId,
         route: MulticastMediaRoute,
     },
+    /// Reports a negative acknowledgement for the current multicast receive request.
+    /// Carries the exact conference, call, and station-reported failure status.
     MulticastReceptionFailed {
         conference_id: ConferenceId,
         call_id: CallId,
         status: MediaStatus,
     },
+    /// Reports expiry of the current multicast receive acknowledgement deadline.
+    /// Identifies the exact conference and call whose request was retired.
     MulticastReceptionTimedOut {
         conference_id: ConferenceId,
         call_id: CallId,
     },
+    /// Reports that multicast transmission began for the requested route.
+    /// Carries the exact conference, call, and admitted multicast destination.
     MulticastTransmissionStarted {
         conference_id: ConferenceId,
         call_id: CallId,
         route: MulticastMediaRoute,
     },
+    /// Reports a station-declared failure of multicast audio transmission.
+    /// Carries the conference, call, status, and failed multicast endpoint.
     MulticastTransmissionFailed {
         conference_id: ConferenceId,
         call_id: CallId,
@@ -828,29 +886,41 @@ pub enum DeviceEventKind {
         address: IpAddr,
         port: u16,
     },
-    /// A requested statistics response was correlated and retained.
+    /// Reports a correlated media-statistics response retained by the server.
+    /// Carries the complete snapshot for the exact call and media generation.
     ConnectionStatisticsCollected {
         snapshot: MediaStatisticsSnapshot,
     },
+    /// Reports a decoded fixed-layout station alarm and optional parameters.
+    /// Carries the station-provided severity and bounded human-readable text.
     Alarm {
         severity: AlarmSeverity,
         text: String,
         parameters: Option<[u32; 2]>,
     },
+    /// Reports a typed alarm decoded from a station XML telemetry document.
+    /// The parsed telemetry exposes only the validated alarm schema and values.
     XmlAlarm {
         telemetry: PhoneAlarmTelemetry,
     },
+    /// Reports typed station location data decoded from an XML document.
+    /// The telemetry retains validated address and location fields in wire order.
     LocationInformation {
         telemetry: PhoneLocationTelemetry,
     },
+    /// Reports that the station headset-enabled state changed.
+    /// Carries the newly reported boolean state for integration-side handling.
     HeadsetStatusChanged {
         enabled: bool,
     },
+    /// Reports a state transition on a station media path or accessory.
+    /// Carries the typed path identity and the event reported for that path.
     MediaPathChanged {
         path: crate::message::values::MediaPathId,
         event: crate::message::values::MediaPathEvent,
     },
-    /// A well-framed client message has no server-side behavior yet.
+    /// Reports a valid client message with no implemented server-side behavior.
+    /// Preserves the decoded message so integrations can observe or log it.
     UnhandledMessage {
         message: ClientMessage,
     },
@@ -892,112 +962,148 @@ impl Command {
 /// that identity so a late acknowledgement cannot settle replacement media.
 #[derive(Clone, Debug)]
 pub enum CommandAction {
-    /// Create local station state and off-hook presentation for an outbound
-    /// call whose adapter-side identity is already allocated.
+    /// Creates an outbound call in the station session and makes it active.
+    /// Presents the line off hook using the supplied codec and call identity.
     BeginCall {
         line_instance: LineInstance,
         call_id: CallId,
         codec: Codec,
     },
-    /// Put a held source call into transfer mode and create its consultation
-    /// call as the active off-hook presentation.
+    /// Moves a held call into transfer mode and creates a consultation call.
+    /// Makes the consultation call active with transfer-specific station UI.
     BeginTransfer {
         source_call_id: CallId,
         consultation_line_instance: LineInstance,
         consultation_call_id: CallId,
         codec: Codec,
     },
+    /// Replaces the calling and called-party information shown for a call.
+    /// Also updates the directory number used for later media statistics.
     SetCallInfo {
         call_id: CallId,
         info: CallInfo,
     },
+    /// Commits collected outbound digits and advances the call to proceeding.
+    /// Updates call information, dialed-number history, lamps, and station UI.
     CommitOutboundCall {
         call_id: CallId,
         info: CallInfo,
     },
+    /// Presents an outbound call as accepted and currently proceeding.
+    /// Stops dial tone and refreshes call information and the station prompt.
     PresentOutboundProceeding {
         call_id: CallId,
         info: CallInfo,
     },
+    /// Presents remote alerting for an outbound call on the station.
+    /// Updates call information, prompt, soft keys, and local ringback tone.
     PresentOutboundRinging {
         call_id: CallId,
         info: CallInfo,
     },
+    /// Changes the protocol-visible state of an existing station call.
+    /// Reconciles active-call ownership, history, lamps, prompts, and soft keys.
     SetCallState {
         call_id: CallId,
         state: CallState,
     },
+    /// Marks or unmarks a call in the station's selected-call set.
+    /// Emits the selection status for the call's current wire reference.
     SetCallSelected {
         call_id: CallId,
         selected: bool,
     },
+    /// Displays call-scoped prompt text for an optional number of seconds.
+    /// Resolves the server call identity to the station line and wire call.
     DisplayPrompt {
         call_id: CallId,
         timeout_seconds: u32,
         text: String,
     },
+    /// Clears the prompt currently associated with a station call.
+    /// Targets the call's resolved line instance and current wire reference.
     ClearPrompt {
         call_id: CallId,
     },
+    /// Replaces the station's persistent status notification and beep policy.
+    /// Selects the appropriate static or dynamic display frames for the phone.
     SetStatusMessage {
         message: HandsetStatusMessage,
         beep: bool,
     },
+    /// Enables or disables the station microphone outside a media renegotiation.
+    /// Sends the handset microphone-mode command in command-queue order.
     SetMicrophoneMode {
         enabled: bool,
     },
+    /// Shows or clears the recording indicator for a particular call.
+    /// Resolves the call before emitting the station recording-status frame.
     SetRecordingStatus {
         call_id: CallId,
         active: bool,
     },
+    /// Requests that the station reset using the selected reset behavior.
+    /// The reset type controls whether the device restarts or resets its state.
     ResetDevice {
         reset_type: ResetType,
     },
+    /// Sets the message-waiting state for one configured line appearance.
+    /// Caches the state and updates the corresponding station lamp immediately.
     SetMwi {
         line_instance: LineInstance,
         enabled: bool,
     },
-    /// Replace all three forwarding destinations displayed for a line.
-    ///
-    /// `None` clears that forwarding kind; the server retains the complete
-    /// triple for subsequent station queries.
+    /// Replaces all three forwarding destinations retained for one line.
+    /// A missing destination clears that forwarding kind and its display.
     SetForwardStatus {
         line_instance: LineInstance,
         forward_all: Option<String>,
         forward_busy: Option<String>,
         forward_no_answer: Option<String>,
     },
+    /// Sets the enabled state of a configured generic feature button.
+    /// Caches and emits the station-specific feature projection when present.
     SetFeatureStatus {
         instance: LineInstance,
         enabled: bool,
     },
+    /// Updates a configured do-not-disturb button and its current mode.
+    /// Projects the configured button behavior into the station UI and cache.
     SetDoNotDisturbStatus {
         instance: LineInstance,
         mode: DoNotDisturbMode,
         button_mode: DoNotDisturbButtonMode,
     },
-    /// Install or remove the temporary line appearance owned by a mobility
-    /// button, rebuilding the station button template atomically.
+    /// Installs or removes the temporary line owned by a mobility button.
+    /// Rebuilds the button template and line status as one validated change.
     SetMobilityAppearance {
         mobility_instance: LineInstance,
         appearance: Option<LineAppearance>,
     },
+    /// Updates a configured busy-lamp-field button and optional caller details.
+    /// Refreshes its cached feature state and any hinted-ringing notification.
     SetBlfStatus {
         instance: LineInstance,
         state: BlfState,
         caller: Option<BlfCallerInfo>,
     },
+    /// Displays a parking-lot menu containing the supplied parked calls.
+    /// Records its transaction so a later station selection can be correlated.
     ShowParkingMenu {
         instance: LineInstance,
         transaction_id: TransactionId,
         lot: String,
         calls: Vec<ParkingMenuEntry>,
     },
+    /// Displays the participant list for a conference attached to a call.
+    /// Selects the phone-compatible menu family and sends its service document.
     ShowConferenceList {
         call_id: CallId,
         conference_id: ConferenceId,
         participants: Vec<ConferenceListEntry>,
     },
+    /// Displays the allowed actions for one conference participant.
+    /// Builds removal and demotion choices for the target call and phone family.
     ShowConferenceParticipantActions {
         call_id: CallId,
         conference_id: ConferenceId,
@@ -1005,6 +1111,8 @@ pub enum CommandAction {
         removable: bool,
         demotable: bool,
     },
+    /// Displays a text-service document in the requested application envelope.
+    /// Segments and encodes it according to the negotiated station protocol.
     ShowTextService {
         line_instance: LineInstance,
         call_reference: CallReference,
@@ -1012,8 +1120,8 @@ pub enum CommandAction {
         priority: PhoneServicePriority,
         document: CiscoIpPhoneText,
     },
-    /// Send an input-service form whose response is emitted as
-    /// [`DeviceEventKind::PhoneServiceResponse`].
+    /// Displays an input form and establishes its response correlation fields.
+    /// A submitted form returns as a phone-service response device event.
     ShowInputService {
         line_instance: LineInstance,
         call_reference: CallReference,
@@ -1022,6 +1130,8 @@ pub enum CommandAction {
         priority: PhoneServicePriority,
         document: CiscoIpPhoneInput,
     },
+    /// Sends a document instructing the station to execute phone actions.
+    /// Preserves application routing, transaction identity, and display priority.
     ExecutePhoneActions {
         line_instance: LineInstance,
         call_reference: CallReference,
@@ -1030,6 +1140,8 @@ pub enum CommandAction {
         priority: PhoneServicePriority,
         document: CiscoIpPhoneExecute,
     },
+    /// Displays an image-service document using the target application envelope.
+    /// Encodes and segments the image for the negotiated station protocol.
     ShowImageService {
         line_instance: LineInstance,
         call_reference: CallReference,
@@ -1038,6 +1150,8 @@ pub enum CommandAction {
         priority: PhoneServicePriority,
         document: PhoneImageDocument,
     },
+    /// Displays a status-service document with its application routing fields.
+    /// Encodes and segments status content for the negotiated station protocol.
     ShowStatusService {
         line_instance: LineInstance,
         call_reference: CallReference,
@@ -1046,24 +1160,32 @@ pub enum CommandAction {
         priority: PhoneServicePriority,
         document: PhoneStatusDocument,
     },
+    /// Applies a background image described by the supplied control document.
+    /// Sends the request with the provided service transaction identity.
     SetBackgroundImage {
         transaction_id: TransactionId,
         document: CiscoIpPhoneSetBackground,
     },
+    /// Previews a background image without selecting it as the active image.
+    /// Sends the preview control document under the supplied transaction.
     PreviewBackgroundImage {
         transaction_id: TransactionId,
         document: CiscoIpPhoneSetBackgroundPreview,
     },
+    /// Selects the station ringtone described by the supplied control document.
+    /// Sends the ringtone operation under the provided service transaction.
     SetRingtone {
         transaction_id: TransactionId,
         document: CiscoIpPhoneSetRingTone,
     },
+    /// Starts a user-direction tone for a call, or stops tone for `Silence`.
+    /// Resolves the call to its current station line and wire reference.
     StartTone {
         call_id: CallId,
         tone: Tone,
     },
-    /// Start one or more conference announcements with an explicit participant
-    /// hearing mask and playback mode.
+    /// Carries a service-node request to start conference announcements.
+    /// Station sessions reject it because announcement routing is not station-local.
     StartAnnouncement {
         conference_id: ConferenceId,
         announcements: Vec<AnnouncementEntry>,
@@ -1075,21 +1197,29 @@ pub enum CommandAction {
         /// Protocol playback-mode value retained for station interpretation.
         play_mode: u32,
     },
+    /// Carries a service-node request to stop conference announcements.
+    /// Station sessions reject it because announcement routing is not station-local.
     StopAnnouncement {
         conference_id: ConferenceId,
     },
+    /// Carries a conference announcement completion and playback result.
+    /// Station sessions reject it because completion belongs to the service node.
     AnnouncementFinish {
         conference_id: ConferenceId,
         play_status: u32,
     },
+    /// Starts audible ringing and the associated line indication for a call.
+    /// Resolves the call to its current station line and wire reference.
     StartRinging {
         call_id: CallId,
     },
+    /// Stops audible ringing and clears the associated call indication.
+    /// Leaves the call itself intact for a following state transition or close.
     StopRinging {
         call_id: CallId,
     },
-    /// Ask the station to allocate its receive channel and begin a correlated
-    /// media transaction.
+    /// Allocates the station's audio receive channel for a correlated request.
+    /// Applies codec, packetization, DTMF, source, and processing constraints.
     OpenReceiveChannel {
         call_id: CallId,
         /// Optional RTP source restriction. `None` accepts media from any
@@ -1101,46 +1231,51 @@ pub enum CommandAction {
         dtmf_mode: DtmfMode,
         audio_processing: AudioProcessingPolicy,
     },
-    /// Requires a connected call and an exact advertised receive capability;
-    /// replacing a live generation writes its close first.
+    /// Opens a video receive channel matching an advertised station capability.
+    /// Replacing an existing generation closes and retires that generation first.
     OpenMultimediaReceiveChannel {
         call_id: CallId,
         descriptor: MultimediaReceiveDescriptor,
     },
+    /// Closes the active multimedia receive channel for a call.
+    /// Retires its request identity so late acknowledgements cannot settle it.
     CloseMultimediaReceiveChannel {
         call_id: CallId,
     },
-    /// Requires a connected call and an exact advertised transmit capability;
-    /// replacing a live generation writes its stop first.
+    /// Starts station video transmission using an advertised transmit capability.
+    /// Replacing an existing generation stops and retires that generation first.
     StartMultimediaTransmission {
         call_id: CallId,
         descriptor: MultimediaTransmitDescriptor,
     },
+    /// Stops the active multimedia transmission for a call.
+    /// Retires its request identity so late acknowledgements cannot settle it.
     StopMultimediaTransmission {
         call_id: CallId,
     },
-    /// Limits the exact live station video encoder identified by its current
-    /// passthrough token.
+    /// Sets the maximum bit rate of an exact live station video encoder.
+    /// Requires the current passthrough token to reject stale stream controls.
     SetMultimediaTransmitBitRate {
         call_id: CallId,
         passthrough_party_id: PassthroughPartyId,
         maximum_bit_rate: u32,
     },
-    /// Reports a bit-rate change for the exact live station video encoder.
+    /// Notifies the exact live station video encoder of a bit-rate change.
+    /// Requires the current passthrough token to reject stale notifications.
     NotifyMultimediaTransmitBitRate {
         call_id: CallId,
         passthrough_party_id: PassthroughPartyId,
         maximum_bit_rate: u32,
     },
-    /// Applies typed feedback to the exact live station video encoder.
+    /// Applies typed flow, picture, or display feedback to a video encoder.
+    /// Requires the current passthrough token to target the exact live stream.
     ControlMultimediaTransmission {
         call_id: CallId,
         passthrough_party_id: PassthroughPartyId,
         control: MultimediaTransmitControl,
     },
-    /// Open both directions of an outbound media path in one session-writer
-    /// transaction. The two SCCP frames are written ORC then SMT without a
-    /// command-queue or acknowledgement boundary between them.
+    /// Opens both audio directions for an outbound call in one writer action.
+    /// Writes receive then transmit setup without an intervening queue boundary.
     OpenOutboundMedia {
         call_id: CallId,
         source: Option<MediaEndpoint>,
@@ -1152,10 +1287,13 @@ pub enum CommandAction {
         audio_processing: AudioProcessingPolicy,
         traffic_class: MediaTrafficClass,
     },
-    /// Close the station receive leg and retire its pending acknowledgement.
+    /// Closes the station's audio receive leg for a call.
+    /// Retires its pending request so a late acknowledgement is ignored.
     CloseReceiveChannel {
         call_id: CallId,
     },
+    /// Starts the station's audio transmit leg toward the supplied endpoint.
+    /// Applies DTMF, processing, and traffic-class policy to the new generation.
     StartMedia {
         call_id: CallId,
         endpoint: MediaEndpoint,
@@ -1163,6 +1301,8 @@ pub enum CommandAction {
         audio_processing: AudioProcessingPolicy,
         traffic_class: MediaTrafficClass,
     },
+    /// Starts station reception of an admitted multicast audio route.
+    /// Correlates the route with the call and requested audio processing policy.
     StartMulticastReception {
         conference_id: ConferenceId,
         call_id: CallId,
@@ -1170,10 +1310,14 @@ pub enum CommandAction {
         echo_cancellation: EchoCancellation,
         g723_bitrate: G723BitRate,
     },
+    /// Stops multicast audio reception for the exact call and conference.
+    /// Retires the active receive transaction associated with that route.
     StopMulticastReception {
         conference_id: ConferenceId,
         call_id: CallId,
     },
+    /// Starts station transmission onto an admitted multicast audio route.
+    /// Applies precedence, silence, packetization, and G.723 rate parameters.
     StartMulticastTransmission {
         conference_id: ConferenceId,
         call_id: CallId,
@@ -1183,19 +1327,24 @@ pub enum CommandAction {
         max_frames_per_packet: u32,
         g723_bitrate: G723BitRate,
     },
+    /// Stops multicast audio transmission for the exact call and conference.
+    /// Retires the active transmit transaction associated with that route.
     StopMulticastTransmission {
         conference_id: ConferenceId,
         call_id: CallId,
     },
-    /// Stop the station transmit leg and retire its pending acknowledgement.
+    /// Stops the station's audio transmit leg for a call.
+    /// Retires its pending request so a late acknowledgement is ignored.
     StopMedia {
         call_id: CallId,
     },
-    /// Tear down station media and presentation, request final statistics when
-    /// applicable, and retire the call identity.
+    /// Tears down all station media and presentation for a call.
+    /// Requests final statistics when applicable and retires the call identity.
     CloseCall {
         call_id: CallId,
     },
+    /// Drains all active media and terminates the target station session.
+    /// Causes the running server to disconnect that device after command handling.
     DisconnectDevice {},
 }
 
