@@ -315,16 +315,17 @@ pub(super) fn encode_dynamic_service_url_status(
         120,
         code_page,
     )?;
-    if protocol >= ProtocolVersion::V19 {
-        push_dynamic_station_text(
+    match protocol.wire() {
+        19.. => push_dynamic_station_text(
             &mut payload,
             wire_id::SERVICE_URL_STAT_DYNAMIC,
             "service extension text",
             extension_text,
             120,
             code_page,
-        )?;
-    }
+        ),
+        _ => Ok(()),
+    }?;
     pad_dynamic_payload(&mut payload);
     Ok(payload)
 }
@@ -342,15 +343,15 @@ pub(super) fn decode_dynamic_service_url_status(
         });
     }
     let header: WireOneWord = decode(wire_id::SERVICE_URL_STAT_DYNAMIC, &payload[..HEADER_SIZE])?;
+    let field_count = match protocol.wire() {
+        19.. => 3,
+        _ => 2,
+    };
     let fields = decode_dynamic_texts(
         wire_id::SERVICE_URL_STAT_DYNAMIC,
         payload,
         HEADER_SIZE,
-        if protocol >= ProtocolVersion::V19 {
-            3
-        } else {
-            2
-        },
+        field_count,
     )?;
     Ok(ServerMessage::ServiceUrlStatus {
         index: header.value,

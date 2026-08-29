@@ -56,6 +56,30 @@ fn decode_connection_statistics_v22_quality(
     Ok(payload[PREFIX_BYTES + 4..needed].to_vec())
 }
 
+fn connection_statistics_from_wire<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    directory_number: WireAlignedText<TEXT_BYTES, ALIGNMENT_BYTES>,
+    call_reference: u32,
+    processing: u32,
+    counters: WireConnectionStatisticsCounters,
+    quality: Vec<u8>,
+    message_id: u32,
+) -> Result<ConnectionStatistics, CodecError> {
+    directory_number.validate(message_id)?;
+    Ok(ConnectionStatistics {
+        directory_number: directory_number.text()?,
+        call_reference,
+        processing: StatisticsProcessing::from(processing),
+        packets_sent: counters.packets_sent,
+        octets_sent: counters.octets_sent,
+        packets_received: counters.packets_received,
+        octets_received: counters.octets_received,
+        packets_lost: counters.packets_lost,
+        jitter_millis: counters.jitter_millis,
+        latency_millis: counters.latency_millis,
+        quality: ConnectionQualityStatistics::new(quality)?,
+    })
+}
+
 pub(super) fn decode_connection_statistics(
     payload: &[u8],
     protocol: u32,
@@ -65,52 +89,36 @@ pub(super) fn decode_connection_statistics(
         22.. => {
             let value: WireConnectionStatisticsV22Prefix = decode_prefix(message_id, payload)?;
             let quality = decode_connection_statistics_v22_quality(payload, message_id)?;
-            Ok(ConnectionStatistics {
-                directory_number: value.directory_number.text()?,
-                call_reference: value.call_reference,
-                processing: StatisticsProcessing::from(u32::from(value.processing)),
-                packets_sent: value.packets_sent,
-                octets_sent: value.octets_sent,
-                packets_received: value.packets_received,
-                octets_received: value.octets_received,
-                packets_lost: value.packets_lost,
-                jitter_millis: value.jitter_millis,
-                latency_millis: value.latency_millis,
-                quality: ConnectionQualityStatistics::new(quality)?,
-            })
+            connection_statistics_from_wire(
+                value.directory_number,
+                value.call_reference,
+                value.processing.to_wire(),
+                value.counters,
+                quality,
+                message_id,
+            )
         }
         19..=21 => {
             let value: WireConnectionStatisticsV19 = decode_zero_padded(message_id, payload)?;
-            validate_zero_payload(&value.alignment, message_id, 3)?;
-            Ok(ConnectionStatistics {
-                directory_number: value.directory_number.text()?,
-                call_reference: value.call_reference,
-                processing: StatisticsProcessing::from(value.processing),
-                packets_sent: value.statistics.packets_sent,
-                octets_sent: value.statistics.octets_sent,
-                packets_received: value.statistics.packets_received,
-                octets_received: value.statistics.octets_received,
-                packets_lost: value.statistics.packets_lost,
-                jitter_millis: value.statistics.jitter_millis,
-                latency_millis: value.statistics.latency_millis,
-                quality: ConnectionQualityStatistics::new(value.quality)?,
-            })
+            connection_statistics_from_wire(
+                value.directory_number,
+                value.call_reference,
+                value.processing.to_wire(),
+                value.statistics.counters,
+                value.quality,
+                message_id,
+            )
         }
         _ => {
             let value: WireConnectionStatisticsV3 = decode_zero_padded(message_id, payload)?;
-            Ok(ConnectionStatistics {
-                directory_number: value.directory_number.text()?,
-                call_reference: value.call_reference,
-                processing: StatisticsProcessing::from(value.processing),
-                packets_sent: value.statistics.packets_sent,
-                octets_sent: value.statistics.octets_sent,
-                packets_received: value.statistics.packets_received,
-                octets_received: value.statistics.octets_received,
-                packets_lost: value.statistics.packets_lost,
-                jitter_millis: value.statistics.jitter_millis,
-                latency_millis: value.statistics.latency_millis,
-                quality: ConnectionQualityStatistics::new(value.quality)?,
-            })
+            connection_statistics_from_wire(
+                value.directory_number,
+                value.call_reference,
+                value.processing.to_wire(),
+                value.statistics.counters,
+                value.quality,
+                message_id,
+            )
         }
     }
 }
@@ -120,52 +128,54 @@ pub(super) fn decode_start_media_ack(
     protocol: u32,
     message_id: u32,
 ) -> Result<MediaTransmissionAck, CodecError> {
-    if protocol >= 17 {
-        let (value, v20_extension) = match payload.len() {
-            40 => (decode::<WireStartMediaAckV17>(message_id, payload)?, None),
-            48 => {
-                let value = decode::<WireStartMediaAckV20>(message_id, payload)?;
-                (value.base, Some(value.extension))
-            }
-            actual => {
-                return Err(if actual < 40 {
-                    CodecError::Truncated {
-                        message_id,
-                        needed: 40,
-                        actual,
-                    }
-                } else {
-                    CodecError::TrailingBytes {
-                        message_id,
-                        count: actual - 40,
-                    }
-                });
-            }
-        };
-        let wire = MediaTransmissionAckWire {
-            extension: v20_extension,
-        };
-        Ok(MediaTransmissionAck {
-            conference_id: value.conference_id,
-            passthrough_party_id: value.passthrough_party_id,
-            call_reference: value.call_reference,
-            status: MediaStatus::from(value.status),
-            address: value.address.to_ip(message_id)?,
-            port: decode_port(value.port, message_id, "RTP port")?,
-            wire: wire.extension.is_some().then_some(wire),
-        })
-    } else {
-        let value: WireStartMediaAckV3 = decode(message_id, payload)?;
-        Ok(MediaTransmissionAck {
-            conference_id: value.conference_id,
-            passthrough_party_id: value.passthrough_party_id,
-            call_reference: value.call_reference,
-            status: MediaStatus::from(value.status),
-            address: IpAddr::V4(Ipv4Addr::from(value.address)),
-            port: decode_port(value.port, message_id, "RTP port")?,
-            wire: None,
-        })
+    match protocol {
+        17.. => {
+            let (value, extension) = match payload.len() {
+                40 => (decode::<WireStartMediaAckV17>(message_id, payload)?, None),
+                48 => {
+                    let value = decode::<WireStartMediaAckV20>(message_id, payload)?;
+                    (value.base, Some(value.extension))
+                }
+                actual => {
+                    return Err(match actual {
+                        0..40 => CodecError::Truncated {
+                            message_id,
+                            needed: 40,
+                            actual,
+                        },
+                        _ => CodecError::TrailingBytes {
+                            message_id,
+                            count: actual - 40,
+                        },
+                    });
+                }
+            };
+            media_transmission_ack_from_wire(value, extension, message_id)
+        }
+        _ => media_transmission_ack_from_wire(
+            decode::<WireStartMediaAckV3>(message_id, payload)?,
+            None,
+            message_id,
+        ),
     }
+}
+
+fn media_transmission_ack_from_wire<Address: WireIpAddress>(
+    value: WireStartMediaAck<Address>,
+    extension: Option<[u8; 8]>,
+    message_id: u32,
+) -> Result<MediaTransmissionAck, CodecError> {
+    Ok(MediaTransmissionAck {
+        conference_id: value.conference_id,
+        passthrough_party_id: value.passthrough_party_id,
+        call_reference: value.call_reference,
+        status: MediaStatus::from(value.status),
+        address: value.address.to_ip(message_id)?,
+        port: decode_port(value.port, message_id, "RTP port")?,
+        wire: extension.map(|extension| MediaTransmissionAckWire {
+            extension: Some(extension),
+        }),
+    })
 }
 
 pub(super) fn decode_user_data(
@@ -182,10 +192,10 @@ pub(super) fn decode_user_data(
         });
     }
     Ok(UserDataMessage {
-        application_id: value.application_id,
-        line_instance: value.line_instance,
-        call_reference: value.call_reference,
-        transaction_id: value.transaction_id,
+        application_id: value.header.application_id,
+        line_instance: value.header.line_instance,
+        call_reference: value.header.call_reference,
+        transaction_id: value.header.transaction_id,
         data: value.data,
     })
 }
@@ -195,24 +205,15 @@ pub(super) fn decode_open_multimedia_ack(
     protocol: u32,
     message_id: u32,
 ) -> Result<OpenMultimediaReceiveChannelAck, CodecError> {
-    let (status, address, port, passthrough_party_id, call_reference) = if protocol >= 17 {
-        let value: WireOpenMultimediaAckFrom17 = decode(message_id, payload)?;
-        (
-            value.status,
-            value.address.to_ip(message_id)?,
-            value.port,
-            value.passthrough_party_id,
-            value.call_reference,
-        )
-    } else {
-        let value: WireOpenMultimediaAckPre17 = decode(message_id, payload)?;
-        (
-            value.status,
-            IpAddr::V4(Ipv4Addr::from(value.address)),
-            value.port,
-            value.passthrough_party_id,
-            value.call_reference,
-        )
+    let (status, address, port, passthrough_party_id, call_reference) = match protocol {
+        17.. => receive_channel_ack_from_wire(
+            decode::<WireOpenMultimediaAckFrom17>(message_id, payload)?,
+            message_id,
+        )?,
+        _ => receive_channel_ack_from_wire(
+            decode::<WireOpenMultimediaAckPre17>(message_id, payload)?,
+            message_id,
+        )?,
     };
     Ok(OpenMultimediaReceiveChannelAck {
         status: MediaStatus::from(status),
@@ -225,12 +226,25 @@ pub(super) fn decode_open_multimedia_ack(
     })
 }
 
+fn receive_channel_ack_from_wire<Address: WireIpAddress>(
+    value: WireReceiveChannelAck<Address>,
+    message_id: u32,
+) -> Result<(u32, IpAddr, u32, u32, u32), CodecError> {
+    Ok((
+        value.status,
+        value.address.to_ip(message_id)?,
+        value.port,
+        value.passthrough_party_id,
+        value.call_reference,
+    ))
+}
+
 pub(super) fn encode_open_multimedia_ack(
     value: OpenMultimediaReceiveChannelAck,
     protocol: ProtocolVersion,
 ) -> Result<Vec<u8>, CodecError> {
-    if protocol.wire() >= 17 {
-        encode(
+    match protocol.wire() {
+        17.. => encode(
             wire_id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
             &WireOpenMultimediaAckFrom17 {
                 status: value.status.wire_value(),
@@ -239,25 +253,21 @@ pub(super) fn encode_open_multimedia_ack(
                 passthrough_party_id: value.passthrough_party_id.get(),
                 call_reference: value.call_reference.get(),
             },
-        )
-    } else {
-        let IpAddr::V4(address) = value.endpoint.address else {
-            return Err(CodecError::InvalidValue {
-                message_id: wire_id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
-                field: "IP address family for this protocol version",
-                value: 1,
-            });
-        };
-        encode(
+        ),
+        _ => encode(
             wire_id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
             &WireOpenMultimediaAckPre17 {
                 status: value.status.wire_value(),
-                address: address.octets(),
+                address: WireIpv4Address::from_ip(
+                    value.endpoint.address,
+                    wire_id::OPEN_MULTIMEDIA_RECEIVE_CHANNEL_ACK,
+                    "IP address family for this protocol version",
+                )?,
                 port: u32::from(value.endpoint.port),
                 passthrough_party_id: value.passthrough_party_id.get(),
                 call_reference: value.call_reference.get(),
             },
-        )
+        ),
     }
 }
 
@@ -266,26 +276,15 @@ pub(super) fn decode_start_multimedia_ack(
     protocol: u32,
     message_id: u32,
 ) -> Result<StartMultimediaTransmissionAck, CodecError> {
-    let (conference_id, party_id, call_reference, address, port, status) = if protocol >= 17 {
-        let value: WireStartMultimediaAckFrom17 = decode(message_id, payload)?;
-        (
-            value.conference_id,
-            value.passthrough_party_id,
-            value.call_reference,
-            value.address.to_ip(message_id)?,
-            value.port,
-            value.status,
-        )
-    } else {
-        let value: WireStartMultimediaAckPre17 = decode(message_id, payload)?;
-        (
-            value.conference_id,
-            value.passthrough_party_id,
-            value.call_reference,
-            IpAddr::V4(Ipv4Addr::from(value.address)),
-            value.port,
-            value.status,
-        )
+    let (conference_id, party_id, call_reference, address, port, status) = match protocol {
+        17.. => start_multimedia_ack_from_wire(
+            decode::<WireStartMultimediaAckFrom17>(message_id, payload)?,
+            message_id,
+        )?,
+        _ => start_multimedia_ack_from_wire(
+            decode::<WireStartMultimediaAckPre17>(message_id, payload)?,
+            message_id,
+        )?,
     };
     Ok(StartMultimediaTransmissionAck {
         conference_id: conference_id.into(),
@@ -299,12 +298,26 @@ pub(super) fn decode_start_multimedia_ack(
     })
 }
 
+fn start_multimedia_ack_from_wire<Address: WireIpAddress>(
+    value: WireStartMediaAck<Address>,
+    message_id: u32,
+) -> Result<(u32, u32, u32, IpAddr, u32, u32), CodecError> {
+    Ok((
+        value.conference_id,
+        value.passthrough_party_id,
+        value.call_reference,
+        value.address.to_ip(message_id)?,
+        value.port,
+        value.status,
+    ))
+}
+
 pub(super) fn encode_start_multimedia_ack(
     value: StartMultimediaTransmissionAck,
     protocol: ProtocolVersion,
 ) -> Result<Vec<u8>, CodecError> {
-    if protocol.wire() >= 17 {
-        encode(
+    match protocol.wire() {
+        17.. => encode(
             wire_id::START_MULTIMEDIA_TRANSMISSION_ACK,
             &WireStartMultimediaAckFrom17 {
                 conference_id: value.conference_id.get(),
@@ -314,26 +327,22 @@ pub(super) fn encode_start_multimedia_ack(
                 port: u32::from(value.endpoint.port),
                 status: value.status.wire_value(),
             },
-        )
-    } else {
-        let IpAddr::V4(address) = value.endpoint.address else {
-            return Err(CodecError::InvalidValue {
-                message_id: wire_id::START_MULTIMEDIA_TRANSMISSION_ACK,
-                field: "IP address family for this protocol version",
-                value: 1,
-            });
-        };
-        encode(
+        ),
+        _ => encode(
             wire_id::START_MULTIMEDIA_TRANSMISSION_ACK,
             &WireStartMultimediaAckPre17 {
                 conference_id: value.conference_id.get(),
                 passthrough_party_id: value.passthrough_party_id.get(),
                 call_reference: value.call_reference.get(),
-                address: address.octets(),
+                address: WireIpv4Address::from_ip(
+                    value.endpoint.address,
+                    wire_id::START_MULTIMEDIA_TRANSMISSION_ACK,
+                    "IP address family for this protocol version",
+                )?,
                 port: u32::from(value.endpoint.port),
                 status: value.status.wire_value(),
             },
-        )
+        ),
     }
 }
 
@@ -342,19 +351,26 @@ pub(super) fn decode_session_transmission(
     protocol: ProtocolVersion,
     message_id: u32,
 ) -> Result<SessionTransmission, CodecError> {
-    if protocol.wire() >= 17 {
-        let value: WireSessionTransmissionFrom17 = decode(message_id, payload)?;
-        Ok(SessionTransmission {
-            remote_address: value.remote_address.to_ip(message_id)?,
-            session_type: value.session_type,
-        })
-    } else {
-        let value: WireSessionTransmissionPre17 = decode(message_id, payload)?;
-        Ok(SessionTransmission {
-            remote_address: IpAddr::V4(Ipv4Addr::from(value.remote_address)),
-            session_type: value.session_type,
-        })
+    match protocol.wire() {
+        17.. => session_transmission_from_wire(
+            decode::<WireSessionTransmissionFrom17>(message_id, payload)?,
+            message_id,
+        ),
+        _ => session_transmission_from_wire(
+            decode::<WireSessionTransmissionPre17>(message_id, payload)?,
+            message_id,
+        ),
     }
+}
+
+fn session_transmission_from_wire<Address: WireIpAddress>(
+    value: WireSessionTransmission<Address>,
+    message_id: u32,
+) -> Result<SessionTransmission, CodecError> {
+    Ok(SessionTransmission {
+        remote_address: value.remote_address.to_ip(message_id)?,
+        session_type: value.session_type,
+    })
 }
 
 pub(super) fn encode_session_transmission(
@@ -362,29 +378,25 @@ pub(super) fn encode_session_transmission(
     protocol: ProtocolVersion,
     message_id: u32,
 ) -> Result<Vec<u8>, CodecError> {
-    if protocol.wire() >= 17 {
-        encode(
+    match protocol.wire() {
+        17.. => encode(
             message_id,
             &WireSessionTransmissionFrom17 {
                 remote_address: WireExtendedAddress::from_ip(value.remote_address),
                 session_type: value.session_type,
             },
-        )
-    } else {
-        let IpAddr::V4(address) = value.remote_address else {
-            return Err(CodecError::InvalidValue {
-                message_id,
-                field: "IP address family for this protocol version",
-                value: 1,
-            });
-        };
-        encode(
+        ),
+        _ => encode(
             message_id,
             &WireSessionTransmissionPre17 {
-                remote_address: address.octets(),
+                remote_address: WireIpv4Address::from_ip(
+                    value.remote_address,
+                    message_id,
+                    "IP address family for this protocol version",
+                )?,
                 session_type: value.session_type,
             },
-        )
+        ),
     }
 }
 
@@ -633,24 +645,15 @@ pub(super) fn decode_open_multimedia(
     match protocol.wire() {
         17.. => {
             let value: WireOpenMultimediaV17 = decode(message_id, payload)?;
-            let common = WireOpenMultimediaV11 {
-                conference_id: value.conference_id,
-                passthrough_party_id: value.passthrough_party_id,
-                compression_type: value.compression_type,
-                line_instance: value.line_instance,
-                call_reference: value.call_reference,
-                payload_type: value.payload_type,
-                conference_creator: value.conference_creator,
-                capability: value.capability,
-                encryption: value.encryption,
-                stream_passthrough_id: value.stream_passthrough_id,
-                associated_stream_id: value.associated_stream_id,
-            };
             open_multimedia_from_common(
-                common,
+                value.base.base,
                 MediaEndpointAddress {
-                    address: value.source_address.to_ip(message_id)?,
-                    port: decode_port(value.source_port, message_id, "multimedia source port")?,
+                    address: value.base.source_address.to_ip(message_id)?,
+                    port: decode_port(
+                        value.base.source_port,
+                        message_id,
+                        "multimedia source port",
+                    )?,
                 },
                 IpAddressType::from(value.requested_address_type),
                 protocol,
@@ -662,7 +665,7 @@ pub(super) fn decode_open_multimedia(
             open_multimedia_from_common(
                 value.base,
                 MediaEndpointAddress {
-                    address: IpAddr::V4(Ipv4Addr::from(value.source_address)),
+                    address: value.source_address.to_ip(message_id)?,
                     port: decode_port(value.source_port, message_id, "multimedia source port")?,
                 },
                 IpAddressType::Ipv4,
@@ -713,39 +716,26 @@ pub(super) fn encode_open_multimedia(
         17.. => encode(
             wire_id::OPEN_MULTIMEDIA_CHANNEL,
             &WireOpenMultimediaV17 {
-                conference_id: common.conference_id,
-                passthrough_party_id: common.passthrough_party_id,
-                compression_type: common.compression_type,
-                line_instance: common.line_instance,
-                call_reference: common.call_reference,
-                payload_type: common.payload_type,
-                conference_creator: common.conference_creator,
-                capability: common.capability,
-                encryption: common.encryption,
-                stream_passthrough_id: common.stream_passthrough_id,
-                associated_stream_id: common.associated_stream_id,
-                source_address: WireExtendedAddress::from_ip(value.source.address),
-                source_port: u32::from(value.source.port),
+                base: WireOpenMultimediaAddressed {
+                    base: common,
+                    source_address: WireExtendedAddress::from_ip(value.source.address),
+                    source_port: u32::from(value.source.port),
+                },
                 requested_address_type: value.requested_address_type.wire_value(),
             },
         ),
-        12..=16 => {
-            let IpAddr::V4(address) = value.source.address else {
-                return Err(CodecError::InvalidValue {
-                    message_id: wire_id::OPEN_MULTIMEDIA_CHANNEL,
-                    field: "IP address family for this protocol version",
-                    value: 1,
-                });
-            };
-            encode(
-                wire_id::OPEN_MULTIMEDIA_CHANNEL,
-                &WireOpenMultimediaV12 {
-                    base: common,
-                    source_address: address.octets(),
-                    source_port: u32::from(value.source.port),
-                },
-            )
-        }
+        12..=16 => encode(
+            wire_id::OPEN_MULTIMEDIA_CHANNEL,
+            &WireOpenMultimediaV12 {
+                base: common,
+                source_address: WireIpv4Address::from_ip(
+                    value.source.address,
+                    wire_id::OPEN_MULTIMEDIA_CHANNEL,
+                    "IP address family for this protocol version",
+                )?,
+                source_port: u32::from(value.source.port),
+            },
+        ),
         _ => encode(wire_id::OPEN_MULTIMEDIA_CHANNEL, &common),
     }
 }
@@ -755,78 +745,74 @@ pub(super) fn decode_start_multimedia(
     protocol: ProtocolVersion,
     message_id: u32,
 ) -> Result<StartMultimediaTransmission, CodecError> {
-    let (
-        conference_id,
-        party_id,
-        compression_type,
-        address,
-        port,
-        call_reference,
-        payload_type,
-        dscp,
-        capability,
-        encryption,
-        stream_passthrough_id,
-        associated_stream_id,
-    ) = if protocol.wire() >= 17 {
-        let value: WireStartMultimediaFrom17 = decode(message_id, payload)?;
-        (
-            value.conference_id,
-            value.passthrough_party_id,
-            value.compression_type,
-            value.remote_address.to_ip(message_id)?,
-            value.remote_port,
-            value.call_reference,
-            value.payload_type,
-            value.dscp,
-            value.capability,
-            value.encryption,
-            value.stream_passthrough_id,
-            value.associated_stream_id,
-        )
-    } else {
-        let value: WireStartMultimediaPre17 = decode(message_id, payload)?;
-        (
-            value.conference_id,
-            value.passthrough_party_id,
-            value.compression_type,
-            IpAddr::V4(Ipv4Addr::from(value.remote_address)),
-            value.remote_port,
-            value.call_reference,
-            value.payload_type,
-            value.dscp,
-            value.capability,
-            value.encryption,
-            value.stream_passthrough_id,
-            value.associated_stream_id,
-        )
-    };
+    match protocol.wire() {
+        17.. => start_multimedia_from_wire(
+            decode::<WireStartMultimediaFrom17>(message_id, payload)?,
+            protocol,
+            message_id,
+        ),
+        _ => start_multimedia_from_wire(
+            decode::<WireStartMultimediaPre17>(message_id, payload)?,
+            protocol,
+            message_id,
+        ),
+    }
+}
+
+fn start_multimedia_from_wire<Address: WireIpAddress>(
+    value: WireStartMultimedia<Address>,
+    protocol: ProtocolVersion,
+    message_id: u32,
+) -> Result<StartMultimediaTransmission, CodecError> {
     Ok(StartMultimediaTransmission {
-        conference_id: conference_id.into(),
-        passthrough_party_id: party_id.into(),
+        conference_id: value.conference_id.into(),
+        passthrough_party_id: value.passthrough_party_id.into(),
         endpoint: MediaEndpointAddress {
-            address,
-            port: decode_port(port, message_id, "multimedia port")?,
+            address: value.remote_address.to_ip(message_id)?,
+            port: decode_port(value.remote_port, message_id, "multimedia port")?,
         },
-        call_reference: call_reference.into(),
+        call_reference: value.call_reference.into(),
         payload: decode_multimedia_payload(
-            payload_type,
-            capability,
-            Codec::from(compression_type),
+            value.payload_type,
+            value.capability,
+            Codec::from(value.compression_type),
             MultimediaPayloadDirection::Transmit,
             protocol,
             message_id,
         )?,
-        traffic_class: MediaTrafficClass::from_wire(u8::try_from(dscp).map_err(|_| {
+        traffic_class: MediaTrafficClass::from_wire(u8::try_from(value.dscp).map_err(|_| {
             CodecError::InvalidValue {
                 message_id,
                 field: "multimedia traffic class",
-                value: u64::from(dscp),
+                value: u64::from(value.dscp),
             }
         })?),
-        encryption: encryption.to_public(message_id)?,
-        stream_passthrough_id,
-        associated_stream_id,
+        encryption: value.encryption.to_public(message_id)?,
+        stream_passthrough_id: value.stream_passthrough_id,
+        associated_stream_id: value.associated_stream_id,
+    })
+}
+
+fn start_multimedia_to_wire<Address: WireIpAddress>(
+    value: &StartMultimediaTransmission,
+) -> Result<WireStartMultimedia<Address>, CodecError> {
+    Ok(WireStartMultimedia {
+        conference_id: value.conference_id.get(),
+        passthrough_party_id: value.passthrough_party_id.get(),
+        compression_type: value.payload.compression_codec().wire_value(),
+        remote_address: Address::from_ip(
+            value.endpoint.address,
+            wire_id::START_MULTIMEDIA_TRANSMISSION,
+            "IP address family for this protocol version",
+        )?,
+        remote_port: u32::from(value.endpoint.port),
+        call_reference: value.call_reference.get(),
+        payload_type: value.payload.descriptor().into(),
+        dscp: u32::from(value.traffic_class),
+        capability: multimedia_capability_to_wire(&value.payload),
+        encryption: WireEncryptionInfo::from_public(value.encryption.as_ref()),
+        stream_passthrough_id: value.stream_passthrough_id,
+        associated_stream_id: value.associated_stream_id,
     })
 }
 
@@ -840,49 +826,15 @@ pub(super) fn encode_start_multimedia(
         protocol,
         wire_id::START_MULTIMEDIA_TRANSMISSION,
     )?;
-    if protocol.wire() >= 17 {
-        encode(
+    match protocol.wire() {
+        17.. => encode(
             wire_id::START_MULTIMEDIA_TRANSMISSION,
-            &WireStartMultimediaFrom17 {
-                conference_id: value.conference_id.get(),
-                passthrough_party_id: value.passthrough_party_id.get(),
-                compression_type: value.payload.compression_codec().wire_value(),
-                remote_address: WireExtendedAddress::from_ip(value.endpoint.address),
-                remote_port: u32::from(value.endpoint.port),
-                call_reference: value.call_reference.get(),
-                payload_type: value.payload.descriptor().into(),
-                dscp: u32::from(value.traffic_class),
-                capability: multimedia_capability_to_wire(&value.payload),
-                encryption: WireEncryptionInfo::from_public(value.encryption.as_ref()),
-                stream_passthrough_id: value.stream_passthrough_id,
-                associated_stream_id: value.associated_stream_id,
-            },
-        )
-    } else {
-        let IpAddr::V4(address) = value.endpoint.address else {
-            return Err(CodecError::InvalidValue {
-                message_id: wire_id::START_MULTIMEDIA_TRANSMISSION,
-                field: "IP address family for this protocol version",
-                value: 1,
-            });
-        };
-        encode(
+            &start_multimedia_to_wire::<WireExtendedAddress>(value)?,
+        ),
+        _ => encode(
             wire_id::START_MULTIMEDIA_TRANSMISSION,
-            &WireStartMultimediaPre17 {
-                conference_id: value.conference_id.get(),
-                passthrough_party_id: value.passthrough_party_id.get(),
-                compression_type: value.payload.compression_codec().wire_value(),
-                remote_address: address.octets(),
-                remote_port: u32::from(value.endpoint.port),
-                call_reference: value.call_reference.get(),
-                payload_type: value.payload.descriptor().into(),
-                dscp: u32::from(value.traffic_class),
-                capability: multimedia_capability_to_wire(&value.payload),
-                encryption: WireEncryptionInfo::from_public(value.encryption.as_ref()),
-                stream_passthrough_id: value.stream_passthrough_id,
-                associated_stream_id: value.associated_stream_id,
-            },
-        )
+            &start_multimedia_to_wire::<WireIpv4Address>(value)?,
+        ),
     }
 }
 

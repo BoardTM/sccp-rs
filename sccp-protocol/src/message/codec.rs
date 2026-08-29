@@ -246,6 +246,62 @@ impl Default for WireLatentCapabilities {
     }
 }
 
+trait WireIpAddress:
+    for<'a> BinRead<Args<'a> = ()>
+    + for<'a> BinWrite<Args<'a> = ()>
+    + Clone
+    + Copy
+    + std::fmt::Debug
+    + Eq
+    + PartialEq
+    + 'static
+{
+    fn from_ip(address: IpAddr, message_id: u32, field: &'static str) -> Result<Self, CodecError>;
+    fn to_ip(self, message_id: u32) -> Result<IpAddr, CodecError>;
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+struct WireIpv4Address {
+    bytes: [u8; 4],
+}
+
+impl From<[u8; 4]> for WireIpv4Address {
+    fn from(bytes: [u8; 4]) -> Self {
+        Self { bytes }
+    }
+}
+
+impl From<Ipv4Addr> for WireIpv4Address {
+    fn from(address: Ipv4Addr) -> Self {
+        address.octets().into()
+    }
+}
+
+impl From<WireIpv4Address> for Ipv4Addr {
+    fn from(address: WireIpv4Address) -> Self {
+        Self::from(address.bytes)
+    }
+}
+
+impl WireIpAddress for WireIpv4Address {
+    fn from_ip(address: IpAddr, message_id: u32, field: &'static str) -> Result<Self, CodecError> {
+        let IpAddr::V4(address) = address else {
+            return Err(CodecError::InvalidValue {
+                message_id,
+                field,
+                value: 1,
+            });
+        };
+        Ok(Self {
+            bytes: address.octets(),
+        })
+    }
+
+    fn to_ip(self, _message_id: u32) -> Result<IpAddr, CodecError> {
+        Ok(IpAddr::V4(Ipv4Addr::from(self.bytes)))
+    }
+}
+
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
 struct WireExtendedAddress {
@@ -286,12 +342,26 @@ impl WireExtendedAddress {
     }
 }
 
+impl WireIpAddress for WireExtendedAddress {
+    fn from_ip(
+        address: IpAddr,
+        _message_id: u32,
+        _field: &'static str,
+    ) -> Result<Self, CodecError> {
+        Ok(Self::from_ip(address))
+    }
+
+    fn to_ip(self, message_id: u32) -> Result<IpAddr, CodecError> {
+        self.to_ip(message_id)
+    }
+}
+
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireStartMulticastReceptionV3 {
+struct WireStartMulticastReception<Address: WireIpAddress> {
     conference_id: u32,
     passthrough_party_id: u32,
-    address: [u8; 4],
+    address: Address,
     port: u32,
     packet_millis: u32,
     codec: u32,
@@ -302,40 +372,10 @@ struct WireStartMulticastReceptionV3 {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireStartMulticastReceptionV17 {
+struct WireStartMulticastTransmission<Address: WireIpAddress> {
     conference_id: u32,
     passthrough_party_id: u32,
-    address: WireExtendedAddress,
-    port: u32,
-    packet_millis: u32,
-    codec: u32,
-    echo_cancellation: u32,
-    g723_bitrate: u32,
-    call_reference: u32,
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireStartMulticastTransmissionV3 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    address: [u8; 4],
-    port: u32,
-    packet_millis: u32,
-    codec: u32,
-    precedence: u32,
-    silence_suppression: u32,
-    max_frames_per_packet: u32,
-    g723_bitrate: u32,
-    call_reference: u32,
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireStartMulticastTransmissionV17 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    address: WireExtendedAddress,
+    address: Address,
     port: u32,
     packet_millis: u32,
     codec: u32,
@@ -365,44 +405,20 @@ struct WireOpenReceiveV11 {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireOpenReceiveV12 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    packet_millis: u32,
-    codec: u32,
-    vad: u32,
-    g723_bitrate: u32,
-    call_reference: u32,
-    encryption: WireEncryptionInfo,
-    stream_passthrough_id: u32,
-    associated_stream_id: u32,
-    rfc2833_payload: u32,
-    dtmf_type: u32,
+struct WireOpenReceiveAddressed<Address: WireIpAddress> {
+    base: WireOpenReceiveV11,
     mixing_mode: u32,
     direction: u32,
-    remote_ipv4: [u8; 4],
+    remote: Address,
     remote_port: u32,
 }
+
+type WireOpenReceiveV12 = WireOpenReceiveAddressed<WireIpv4Address>;
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
 struct WireOpenReceiveV17 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    packet_millis: u32,
-    codec: u32,
-    vad: u32,
-    g723_bitrate: u32,
-    call_reference: u32,
-    encryption: WireEncryptionInfo,
-    stream_passthrough_id: u32,
-    associated_stream_id: u32,
-    rfc2833_payload: u32,
-    dtmf_type: u32,
-    mixing_mode: u32,
-    direction: u32,
-    remote: WireExtendedAddress,
-    remote_port: u32,
+    base: WireOpenReceiveAddressed<WireExtendedAddress>,
     requested_address_type: u32,
 }
 
@@ -422,10 +438,10 @@ struct WireOpenReceiveV21 {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireStartMediaV11 {
+struct WireStartMediaBase<Address: WireIpAddress> {
     conference_id: u32,
     passthrough_party_id: u32,
-    remote_ipv4: [u8; 4],
+    remote: Address,
     remote_port: u32,
     packet_millis: u32,
     codec: u32,
@@ -441,51 +457,18 @@ struct WireStartMediaV11 {
     dtmf_type: u32,
 }
 
+type WireStartMediaV11 = WireStartMediaBase<WireIpv4Address>;
+
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireStartMediaV12 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    remote_ipv4: [u8; 4],
-    remote_port: u32,
-    packet_millis: u32,
-    codec: u32,
-    precedence: u32,
-    silence_suppression: u32,
-    max_frames_per_packet: u32,
-    g723_bitrate: u32,
-    call_reference: u32,
-    encryption: WireEncryptionInfo,
-    stream_passthrough_id: u32,
-    associated_stream_id: u32,
-    rfc2833_payload: u32,
-    dtmf_type: u32,
+struct WireStartMediaDirected<Address: WireIpAddress> {
+    base: WireStartMediaBase<Address>,
     mixing_mode: u32,
     direction: u32,
 }
 
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireStartMediaV17 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    remote: WireExtendedAddress,
-    remote_port: u32,
-    packet_millis: u32,
-    codec: u32,
-    precedence: u32,
-    silence_suppression: u32,
-    max_frames_per_packet: u32,
-    g723_bitrate: u32,
-    call_reference: u32,
-    encryption: WireEncryptionInfo,
-    stream_passthrough_id: u32,
-    associated_stream_id: u32,
-    rfc2833_payload: u32,
-    dtmf_type: u32,
-    mixing_mode: u32,
-    direction: u32,
-}
+type WireStartMediaV12 = WireStartMediaDirected<WireIpv4Address>;
+type WireStartMediaV17 = WireStartMediaDirected<WireExtendedAddress>;
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
@@ -496,25 +479,17 @@ struct WireStartMediaV21 {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireStartMediaAckV3 {
+struct WireStartMediaAck<Address: WireIpAddress> {
     conference_id: u32,
     passthrough_party_id: u32,
     call_reference: u32,
-    address: [u8; 4],
+    address: Address,
     port: u32,
     status: u32,
 }
 
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireStartMediaAckV17 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    call_reference: u32,
-    address: WireExtendedAddress,
-    port: u32,
-    status: u32,
-}
+type WireStartMediaAckV3 = WireStartMediaAck<WireIpv4Address>;
+type WireStartMediaAckV17 = WireStartMediaAck<WireExtendedAddress>;
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
@@ -599,31 +574,30 @@ words!(WireLampState {
     instance,
     mode
 });
-words!(WirePortRequestPre20 {
+words!(WirePortRequest {
     conference_id,
     call_reference,
     passthrough_party_id,
     transport
 });
-words!(WirePortRequestFrom20 {
-    conference_id,
-    call_reference,
-    passthrough_party_id,
-    transport,
-    address_type,
-    media_type
-});
-words!(WirePortClosePre20 {
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WirePortRequestV20 {
+    base: WirePortRequest,
+    address_type: u32,
+    media_type: u32,
+}
+words!(WirePortClose {
     conference_id,
     call_reference,
     passthrough_party_id
 });
-words!(WirePortCloseFrom20 {
-    conference_id,
-    call_reference,
-    passthrough_party_id,
-    media_type
-});
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WirePortCloseV20 {
+    base: WirePortClose,
+    media_type: u32,
+}
 words!(WireSubscriptionStatus {
     transaction_id,
     feature_id,
@@ -930,18 +904,10 @@ struct WireButtonTemplate {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireServerResponseV3 {
+struct WireServerResponse<Address: WireIpAddress> {
     names: [WireFixedText<48>; 5],
     ports: [u32; 5],
-    addresses: [[u8; 4]; 5],
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireServerResponseV17 {
-    names: [WireFixedText<48>; 5],
-    ports: [u32; 5],
-    addresses: [WireExtendedAddress; 5],
+    addresses: [Address; 5],
 }
 
 words!(WireTimeDate {
@@ -1049,49 +1015,53 @@ struct WireDynamicPriorityNotifyHeader {
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+struct WireAlignedText<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize> {
+    value: WireFixedText<TEXT_BYTES>,
+    alignment: [u8; ALIGNMENT_BYTES],
+}
+
+impl<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>
+    WireAlignedText<TEXT_BYTES, ALIGNMENT_BYTES>
+{
+    fn new(message_id: u32, field: &'static str, value: &str) -> Result<Self, CodecError> {
+        Ok(Self {
+            value: WireFixedText::new(message_id, field, value)?,
+            alignment: [0; ALIGNMENT_BYTES],
+        })
+    }
+
+    fn text(&self) -> Result<String, CodecError> {
+        self.value.text()
+    }
+
+    fn validate(&self, message_id: u32) -> Result<(), CodecError> {
+        validate_zero_payload(&self.alignment, message_id, ALIGNMENT_BYTES)
+    }
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireConnectionStatisticsRequestV3 {
-    directory_number: WireFixedText<24>,
+struct WireConnectionStatisticsRequest<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize> {
+    directory_number: WireAlignedText<TEXT_BYTES, ALIGNMENT_BYTES>,
     call_reference: u32,
     processing: u32,
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireConnectionStatisticsRequestV19 {
-    directory_number: WireFixedText<25>,
-    alignment: [u8; 3],
-    call_reference: u32,
-    processing: u32,
+struct WireForwardTarget<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize> {
+    active: u32,
+    number: WireAlignedText<TEXT_BYTES, ALIGNMENT_BYTES>,
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireForwardStatusV3 {
+struct WireForwardStatus<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize> {
     active: u32,
     line_instance: u32,
-    all_active: u32,
-    all_number: WireFixedText<24>,
-    busy_active: u32,
-    busy_number: WireFixedText<24>,
-    no_answer_active: u32,
-    no_answer_number: WireFixedText<24>,
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireForwardStatusV19 {
-    active: u32,
-    line_instance: u32,
-    all_active: u32,
-    all_number: WireFixedText<25>,
-    all_alignment: [u8; 3],
-    busy_active: u32,
-    busy_number: WireFixedText<25>,
-    busy_alignment: [u8; 3],
-    no_answer_active: u32,
-    no_answer_number: WireFixedText<25>,
-    no_answer_alignment: [u8; 3],
+    all: WireForwardTarget<TEXT_BYTES, ALIGNMENT_BYTES>,
+    busy: WireForwardTarget<TEXT_BYTES, ALIGNMENT_BYTES>,
+    no_answer: WireForwardTarget<TEXT_BYTES, ALIGNMENT_BYTES>,
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
@@ -1104,17 +1074,8 @@ struct WireSpeedDialStatus {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireDialedNumberV3 {
-    number: WireFixedText<24>,
-    line_instance: u32,
-    call_reference: u32,
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireDialedNumberV19 {
-    number: WireFixedText<25>,
-    alignment: [u8; 3],
+struct WireDialedNumber<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize> {
+    number: WireAlignedText<TEXT_BYTES, ALIGNMENT_BYTES>,
     line_instance: u32,
     call_reference: u32,
 }
@@ -1176,51 +1137,37 @@ struct WireRegister {
     firmware: WireFixedText<32>,
 }
 
-words!(WireKeypadButton {
-    button,
-    line_instance,
-    call_reference,
-    keypad_union,
-    reserved
-});
-
-words!(WireKeypadButtonWithCall {
-    button,
-    line_instance,
-    call_reference
-});
-
 words!(WireKeypadButtonLegacy { button });
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireEnblocBefore19 {
-    called_party: WireFixedText<24>,
+struct WireKeypadButtonWithCall {
+    base: WireKeypadButtonLegacy,
+    line_instance: u32,
+    call_reference: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireKeypadButton {
+    base: WireKeypadButtonWithCall,
+    keypad_union: u32,
+    reserved: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireEnbloc<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize> {
+    called_party: WireAlignedText<TEXT_BYTES, ALIGNMENT_BYTES>,
     line_instance: u32,
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireEnblocFrom19 {
-    called_party: WireFixedText<25>,
-    alignment: [u8; 3],
-    line_instance: u32,
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireOffHookWithCallingPartyBefore19 {
-    calling_party_number: WireFixedText<24>,
-    voice_mailbox: WireFixedText<24>,
-    line_instance: u32,
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireOffHookWithCallingPartyFrom19 {
-    calling_party_number: WireFixedText<25>,
-    voice_mailbox: WireFixedText<25>,
-    alignment: [u8; 2],
+struct WireOffHookWithCallingParty<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize> {
+    calling_party_number: WireFixedText<TEXT_BYTES>,
+    voice_mailbox: WireFixedText<TEXT_BYTES>,
+    alignment: [u8; ALIGNMENT_BYTES],
     line_instance: u32,
 }
 
@@ -1249,7 +1196,7 @@ struct WireCapabilitiesResponse {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireAlarmLegacy {
+struct WireAlarmBase {
     severity: u32,
     text: WireFixedText<80>,
 }
@@ -1257,8 +1204,7 @@ struct WireAlarmLegacy {
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
 struct WireAlarm {
-    severity: u32,
-    text: WireFixedText<80>,
+    base: WireAlarmBase,
     parameter_1: u32,
     parameter_2: u32,
 }
@@ -1272,23 +1218,16 @@ struct WireLocationInfo {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireOpenReceiveAckV3 {
+struct WireReceiveChannelAck<Address: WireIpAddress> {
     status: u32,
-    address: [u8; 4],
+    address: Address,
     port: u32,
     passthrough_party_id: u32,
     call_reference: u32,
 }
 
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireOpenReceiveAckV17 {
-    status: u32,
-    address: WireExtendedAddress,
-    port: u32,
-    passthrough_party_id: u32,
-    call_reference: u32,
-}
+type WireOpenReceiveAckV3 = WireReceiveChannelAck<WireIpv4Address>;
+type WireOpenReceiveAckV17 = WireReceiveChannelAck<WireExtendedAddress>;
 
 words!(WireSoftKeyEvent {
     event,
@@ -1359,61 +1298,20 @@ words!(WireVideoDisplayCommand {
     layout_id
 });
 
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireOpenMultimediaAckPre17 {
-    status: u32,
-    address: [u8; 4],
-    port: u32,
-    passthrough_party_id: u32,
-    call_reference: u32,
-}
+type WireOpenMultimediaAckPre17 = WireReceiveChannelAck<WireIpv4Address>;
+type WireOpenMultimediaAckFrom17 = WireReceiveChannelAck<WireExtendedAddress>;
+type WireStartMultimediaAckPre17 = WireStartMediaAck<WireIpv4Address>;
+type WireStartMultimediaAckFrom17 = WireStartMediaAck<WireExtendedAddress>;
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireOpenMultimediaAckFrom17 {
-    status: u32,
-    address: WireExtendedAddress,
-    port: u32,
-    passthrough_party_id: u32,
-    call_reference: u32,
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireStartMultimediaAckPre17 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    call_reference: u32,
-    address: [u8; 4],
-    port: u32,
-    status: u32,
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireStartMultimediaAckFrom17 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    call_reference: u32,
-    address: WireExtendedAddress,
-    port: u32,
-    status: u32,
-}
-
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireSessionTransmissionPre17 {
-    remote_address: [u8; 4],
+struct WireSessionTransmission<Address: WireIpAddress> {
+    remote_address: Address,
     session_type: u32,
 }
 
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireSessionTransmissionFrom17 {
-    remote_address: WireExtendedAddress,
-    session_type: u32,
-}
+type WireSessionTransmissionPre17 = WireSessionTransmission<WireIpv4Address>;
+type WireSessionTransmissionFrom17 = WireSessionTransmission<WireExtendedAddress>;
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
@@ -1449,38 +1347,28 @@ struct WireOpenMultimediaV11 {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireOpenMultimediaV12 {
+struct WireOpenMultimediaAddressed<Address: WireIpAddress> {
     base: WireOpenMultimediaV11,
-    source_address: [u8; 4],
+    source_address: Address,
     source_port: u32,
 }
+
+type WireOpenMultimediaV12 = WireOpenMultimediaAddressed<WireIpv4Address>;
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
 struct WireOpenMultimediaV17 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    compression_type: u32,
-    line_instance: u32,
-    call_reference: u32,
-    payload_type: WireMultimediaPayloadDescriptor,
-    conference_creator: u32,
-    capability: [u8; MULTIMEDIA_CAPABILITY_BYTES],
-    encryption: WireEncryptionInfo,
-    stream_passthrough_id: u32,
-    associated_stream_id: u32,
-    source_address: WireExtendedAddress,
-    source_port: u32,
+    base: WireOpenMultimediaAddressed<WireExtendedAddress>,
     requested_address_type: u32,
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireStartMultimediaPre17 {
+struct WireStartMultimedia<Address: WireIpAddress> {
     conference_id: u32,
     passthrough_party_id: u32,
     compression_type: u32,
-    remote_address: [u8; 4],
+    remote_address: Address,
     remote_port: u32,
     call_reference: u32,
     payload_type: WireMultimediaPayloadDescriptor,
@@ -1491,22 +1379,8 @@ struct WireStartMultimediaPre17 {
     associated_stream_id: u32,
 }
 
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireStartMultimediaFrom17 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    compression_type: u32,
-    remote_address: WireExtendedAddress,
-    remote_port: u32,
-    call_reference: u32,
-    payload_type: WireMultimediaPayloadDescriptor,
-    dscp: u32,
-    capability: [u8; MULTIMEDIA_CAPABILITY_BYTES],
-    encryption: WireEncryptionInfo,
-    stream_passthrough_id: u32,
-    associated_stream_id: u32,
-}
+type WireStartMultimediaPre17 = WireStartMultimedia<WireIpv4Address>;
+type WireStartMultimediaFrom17 = WireStartMultimedia<WireExtendedAddress>;
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
@@ -1529,73 +1403,65 @@ struct WireExtensionDeviceCapabilities {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireMediaFailureV3 {
+struct WireMediaFailure<Address: WireIpAddress> {
     conference_id: u32,
     passthrough_party_id: u32,
-    address: [u8; 4],
+    address: Address,
     port: u32,
     call_reference: u32,
 }
 
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireMediaFailureV17 {
-    conference_id: u32,
-    passthrough_party_id: u32,
-    address: WireExtendedAddress,
-    port: u32,
-    call_reference: u32,
-}
+type WireMediaFailureV3 = WireMediaFailure<WireIpv4Address>;
+type WireMediaFailureV17 = WireMediaFailure<WireExtendedAddress>;
 
 #[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireUserData {
+struct WireUserDataHeader {
     application_id: u32,
     line_instance: u32,
     call_reference: u32,
     transaction_id: u32,
     data_length: u32,
-    #[br(count = data_length)]
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireUserData {
+    header: WireUserDataHeader,
+    #[br(count = header.data_length)]
     data: Vec<u8>,
 }
 
 #[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
 #[brw(little)]
 struct WireUserDataV1 {
-    application_id: u32,
-    line_instance: u32,
-    call_reference: u32,
-    transaction_id: u32,
-    data_length: u32,
+    header: WireUserDataHeader,
     sequence_flag: u32,
     display_priority: u32,
     conference_id: u32,
     application_instance_id: u32,
     routing: u32,
-    #[br(count = data_length)]
+    #[br(count = header.data_length)]
     data: Vec<u8>,
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WirePortResponseV3 {
+struct WirePortResponse<Address: WireIpAddress> {
     conference_id: u32,
     call_reference: u32,
     passthrough_party_id: u32,
-    address: [u8; 4],
+    address: Address,
     rtp_port: u32,
     rtcp_port: u32,
 }
 
+type WirePortResponseV3 = WirePortResponse<WireIpv4Address>;
+
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
 struct WirePortResponseV20 {
-    conference_id: u32,
-    call_reference: u32,
-    passthrough_party_id: u32,
-    address: WireExtendedAddress,
-    rtp_port: u32,
-    rtcp_port: u32,
+    base: WirePortResponse<WireExtendedAddress>,
     media_type: u32,
 }
 
@@ -1610,7 +1476,7 @@ struct WireSubscriptionRequest {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireConnectionStatisticsTail {
+struct WireConnectionStatisticsCounters {
     packets_sent: u32,
     octets_sent: u32,
     packets_received: u32,
@@ -1618,56 +1484,257 @@ struct WireConnectionStatisticsTail {
     packets_lost: u32,
     jitter_millis: u32,
     latency_millis: u32,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsTail {
+    counters: WireConnectionStatisticsCounters,
     quality_size: u32,
 }
 
+trait WireStatisticsProcessing:
+    for<'a> BinRead<Args<'a> = ()>
+    + for<'a> BinWrite<Args<'a> = ()>
+    + Clone
+    + Copy
+    + std::fmt::Debug
+    + Eq
+    + PartialEq
+    + 'static
+{
+    fn from_wire(value: u32, message_id: u32) -> Result<Self, CodecError>;
+    fn to_wire(self) -> u32;
+}
+
+impl WireStatisticsProcessing for u32 {
+    fn from_wire(value: u32, _message_id: u32) -> Result<Self, CodecError> {
+        Ok(value)
+    }
+
+    fn to_wire(self) -> u32 {
+        self
+    }
+}
+
+impl WireStatisticsProcessing for u8 {
+    fn from_wire(value: u32, message_id: u32) -> Result<Self, CodecError> {
+        u8::try_from(value).map_err(|_| CodecError::InvalidValue {
+            message_id,
+            field: "processing",
+            value: u64::from(value),
+        })
+    }
+
+    fn to_wire(self) -> u32 {
+        u32::from(self)
+    }
+}
+
 #[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireConnectionStatisticsV3 {
-    directory_number: WireFixedText<24>,
+struct WireConnectionStatistics<
+    const TEXT_BYTES: usize,
+    const ALIGNMENT_BYTES: usize,
+    Processing: WireStatisticsProcessing,
+> {
+    directory_number: WireAlignedText<TEXT_BYTES, ALIGNMENT_BYTES>,
     call_reference: u32,
-    processing: u32,
+    processing: Processing,
     statistics: WireConnectionStatisticsTail,
     #[br(count = statistics.quality_size)]
     quality: Vec<u8>,
 }
 
-#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireConnectionStatisticsV19 {
-    directory_number: WireFixedText<25>,
-    alignment: [u8; 3],
-    call_reference: u32,
-    processing: u32,
-    statistics: WireConnectionStatisticsTail,
-    #[br(count = statistics.quality_size)]
-    quality: Vec<u8>,
-}
-
-#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireConnectionStatisticsV22 {
-    directory_number: WireFixedText<28>,
-    call_reference: u32,
-    processing: u8,
-    statistics: WireConnectionStatisticsTail,
-    #[br(count = statistics.quality_size)]
-    quality: Vec<u8>,
-}
+type WireConnectionStatisticsV3 = WireConnectionStatistics<24, 0, u32>;
+type WireConnectionStatisticsV19 = WireConnectionStatistics<25, 3, u32>;
+type WireConnectionStatisticsV22 = WireConnectionStatistics<28, 0, u8>;
 
 #[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
 #[brw(little)]
 struct WireConnectionStatisticsV22Prefix {
-    directory_number: WireFixedText<28>,
+    directory_number: WireAlignedText<28, 0>,
     call_reference: u32,
     processing: u8,
-    packets_sent: u32,
-    octets_sent: u32,
-    packets_received: u32,
-    octets_received: u32,
-    packets_lost: u32,
-    jitter_millis: u32,
-    latency_millis: u32,
+    counters: WireConnectionStatisticsCounters,
+}
+
+fn decode_enbloc<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    payload: &[u8],
+    message_id: u32,
+) -> Result<ClientMessage, CodecError> {
+    let value: WireEnbloc<TEXT_BYTES, ALIGNMENT_BYTES> = decode(message_id, payload)?;
+    value.called_party.validate(message_id)?;
+    Ok(ClientMessage::EnblocCall {
+        called_party: value.called_party.text()?,
+        line_instance: value.line_instance,
+    })
+}
+
+fn encode_enbloc<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    called_party: &str,
+    line_instance: u32,
+) -> Result<Vec<u8>, CodecError> {
+    encode(
+        wire_id::ENBLOC_CALL,
+        &WireEnbloc::<TEXT_BYTES, ALIGNMENT_BYTES> {
+            called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", called_party)?,
+            line_instance,
+        },
+    )
+}
+
+fn decode_off_hook_with_calling_party<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    payload: &[u8],
+    message_id: u32,
+) -> Result<ClientMessage, CodecError> {
+    let value: WireOffHookWithCallingParty<TEXT_BYTES, ALIGNMENT_BYTES> =
+        decode(message_id, payload)?;
+    validate_zero_payload(&value.alignment, message_id, ALIGNMENT_BYTES)?;
+    Ok(ClientMessage::OffHookWithCallingParty {
+        calling_party_number: value.calling_party_number.text()?,
+        voice_mailbox: value.voice_mailbox.text()?,
+        line_instance: value.line_instance,
+    })
+}
+
+fn encode_off_hook_with_calling_party<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    calling_party_number: &str,
+    voice_mailbox: &str,
+    line_instance: u32,
+) -> Result<Vec<u8>, CodecError> {
+    encode(
+        wire_id::OFF_HOOK_WITH_CALLING_PARTY,
+        &WireOffHookWithCallingParty::<TEXT_BYTES, ALIGNMENT_BYTES> {
+            calling_party_number: WireFixedText::new(
+                wire_id::OFF_HOOK_WITH_CALLING_PARTY,
+                "calling party number",
+                calling_party_number,
+            )?,
+            voice_mailbox: WireFixedText::new(
+                wire_id::OFF_HOOK_WITH_CALLING_PARTY,
+                "voice mailbox",
+                voice_mailbox,
+            )?,
+            alignment: [0; ALIGNMENT_BYTES],
+            line_instance,
+        },
+    )
+}
+
+fn decode_connection_statistics_request<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    payload: &[u8],
+    message_id: u32,
+) -> Result<ServerMessage, CodecError> {
+    let value: WireConnectionStatisticsRequest<TEXT_BYTES, ALIGNMENT_BYTES> =
+        decode(message_id, payload)?;
+    value.directory_number.validate(message_id)?;
+    Ok(ServerMessage::ConnectionStatisticsRequest {
+        directory_number: value.directory_number.text()?,
+        call_reference: value.call_reference,
+        processing: StatisticsProcessing::from(value.processing),
+    })
+}
+
+fn encode_connection_statistics_request<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    directory_number: &str,
+    call_reference: u32,
+    processing: StatisticsProcessing,
+) -> Result<Vec<u8>, CodecError> {
+    encode(
+        wire_id::CONNECTION_STATISTICS_REQ,
+        &WireConnectionStatisticsRequest::<TEXT_BYTES, ALIGNMENT_BYTES> {
+            directory_number: WireAlignedText::new(
+                wire_id::CONNECTION_STATISTICS_REQ,
+                "directory number",
+                directory_number,
+            )?,
+            call_reference,
+            processing: processing.wire_value(),
+        },
+    )
+}
+
+fn decode_forward_status<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    payload: &[u8],
+    message_id: u32,
+) -> Result<ServerMessage, CodecError> {
+    let value: WireForwardStatus<TEXT_BYTES, ALIGNMENT_BYTES> =
+        decode_zero_padded(message_id, payload)?;
+    value.all.number.validate(message_id)?;
+    value.busy.number.validate(message_id)?;
+    value.no_answer.number.validate(message_id)?;
+    Ok(ServerMessage::ForwardStatus {
+        forward_all: (value.all.active != 0)
+            .then(|| value.all.number.text())
+            .transpose()?,
+        forward_busy: (value.busy.active != 0)
+            .then(|| value.busy.number.text())
+            .transpose()?,
+        forward_no_answer: (value.no_answer.active != 0)
+            .then(|| value.no_answer.number.text())
+            .transpose()?,
+        line_instance: value.line_instance,
+    })
+}
+
+fn encode_forward_status<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    line_instance: u32,
+    forward_all: Option<&str>,
+    forward_busy: Option<&str>,
+    forward_no_answer: Option<&str>,
+) -> Result<Vec<u8>, CodecError> {
+    let target = |value: Option<&str>| -> Result<_, CodecError> {
+        Ok(WireForwardTarget {
+            active: u32::from(value.is_some()),
+            number: WireAlignedText::new(
+                wire_id::FORWARD_STAT,
+                "forward number",
+                value.unwrap_or(""),
+            )?,
+        })
+    };
+    encode(
+        wire_id::FORWARD_STAT,
+        &WireForwardStatus::<TEXT_BYTES, ALIGNMENT_BYTES> {
+            active: u32::from(
+                forward_all.is_some() || forward_busy.is_some() || forward_no_answer.is_some(),
+            ),
+            line_instance,
+            all: target(forward_all)?,
+            busy: target(forward_busy)?,
+            no_answer: target(forward_no_answer)?,
+        },
+    )
+}
+
+fn decode_dialed_number<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    payload: &[u8],
+    message_id: u32,
+) -> Result<ServerMessage, CodecError> {
+    let value: WireDialedNumber<TEXT_BYTES, ALIGNMENT_BYTES> =
+        decode_zero_padded(message_id, payload)?;
+    value.number.validate(message_id)?;
+    Ok(ServerMessage::DialedNumber {
+        number: value.number.text()?,
+        line_instance: value.line_instance,
+        call_reference: value.call_reference,
+    })
+}
+
+fn encode_dialed_number<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+    number: &str,
+    line_instance: u32,
+    call_reference: u32,
+) -> Result<Vec<u8>, CodecError> {
+    encode(
+        wire_id::DIALED_NUMBER,
+        &WireDialedNumber::<TEXT_BYTES, ALIGNMENT_BYTES> {
+            number: WireAlignedText::new(wire_id::DIALED_NUMBER, "dialed number", number)?,
+            line_instance,
+            call_reference,
+        },
+    )
 }
 
 impl ClientMessage {
@@ -1773,7 +1840,7 @@ impl ClientMessage {
                     12 => {
                         let value: WireKeypadButtonWithCall = decode(frame.message_id, p)?;
                         (
-                            value.button,
+                            value.base.button,
                             value.line_instance,
                             value.call_reference,
                             Some(KeypadButtonWireLayout::WithCallIdentity),
@@ -1789,9 +1856,9 @@ impl ClientMessage {
                             });
                         }
                         (
-                            value.button,
-                            value.line_instance,
-                            value.call_reference,
+                            value.base.base.button,
+                            value.base.line_instance,
+                            value.base.call_reference,
                             None,
                         )
                     }
@@ -1804,20 +1871,10 @@ impl ClientMessage {
                     wire_layout,
                 })
             }
-            wire_id::ENBLOC_CALL => {
-                let (called_party, line_instance) = if protocol_version >= 19 {
-                    let value: WireEnblocFrom19 = decode(frame.message_id, p)?;
-                    validate_zero_payload(&value.alignment, frame.message_id, 3)?;
-                    (value.called_party.text()?, value.line_instance)
-                } else {
-                    let value: WireEnblocBefore19 = decode(frame.message_id, p)?;
-                    (value.called_party.text()?, value.line_instance)
-                };
-                Ok(Self::EnblocCall {
-                    called_party,
-                    line_instance,
-                })
-            }
+            wire_id::ENBLOC_CALL => match protocol_version {
+                19.. => decode_enbloc::<25, 3>(p, frame.message_id),
+                _ => decode_enbloc::<24, 0>(p, frame.message_id),
+            },
             wire_id::STIMULUS => {
                 let value: WireStimulus = decode(frame.message_id, p)?;
                 Ok(Self::Stimulus {
@@ -1841,30 +1898,10 @@ impl ClientMessage {
                     call_reference: value.call_reference,
                 })
             }
-            wire_id::OFF_HOOK_WITH_CALLING_PARTY => {
-                let (calling_party_number, voice_mailbox, line_instance) = if protocol_version >= 19
-                {
-                    let value: WireOffHookWithCallingPartyFrom19 = decode(frame.message_id, p)?;
-                    validate_zero_payload(&value.alignment, frame.message_id, 2)?;
-                    (
-                        value.calling_party_number.text()?,
-                        value.voice_mailbox.text()?,
-                        value.line_instance,
-                    )
-                } else {
-                    let value: WireOffHookWithCallingPartyBefore19 = decode(frame.message_id, p)?;
-                    (
-                        value.calling_party_number.text()?,
-                        value.voice_mailbox.text()?,
-                        value.line_instance,
-                    )
-                };
-                Ok(Self::OffHookWithCallingParty {
-                    calling_party_number,
-                    voice_mailbox,
-                    line_instance,
-                })
-            }
+            wire_id::OFF_HOOK_WITH_CALLING_PARTY => match protocol_version {
+                19.. => decode_off_hook_with_calling_party::<25, 2>(p, frame.message_id),
+                _ => decode_off_hook_with_calling_party::<24, 0>(p, frame.message_id),
+            },
             wire_id::LINE_STAT_REQ => {
                 let value: WireOneWord = decode(frame.message_id, p)?;
                 Ok(Self::LineStatRequest {
@@ -1903,12 +1940,12 @@ impl ClientMessage {
             }
             wire_id::UPDATE_CAPABILITIES => {
                 let expanded_layout = CapabilityUpdateVariant::Version1ExpandedVideo;
-                let variant = if protocol_version >= 16
-                    && p.len() >= expanded_layout.minimum_payload_bytes(protocol_version)
-                {
-                    expanded_layout
-                } else {
-                    CapabilityUpdateVariant::Version1
+                let variant = match (
+                    protocol_version,
+                    p.len() >= expanded_layout.minimum_payload_bytes(protocol_version),
+                ) {
+                    (16.., true) => expanded_layout,
+                    _ => CapabilityUpdateVariant::Version1,
                 };
                 CapabilityUpdate::decode(variant, protocol_version, p).map(Self::CapabilitiesUpdate)
             }
@@ -1927,7 +1964,7 @@ impl ClientMessage {
             wire_id::SERVER_REQ => Ok(Self::ServerRequest),
             wire_id::ALARM => match p.len() {
                 84 => {
-                    let value: WireAlarmLegacy = decode(frame.message_id, p)?;
+                    let value: WireAlarmBase = decode(frame.message_id, p)?;
                     Ok(Self::Alarm {
                         severity: AlarmSeverity::from(value.severity),
                         text: value.text.text()?,
@@ -1937,8 +1974,8 @@ impl ClientMessage {
                 92 => {
                     let value: WireAlarm = decode(frame.message_id, p)?;
                     Ok(Self::Alarm {
-                        severity: AlarmSeverity::from(value.severity),
-                        text: value.text.text()?,
+                        severity: AlarmSeverity::from(value.base.severity),
+                        text: value.base.text.text()?,
                         parameters: Some([value.parameter_1, value.parameter_2]),
                     })
                 }
@@ -1953,8 +1990,8 @@ impl ClientMessage {
                     call_reference: value.call_reference.into(),
                 })
             }
-            wire_id::OPEN_RECEIVE_CHANNEL_ACK => {
-                if protocol_version >= 17 {
+            wire_id::OPEN_RECEIVE_CHANNEL_ACK => match protocol_version {
+                17.. => {
                     let value: WireOpenReceiveAckV17 = decode(frame.message_id, p)?;
                     Ok(Self::OpenReceiveChannelAck {
                         status: MediaStatus::from(value.status),
@@ -1963,17 +2000,18 @@ impl ClientMessage {
                         passthrough_party_id: value.passthrough_party_id,
                         call_reference: value.call_reference,
                     })
-                } else {
+                }
+                _ => {
                     let value: WireOpenReceiveAckV3 = decode(frame.message_id, p)?;
                     Ok(Self::OpenReceiveChannelAck {
                         status: MediaStatus::from(value.status),
-                        address: IpAddr::V4(Ipv4Addr::from(value.address)),
+                        address: value.address.to_ip(frame.message_id)?,
                         port: decode_port(value.port, frame.message_id, "RTP port")?,
                         passthrough_party_id: value.passthrough_party_id,
                         call_reference: value.call_reference,
                     })
                 }
-            }
+            },
             wire_id::SOFT_KEY_SET_REQ => Ok(Self::SoftKeySetRequest),
             wire_id::SOFT_KEY_TEMPLATE_REQ => Ok(Self::SoftKeyTemplateRequest),
             wire_id::SOFT_KEY_EVENT => {
@@ -2110,8 +2148,8 @@ impl ClientMessage {
                     capabilities: value.capabilities,
                 })
             }
-            wire_id::MEDIA_TRANSMISSION_FAILURE => {
-                if protocol_version >= 17 {
+            wire_id::MEDIA_TRANSMISSION_FAILURE => match protocol_version {
+                17.. => {
                     let value: WireMediaFailureV17 = decode(frame.message_id, p)?;
                     Ok(Self::MediaTransmissionFailure {
                         conference_id: value.conference_id,
@@ -2121,18 +2159,19 @@ impl ClientMessage {
                         call_reference: value.call_reference,
                         status: MediaStatus::UnspecifiedError,
                     })
-                } else {
+                }
+                _ => {
                     let value: WireMediaFailureV3 = decode(frame.message_id, p)?;
                     Ok(Self::MediaTransmissionFailure {
                         conference_id: value.conference_id,
                         passthrough_party_id: value.passthrough_party_id,
-                        address: IpAddr::V4(Ipv4Addr::from(value.address)),
+                        address: value.address.to_ip(frame.message_id)?,
                         port: decode_port(value.port, frame.message_id, "RTP port")?,
                         call_reference: value.call_reference,
                         status: MediaStatus::UnspecifiedError,
                     })
                 }
-            }
+            },
             wire_id::CONNECTION_STATISTICS_RES => {
                 decode_connection_statistics(p, protocol_version, frame.message_id)
                     .map(Self::ConnectionStatisticsResponse)
@@ -2420,7 +2459,9 @@ impl ClientMessage {
                     Some(KeypadButtonWireLayout::WithCallIdentity) => encode(
                         wire_id::KEYPAD_BUTTON,
                         &WireKeypadButtonWithCall {
-                            button: button.keypad_value(),
+                            base: WireKeypadButtonLegacy {
+                                button: button.keypad_value(),
+                            },
                             line_instance: *line_instance,
                             call_reference: *call_reference,
                         },
@@ -2428,9 +2469,13 @@ impl ClientMessage {
                     None => encode(
                         wire_id::KEYPAD_BUTTON,
                         &WireKeypadButton {
-                            button: button.keypad_value(),
-                            line_instance: *line_instance,
-                            call_reference: *call_reference,
+                            base: WireKeypadButtonWithCall {
+                                base: WireKeypadButtonLegacy {
+                                    button: button.keypad_value(),
+                                },
+                                line_instance: *line_instance,
+                                call_reference: *call_reference,
+                            },
                             keypad_union: 0,
                             reserved: 0,
                         },
@@ -2442,32 +2487,10 @@ impl ClientMessage {
                 called_party,
                 line_instance,
             } => {
-                if protocol.wire() >= 19 {
-                    payload = encode(
-                        wire_id::ENBLOC_CALL,
-                        &WireEnblocFrom19 {
-                            called_party: WireFixedText::new(
-                                wire_id::ENBLOC_CALL,
-                                "called party",
-                                called_party,
-                            )?,
-                            alignment: [0; 3],
-                            line_instance: *line_instance,
-                        },
-                    )?;
-                } else {
-                    payload = encode(
-                        wire_id::ENBLOC_CALL,
-                        &WireEnblocBefore19 {
-                            called_party: WireFixedText::new(
-                                wire_id::ENBLOC_CALL,
-                                "called party",
-                                called_party,
-                            )?,
-                            line_instance: *line_instance,
-                        },
-                    )?;
-                }
+                payload = match protocol.wire() {
+                    19.. => encode_enbloc::<25, 3>(called_party, *line_instance),
+                    _ => encode_enbloc::<24, 0>(called_party, *line_instance),
+                }?;
                 wire_id::ENBLOC_CALL
             }
             Self::Stimulus {
@@ -2518,42 +2541,18 @@ impl ClientMessage {
                 voice_mailbox,
                 line_instance,
             } => {
-                payload = if protocol.wire() >= 19 {
-                    encode(
-                        wire_id::OFF_HOOK_WITH_CALLING_PARTY,
-                        &WireOffHookWithCallingPartyFrom19 {
-                            calling_party_number: WireFixedText::new(
-                                wire_id::OFF_HOOK_WITH_CALLING_PARTY,
-                                "calling party number",
-                                calling_party_number,
-                            )?,
-                            voice_mailbox: WireFixedText::new(
-                                wire_id::OFF_HOOK_WITH_CALLING_PARTY,
-                                "voice mailbox",
-                                voice_mailbox,
-                            )?,
-                            alignment: [0; 2],
-                            line_instance: *line_instance,
-                        },
-                    )?
-                } else {
-                    encode(
-                        wire_id::OFF_HOOK_WITH_CALLING_PARTY,
-                        &WireOffHookWithCallingPartyBefore19 {
-                            calling_party_number: WireFixedText::new(
-                                wire_id::OFF_HOOK_WITH_CALLING_PARTY,
-                                "calling party number",
-                                calling_party_number,
-                            )?,
-                            voice_mailbox: WireFixedText::new(
-                                wire_id::OFF_HOOK_WITH_CALLING_PARTY,
-                                "voice mailbox",
-                                voice_mailbox,
-                            )?,
-                            line_instance: *line_instance,
-                        },
-                    )?
-                };
+                payload = match protocol.wire() {
+                    19.. => encode_off_hook_with_calling_party::<25, 2>(
+                        calling_party_number,
+                        voice_mailbox,
+                        *line_instance,
+                    ),
+                    _ => encode_off_hook_with_calling_party::<24, 0>(
+                        calling_party_number,
+                        voice_mailbox,
+                        *line_instance,
+                    ),
+                }?;
                 wire_id::OFF_HOOK_WITH_CALLING_PARTY
             }
             Self::HookFlash {
@@ -2646,25 +2645,21 @@ impl ClientMessage {
                 parameters,
             } => {
                 let text = WireFixedText::new(wire_id::ALARM, "alarm text", text)?;
-                payload = if let Some([parameter_1, parameter_2]) = parameters {
-                    encode(
+                let base = WireAlarmBase {
+                    severity: severity.wire_value(),
+                    text,
+                };
+                payload = match parameters {
+                    Some([parameter_1, parameter_2]) => encode(
                         wire_id::ALARM,
                         &WireAlarm {
-                            severity: severity.wire_value(),
-                            text,
+                            base,
                             parameter_1: *parameter_1,
                             parameter_2: *parameter_2,
                         },
-                    )?
-                } else {
-                    encode(
-                        wire_id::ALARM,
-                        &WireAlarmLegacy {
-                            severity: severity.wire_value(),
-                            text,
-                        },
-                    )?
-                };
+                    ),
+                    None => encode(wire_id::ALARM, &base),
+                }?;
                 wire_id::ALARM
             }
             Self::MulticastMediaReceptionAck {
@@ -2689,8 +2684,8 @@ impl ClientMessage {
                 passthrough_party_id,
                 call_reference,
             } => {
-                if protocol.wire() >= 17 {
-                    payload = encode(
+                payload = match protocol.wire() {
+                    17.. => encode(
                         wire_id::OPEN_RECEIVE_CHANNEL_ACK,
                         &WireOpenReceiveAckV17 {
                             status: status.wire_value(),
@@ -2699,26 +2694,22 @@ impl ClientMessage {
                             passthrough_party_id: *passthrough_party_id,
                             call_reference: *call_reference,
                         },
-                    )?;
-                } else {
-                    let IpAddr::V4(address) = address else {
-                        return Err(CodecError::InvalidValue {
-                            message_id: wire_id::OPEN_RECEIVE_CHANNEL_ACK,
-                            field: "IP address family for this protocol version",
-                            value: 1,
-                        });
-                    };
-                    payload = encode(
+                    ),
+                    _ => encode(
                         wire_id::OPEN_RECEIVE_CHANNEL_ACK,
                         &WireOpenReceiveAckV3 {
                             status: status.wire_value(),
-                            address: address.octets(),
+                            address: WireIpv4Address::from_ip(
+                                *address,
+                                wire_id::OPEN_RECEIVE_CHANNEL_ACK,
+                                "IP address family for this protocol version",
+                            )?,
                             port: u32::from(*port),
                             passthrough_party_id: *passthrough_party_id,
                             call_reference: *call_reference,
                         },
-                    )?;
-                }
+                    ),
+                }?;
                 wire_id::OPEN_RECEIVE_CHANNEL_ACK
             }
             Self::SoftKeySetRequest => wire_id::SOFT_KEY_SET_REQ,
@@ -2817,8 +2808,8 @@ impl ClientMessage {
                 call_reference,
                 ..
             } => {
-                if protocol.wire() >= 17 {
-                    payload = encode(
+                payload = match protocol.wire() {
+                    17.. => encode(
                         wire_id::MEDIA_TRANSMISSION_FAILURE,
                         &WireMediaFailureV17 {
                             conference_id: *conference_id,
@@ -2827,26 +2818,22 @@ impl ClientMessage {
                             port: u32::from(*port),
                             call_reference: *call_reference,
                         },
-                    )?;
-                } else {
-                    let IpAddr::V4(address) = address else {
-                        return Err(CodecError::InvalidValue {
-                            message_id: wire_id::MEDIA_TRANSMISSION_FAILURE,
-                            field: "IP address family for this protocol version",
-                            value: 1,
-                        });
-                    };
-                    payload = encode(
+                    ),
+                    _ => encode(
                         wire_id::MEDIA_TRANSMISSION_FAILURE,
                         &WireMediaFailureV3 {
                             conference_id: *conference_id,
                             passthrough_party_id: *passthrough_party_id,
-                            address: address.octets(),
+                            address: WireIpv4Address::from_ip(
+                                *address,
+                                wire_id::MEDIA_TRANSMISSION_FAILURE,
+                                "IP address family for this protocol version",
+                            )?,
                             port: u32::from(*port),
                             call_reference: *call_reference,
                         },
-                    )?;
-                }
+                    ),
+                }?;
                 wire_id::MEDIA_TRANSMISSION_FAILURE
             }
             Self::RegisterAvailableLines { lines } => {
@@ -3117,13 +3104,15 @@ fn encode_connection_statistics(
     protocol: ProtocolVersion,
 ) -> Result<Vec<u8>, CodecError> {
     let tail = WireConnectionStatisticsTail {
-        packets_sent: statistics.packets_sent,
-        octets_sent: statistics.octets_sent,
-        packets_received: statistics.packets_received,
-        octets_received: statistics.octets_received,
-        packets_lost: statistics.packets_lost,
-        jitter_millis: statistics.jitter_millis,
-        latency_millis: statistics.latency_millis,
+        counters: WireConnectionStatisticsCounters {
+            packets_sent: statistics.packets_sent,
+            octets_sent: statistics.octets_sent,
+            packets_received: statistics.packets_received,
+            octets_received: statistics.octets_received,
+            packets_lost: statistics.packets_lost,
+            jitter_millis: statistics.jitter_millis,
+            latency_millis: statistics.latency_millis,
+        },
         quality_size: u32::try_from(statistics.quality.as_bytes().len()).map_err(|_| {
             CodecError::CountTooLarge {
                 message_id: wire_id::CONNECTION_STATISTICS_RES,
@@ -3135,17 +3124,14 @@ fn encode_connection_statistics(
     };
     match protocol.wire() {
         22.. => {
-            let processing = u8::try_from(statistics.processing.wire_value()).map_err(|_| {
-                CodecError::InvalidValue {
-                    message_id: wire_id::CONNECTION_STATISTICS_RES,
-                    field: "processing",
-                    value: u64::from(statistics.processing.wire_value()),
-                }
-            })?;
+            let processing = u8::from_wire(
+                statistics.processing.wire_value(),
+                wire_id::CONNECTION_STATISTICS_RES,
+            )?;
             encode(
                 wire_id::CONNECTION_STATISTICS_RES,
                 &WireConnectionStatisticsV22 {
-                    directory_number: WireFixedText::new(
+                    directory_number: WireAlignedText::new(
                         wire_id::CONNECTION_STATISTICS_RES,
                         "directory number",
                         &statistics.directory_number,
@@ -3160,12 +3146,11 @@ fn encode_connection_statistics(
         19..=21 => encode(
             wire_id::CONNECTION_STATISTICS_RES,
             &WireConnectionStatisticsV19 {
-                directory_number: WireFixedText::new(
+                directory_number: WireAlignedText::new(
                     wire_id::CONNECTION_STATISTICS_RES,
                     "directory number",
                     &statistics.directory_number,
                 )?,
-                alignment: [0; 3],
                 call_reference: statistics.call_reference,
                 processing: statistics.processing.wire_value(),
                 statistics: tail,
@@ -3175,7 +3160,7 @@ fn encode_connection_statistics(
         _ => encode(
             wire_id::CONNECTION_STATISTICS_RES,
             &WireConnectionStatisticsV3 {
-                directory_number: WireFixedText::new(
+                directory_number: WireAlignedText::new(
                     wire_id::CONNECTION_STATISTICS_RES,
                     "directory number",
                     &statistics.directory_number,
@@ -3193,42 +3178,39 @@ fn encode_start_media_ack(
     ack: &MediaTransmissionAck,
     protocol: ProtocolVersion,
 ) -> Result<Vec<u8>, CodecError> {
-    if protocol.wire() >= 17 {
-        let base = WireStartMediaAckV17 {
-            conference_id: ack.conference_id,
-            passthrough_party_id: ack.passthrough_party_id,
-            call_reference: ack.call_reference,
-            address: WireExtendedAddress::from_ip(ack.address),
-            port: u32::from(ack.port),
-            status: ack.status.wire_value(),
-        };
-        if let Some(extension) = ack.wire.as_ref().and_then(|wire| wire.extension) {
-            encode(
-                wire_id::START_MEDIA_TRANSMISSION_ACK,
-                &WireStartMediaAckV20 { base, extension },
-            )
-        } else {
-            encode(wire_id::START_MEDIA_TRANSMISSION_ACK, &base)
+    match protocol.wire() {
+        17.. => {
+            let base = WireStartMediaAckV17 {
+                conference_id: ack.conference_id,
+                passthrough_party_id: ack.passthrough_party_id,
+                call_reference: ack.call_reference,
+                address: WireExtendedAddress::from_ip(ack.address),
+                port: u32::from(ack.port),
+                status: ack.status.wire_value(),
+            };
+            match ack.wire.as_ref().and_then(|wire| wire.extension) {
+                Some(extension) => encode(
+                    wire_id::START_MEDIA_TRANSMISSION_ACK,
+                    &WireStartMediaAckV20 { base, extension },
+                ),
+                None => encode(wire_id::START_MEDIA_TRANSMISSION_ACK, &base),
+            }
         }
-    } else {
-        let IpAddr::V4(address) = ack.address else {
-            return Err(CodecError::InvalidValue {
-                message_id: wire_id::START_MEDIA_TRANSMISSION_ACK,
-                field: "IP address family for this protocol version",
-                value: 1,
-            });
-        };
-        encode(
+        _ => encode(
             wire_id::START_MEDIA_TRANSMISSION_ACK,
             &WireStartMediaAckV3 {
                 conference_id: ack.conference_id,
                 passthrough_party_id: ack.passthrough_party_id,
                 call_reference: ack.call_reference,
-                address: address.octets(),
+                address: WireIpv4Address::from_ip(
+                    ack.address,
+                    wire_id::START_MEDIA_TRANSMISSION_ACK,
+                    "IP address family for this protocol version",
+                )?,
                 port: u32::from(ack.port),
                 status: ack.status.wire_value(),
             },
-        )
+        ),
     }
 }
 
@@ -3342,29 +3324,35 @@ impl ServerMessage {
                 })
             }
             wire_id::SERVER_RES => {
-                let servers = if protocol.wire() >= 17 {
-                    let value: WireServerResponseV17 = decode(frame.message_id, p)?;
-                    decode_server_endpoints(
-                        frame.message_id,
-                        value.names,
-                        value.ports,
-                        value
-                            .addresses
-                            .map(|address| address.to_ip(frame.message_id))
-                            .into_iter()
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )?
-                } else {
-                    let value: WireServerResponseV3 = decode(frame.message_id, p)?;
-                    decode_server_endpoints(
-                        frame.message_id,
-                        value.names,
-                        value.ports,
-                        value
-                            .addresses
-                            .map(|address| IpAddr::V4(Ipv4Addr::from(address)))
-                            .to_vec(),
-                    )?
+                let servers = match protocol.wire() {
+                    17.. => {
+                        let value: WireServerResponse<WireExtendedAddress> =
+                            decode(frame.message_id, p)?;
+                        decode_server_endpoints(
+                            frame.message_id,
+                            value.names,
+                            value.ports,
+                            value
+                                .addresses
+                                .map(|address| address.to_ip(frame.message_id))
+                                .into_iter()
+                                .collect::<Result<Vec<_>, _>>()?,
+                        )?
+                    }
+                    _ => {
+                        let value: WireServerResponse<WireIpv4Address> =
+                            decode(frame.message_id, p)?;
+                        decode_server_endpoints(
+                            frame.message_id,
+                            value.names,
+                            value.ports,
+                            value
+                                .addresses
+                                .map(|address| address.to_ip(frame.message_id))
+                                .into_iter()
+                                .collect::<Result<Vec<_>, _>>()?,
+                        )?
+                    }
                 };
                 Ok(Self::ServerResponse { servers })
             }
@@ -3760,12 +3748,15 @@ impl ServerMessage {
                 })
             }
             wire_id::STOP_TONE => {
-                let (line_instance, call_reference) = if protocol.wire() >= 12 {
-                    let value: WireStopToneV12 = decode(frame.message_id, p)?;
-                    (value.line_instance, value.call_reference)
-                } else {
-                    let value: WireLineCall = decode(frame.message_id, p)?;
-                    (value.line_instance, value.call_reference)
+                let (line_instance, call_reference) = match protocol.wire() {
+                    12.. => {
+                        let value: WireStopToneV12 = decode(frame.message_id, p)?;
+                        (value.line_instance, value.call_reference)
+                    }
+                    _ => {
+                        let value: WireLineCall = decode(frame.message_id, p)?;
+                        (value.line_instance, value.call_reference)
+                    }
                 };
                 Ok(Self::StopTone {
                     line_instance,
@@ -3807,23 +3798,10 @@ impl ServerMessage {
                     port_handling_flag: value.port_handling_flag,
                 }))
             }
-            wire_id::CONNECTION_STATISTICS_REQ => {
-                if protocol.wire() >= 19 {
-                    let value: WireConnectionStatisticsRequestV19 = decode(frame.message_id, p)?;
-                    Ok(Self::ConnectionStatisticsRequest {
-                        directory_number: value.directory_number.text()?,
-                        call_reference: value.call_reference,
-                        processing: StatisticsProcessing::from(value.processing),
-                    })
-                } else {
-                    let value: WireConnectionStatisticsRequestV3 = decode(frame.message_id, p)?;
-                    Ok(Self::ConnectionStatisticsRequest {
-                        directory_number: value.directory_number.text()?,
-                        call_reference: value.call_reference,
-                        processing: StatisticsProcessing::from(value.processing),
-                    })
-                }
-            }
+            wire_id::CONNECTION_STATISTICS_REQ => match protocol.wire() {
+                19.. => decode_connection_statistics_request::<25, 3>(p, frame.message_id),
+                _ => decode_connection_statistics_request::<24, 0>(p, frame.message_id),
+            },
             wire_id::START_MEDIA_TRANSMISSION => decode_start_media(p, protocol, frame.message_id),
             wire_id::STOP_MEDIA_TRANSMISSION => {
                 validate_exact_payload(p, frame.message_id, 16)?;
@@ -3854,40 +3832,10 @@ impl ServerMessage {
                 })
             }
             wire_id::CLEAR_DISPLAY => Ok(Self::ClearDisplay),
-            wire_id::FORWARD_STAT => {
-                if protocol.wire() >= 19 {
-                    let value: WireForwardStatusV19 = decode(frame.message_id, p)?;
-                    validate_zero_payload(&value.all_alignment, frame.message_id, 3)?;
-                    validate_zero_payload(&value.busy_alignment, frame.message_id, 3)?;
-                    validate_zero_payload(&value.no_answer_alignment, frame.message_id, 3)?;
-                    Ok(Self::ForwardStatus {
-                        forward_all: (value.all_active != 0)
-                            .then(|| value.all_number.text())
-                            .transpose()?,
-                        forward_busy: (value.busy_active != 0)
-                            .then(|| value.busy_number.text())
-                            .transpose()?,
-                        forward_no_answer: (value.no_answer_active != 0)
-                            .then(|| value.no_answer_number.text())
-                            .transpose()?,
-                        line_instance: value.line_instance,
-                    })
-                } else {
-                    let value: WireForwardStatusV3 = decode_zero_padded(frame.message_id, p)?;
-                    Ok(Self::ForwardStatus {
-                        forward_all: (value.all_active != 0)
-                            .then(|| value.all_number.text())
-                            .transpose()?,
-                        forward_busy: (value.busy_active != 0)
-                            .then(|| value.busy_number.text())
-                            .transpose()?,
-                        forward_no_answer: (value.no_answer_active != 0)
-                            .then(|| value.no_answer_number.text())
-                            .transpose()?,
-                        line_instance: value.line_instance,
-                    })
-                }
-            }
+            wire_id::FORWARD_STAT => match protocol.wire() {
+                19.. => decode_forward_status::<25, 3>(p, frame.message_id),
+                _ => decode_forward_status::<24, 0>(p, frame.message_id),
+            },
             wire_id::SPEED_DIAL_STAT => {
                 let value: WireSpeedDialStatus = decode(frame.message_id, p)?;
                 Ok(Self::SpeedDialStatus {
@@ -3920,24 +3868,10 @@ impl ServerMessage {
             wire_id::MISCELLANEOUS_COMMAND => {
                 decode_miscellaneous_command(p, frame.message_id).map(Self::MiscellaneousCommand)
             }
-            wire_id::DIALED_NUMBER => {
-                if protocol.wire() >= 19 {
-                    let value: WireDialedNumberV19 = decode(frame.message_id, p)?;
-                    validate_zero_payload(&value.alignment, frame.message_id, 3)?;
-                    Ok(Self::DialedNumber {
-                        number: value.number.text()?,
-                        line_instance: value.line_instance,
-                        call_reference: value.call_reference,
-                    })
-                } else {
-                    let value: WireDialedNumberV3 = decode_zero_padded(frame.message_id, p)?;
-                    Ok(Self::DialedNumber {
-                        number: value.number.text()?,
-                        line_instance: value.line_instance,
-                        call_reference: value.call_reference,
-                    })
-                }
-            }
+            wire_id::DIALED_NUMBER => match protocol.wire() {
+                19.. => decode_dialed_number::<25, 3>(p, frame.message_id),
+                _ => decode_dialed_number::<24, 0>(p, frame.message_id),
+            },
             wire_id::SUBSCRIBE_DTMF_PAYLOAD_REQ => {
                 let value: WireDtmfPayloadRequest = decode(frame.message_id, p)?;
                 Ok(Self::SubscribeDtmfPayloadRequest(
@@ -4005,45 +3939,51 @@ impl ServerMessage {
                 })
             }
             wire_id::PORT_REQUEST => {
-                let request = if protocol.wire() >= 20 {
-                    let value: WirePortRequestFrom20 = decode(frame.message_id, p)?;
-                    PortRequest {
-                        conference_id: value.conference_id.into(),
-                        call_reference: value.call_reference.into(),
-                        passthrough_party_id: value.passthrough_party_id.into(),
-                        transport: MediaTransport::from(value.transport),
-                        address_type: Some(IpAddressType::from(value.address_type)),
-                        media_type: Some(MediaType::from(value.media_type)),
+                let request = match protocol.wire() {
+                    20.. => {
+                        let value: WirePortRequestV20 = decode(frame.message_id, p)?;
+                        PortRequest {
+                            conference_id: value.base.conference_id.into(),
+                            call_reference: value.base.call_reference.into(),
+                            passthrough_party_id: value.base.passthrough_party_id.into(),
+                            transport: MediaTransport::from(value.base.transport),
+                            address_type: Some(IpAddressType::from(value.address_type)),
+                            media_type: Some(MediaType::from(value.media_type)),
+                        }
                     }
-                } else {
-                    let value: WirePortRequestPre20 = decode(frame.message_id, p)?;
-                    PortRequest {
-                        conference_id: value.conference_id.into(),
-                        call_reference: value.call_reference.into(),
-                        passthrough_party_id: value.passthrough_party_id.into(),
-                        transport: MediaTransport::from(value.transport),
-                        address_type: None,
-                        media_type: None,
+                    _ => {
+                        let value: WirePortRequest = decode(frame.message_id, p)?;
+                        PortRequest {
+                            conference_id: value.conference_id.into(),
+                            call_reference: value.call_reference.into(),
+                            passthrough_party_id: value.passthrough_party_id.into(),
+                            transport: MediaTransport::from(value.transport),
+                            address_type: None,
+                            media_type: None,
+                        }
                     }
                 };
                 Ok(Self::PortRequest(request))
             }
             wire_id::PORT_CLOSE => {
-                let close = if protocol.wire() >= 20 {
-                    let value: WirePortCloseFrom20 = decode(frame.message_id, p)?;
-                    PortClose {
-                        conference_id: value.conference_id.into(),
-                        call_reference: value.call_reference.into(),
-                        passthrough_party_id: value.passthrough_party_id.into(),
-                        media_type: Some(MediaType::from(value.media_type)),
+                let close = match protocol.wire() {
+                    20.. => {
+                        let value: WirePortCloseV20 = decode(frame.message_id, p)?;
+                        PortClose {
+                            conference_id: value.base.conference_id.into(),
+                            call_reference: value.base.call_reference.into(),
+                            passthrough_party_id: value.base.passthrough_party_id.into(),
+                            media_type: Some(MediaType::from(value.media_type)),
+                        }
                     }
-                } else {
-                    let value: WirePortClosePre20 = decode(frame.message_id, p)?;
-                    PortClose {
-                        conference_id: value.conference_id.into(),
-                        call_reference: value.call_reference.into(),
-                        passthrough_party_id: value.passthrough_party_id.into(),
-                        media_type: None,
+                    _ => {
+                        let value: WirePortClose = decode(frame.message_id, p)?;
+                        PortClose {
+                            conference_id: value.conference_id.into(),
+                            call_reference: value.call_reference.into(),
+                            passthrough_party_id: value.passthrough_party_id.into(),
+                            media_type: None,
+                        }
                     }
                 };
                 Ok(Self::PortClose(close))
@@ -4392,10 +4332,10 @@ impl ServerMessage {
                         .get(index)
                         .map_or(0, |server| u32::from(server.port.get()))
                 });
-                if protocol.wire() >= 17 {
-                    p = encode(
+                p = match protocol.wire() {
+                    17.. => encode(
                         wire_id::SERVER_RES,
-                        &WireServerResponseV17 {
+                        &WireServerResponse::<WireExtendedAddress> {
                             names,
                             ports,
                             addresses: std::array::from_fn(|index| {
@@ -4408,36 +4348,38 @@ impl ServerMessage {
                                 )
                             }),
                         },
-                    )?;
-                } else {
-                    let addresses: [[u8; 4]; MAX_SIGNALING_SERVERS] = (0..MAX_SIGNALING_SERVERS)
-                        .map(|index| match servers.get(index) {
-                            Some(server) => match server.address {
-                                IpAddr::V4(address) => Ok(address.octets()),
-                                IpAddr::V6(_) => Err(CodecError::InvalidValue {
-                                    message_id: wire_id::SERVER_RES,
-                                    field: "IP address family for pre-v17 protocol",
-                                    value: 1,
-                                }),
+                    ),
+                    _ => {
+                        let addresses: [WireIpv4Address; MAX_SIGNALING_SERVERS] = (0
+                            ..MAX_SIGNALING_SERVERS)
+                            .map(|index| {
+                                WireIpv4Address::from_ip(
+                                    servers
+                                        .get(index)
+                                        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |server| {
+                                            server.address
+                                        }),
+                                    wire_id::SERVER_RES,
+                                    "IP address family for pre-v17 protocol",
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                            .try_into()
+                            .map_err(|_| CodecError::InvalidValue {
+                                message_id: wire_id::SERVER_RES,
+                                field: "server address array",
+                                value: servers.len() as u64,
+                            })?;
+                        encode(
+                            wire_id::SERVER_RES,
+                            &WireServerResponse::<WireIpv4Address> {
+                                names,
+                                ports,
+                                addresses,
                             },
-                            None => Ok([0; 4]),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                        .try_into()
-                        .map_err(|_| CodecError::InvalidValue {
-                            message_id: wire_id::SERVER_RES,
-                            field: "server address array",
-                            value: servers.len() as u64,
-                        })?;
-                    p = encode(
-                        wire_id::SERVER_RES,
-                        &WireServerResponseV3 {
-                            names,
-                            ports,
-                            addresses,
-                        },
-                    )?;
-                }
+                        )
+                    }
+                }?;
                 wire_id::SERVER_RES
             }
             Self::TimeDate {
@@ -4505,11 +4447,13 @@ impl ServerMessage {
                             }
                             let label = LABELS[index];
                             let mut encoded = [0; 16];
-                            if label == 201 {
-                                encoded[..4].copy_from_slice(b"Dial");
-                            } else if label != 0 {
-                                encoded[0] = 0x80;
-                                encoded[1] = label as u8;
+                            match label {
+                                201 => encoded[..4].copy_from_slice(b"Dial"),
+                                0 => {}
+                                _ => {
+                                    encoded[0] = 0x80;
+                                    encoded[1] = label as u8;
+                                }
                             }
                             WireSoftKeyDefinition {
                                 label: encoded,
@@ -5134,24 +5078,23 @@ impl ServerMessage {
                 line_instance,
                 call_reference,
             } => {
-                p = if protocol.wire() > 11 {
-                    encode(
+                p = match protocol.wire() {
+                    12.. => encode(
                         wire_id::STOP_TONE,
                         &WireStopToneV12 {
                             line_instance: *line_instance,
                             call_reference: *call_reference,
                             tone: 0,
                         },
-                    )?
-                } else {
-                    encode(
+                    ),
+                    _ => encode(
                         wire_id::STOP_TONE,
                         &WireLineCall {
                             line_instance: *line_instance,
                             call_reference: *call_reference,
                         },
-                    )?
-                };
+                    ),
+                }?;
                 wire_id::STOP_TONE
             }
             Self::StartMulticastMediaReception(message) => {
@@ -5233,34 +5176,18 @@ impl ServerMessage {
                 call_reference,
                 processing,
             } => {
-                if protocol.wire() >= 19 {
-                    p = encode(
-                        wire_id::CONNECTION_STATISTICS_REQ,
-                        &WireConnectionStatisticsRequestV19 {
-                            directory_number: WireFixedText::new(
-                                wire_id::CONNECTION_STATISTICS_REQ,
-                                "directory number",
-                                directory_number,
-                            )?,
-                            alignment: [0; 3],
-                            call_reference: *call_reference,
-                            processing: processing.wire_value(),
-                        },
-                    )?;
-                } else {
-                    p = encode(
-                        wire_id::CONNECTION_STATISTICS_REQ,
-                        &WireConnectionStatisticsRequestV3 {
-                            directory_number: WireFixedText::new(
-                                wire_id::CONNECTION_STATISTICS_REQ,
-                                "directory number",
-                                directory_number,
-                            )?,
-                            call_reference: *call_reference,
-                            processing: processing.wire_value(),
-                        },
-                    )?;
-                }
+                p = match protocol.wire() {
+                    19.. => encode_connection_statistics_request::<25, 3>(
+                        directory_number,
+                        *call_reference,
+                        *processing,
+                    ),
+                    _ => encode_connection_statistics_request::<24, 0>(
+                        directory_number,
+                        *call_reference,
+                        *processing,
+                    ),
+                }?;
                 wire_id::CONNECTION_STATISTICS_REQ
             }
             Self::StartMediaTransmission {
@@ -5339,65 +5266,20 @@ impl ServerMessage {
                 forward_busy,
                 forward_no_answer,
             } => {
-                let active = u32::from(
-                    forward_all.is_some() || forward_busy.is_some() || forward_no_answer.is_some(),
-                );
-                if protocol.wire() >= 19 {
-                    p = encode(
-                        wire_id::FORWARD_STAT,
-                        &WireForwardStatusV19 {
-                            active,
-                            line_instance: *line_instance,
-                            all_active: u32::from(forward_all.is_some()),
-                            all_number: WireFixedText::new(
-                                wire_id::FORWARD_STAT,
-                                "forward number",
-                                forward_all.as_deref().unwrap_or(""),
-                            )?,
-                            all_alignment: [0; 3],
-                            busy_active: u32::from(forward_busy.is_some()),
-                            busy_number: WireFixedText::new(
-                                wire_id::FORWARD_STAT,
-                                "forward number",
-                                forward_busy.as_deref().unwrap_or(""),
-                            )?,
-                            busy_alignment: [0; 3],
-                            no_answer_active: u32::from(forward_no_answer.is_some()),
-                            no_answer_number: WireFixedText::new(
-                                wire_id::FORWARD_STAT,
-                                "forward number",
-                                forward_no_answer.as_deref().unwrap_or(""),
-                            )?,
-                            no_answer_alignment: [0; 3],
-                        },
-                    )?;
-                } else {
-                    p = encode(
-                        wire_id::FORWARD_STAT,
-                        &WireForwardStatusV3 {
-                            active,
-                            line_instance: *line_instance,
-                            all_active: u32::from(forward_all.is_some()),
-                            all_number: WireFixedText::new(
-                                wire_id::FORWARD_STAT,
-                                "forward number",
-                                forward_all.as_deref().unwrap_or(""),
-                            )?,
-                            busy_active: u32::from(forward_busy.is_some()),
-                            busy_number: WireFixedText::new(
-                                wire_id::FORWARD_STAT,
-                                "forward number",
-                                forward_busy.as_deref().unwrap_or(""),
-                            )?,
-                            no_answer_active: u32::from(forward_no_answer.is_some()),
-                            no_answer_number: WireFixedText::new(
-                                wire_id::FORWARD_STAT,
-                                "forward number",
-                                forward_no_answer.as_deref().unwrap_or(""),
-                            )?,
-                        },
-                    )?;
-                }
+                p = match protocol.wire() {
+                    19.. => encode_forward_status::<25, 3>(
+                        *line_instance,
+                        forward_all.as_deref(),
+                        forward_busy.as_deref(),
+                        forward_no_answer.as_deref(),
+                    ),
+                    _ => encode_forward_status::<24, 0>(
+                        *line_instance,
+                        forward_all.as_deref(),
+                        forward_busy.as_deref(),
+                        forward_no_answer.as_deref(),
+                    ),
+                }?;
                 wire_id::FORWARD_STAT
             }
             Self::SpeedDialStatus {
@@ -5435,34 +5317,10 @@ impl ServerMessage {
                 line_instance,
                 call_reference,
             } => {
-                p = if protocol.wire() >= 19 {
-                    encode(
-                        wire_id::DIALED_NUMBER,
-                        &WireDialedNumberV19 {
-                            number: WireFixedText::new(
-                                wire_id::DIALED_NUMBER,
-                                "dialed number",
-                                number,
-                            )?,
-                            alignment: [0; 3],
-                            line_instance: *line_instance,
-                            call_reference: *call_reference,
-                        },
-                    )?
-                } else {
-                    encode(
-                        wire_id::DIALED_NUMBER,
-                        &WireDialedNumberV3 {
-                            number: WireFixedText::new(
-                                wire_id::DIALED_NUMBER,
-                                "dialed number",
-                                number,
-                            )?,
-                            line_instance: *line_instance,
-                            call_reference: *call_reference,
-                        },
-                    )?
-                };
+                p = match protocol.wire() {
+                    19.. => encode_dialed_number::<25, 3>(number, *line_instance, *call_reference),
+                    _ => encode_dialed_number::<24, 0>(number, *line_instance, *call_reference),
+                }?;
                 wire_id::DIALED_NUMBER
             }
             Self::StartMediaFailureDetection(detection) => {
@@ -5575,13 +5433,14 @@ impl ServerMessage {
                 label,
                 extension_text,
             } => {
-                if protocol < ProtocolVersion::V19 && !extension_text.is_empty() {
-                    return Err(CodecError::InvalidValue {
+                match (protocol.wire(), extension_text.is_empty()) {
+                    (0..=18, false) => Err(CodecError::InvalidValue {
                         message_id: wire_id::SERVICE_URL_STAT_DYNAMIC,
                         field: "service URL extension for this protocol version",
                         value: extension_text.len() as u64,
-                    });
-                }
+                    }),
+                    _ => Ok(()),
+                }?;
                 if session.uses_dynamic_general_ui() {
                     p = encode_dynamic_service_url_status(
                         *index,
@@ -5625,14 +5484,17 @@ impl ServerMessage {
                 wire_id::CALL_SELECT_STAT
             }
             Self::PortRequest(request) => {
-                p = if protocol.wire() >= 20 {
-                    encode(
+                let base = WirePortRequest {
+                    conference_id: request.conference_id.get(),
+                    call_reference: request.call_reference.get(),
+                    passthrough_party_id: request.passthrough_party_id.get(),
+                    transport: request.transport.wire_value(),
+                };
+                p = match protocol.wire() {
+                    20.. => encode(
                         wire_id::PORT_REQUEST,
-                        &WirePortRequestFrom20 {
-                            conference_id: request.conference_id.get(),
-                            call_reference: request.call_reference.get(),
-                            passthrough_party_id: request.passthrough_party_id.get(),
-                            transport: request.transport.wire_value(),
+                        &WirePortRequestV20 {
+                            base,
                             address_type: request
                                 .address_type
                                 .ok_or(CodecError::InvalidValue {
@@ -5650,28 +5512,22 @@ impl ServerMessage {
                                 })?
                                 .wire_value(),
                         },
-                    )?
-                } else {
-                    encode(
-                        wire_id::PORT_REQUEST,
-                        &WirePortRequestPre20 {
-                            conference_id: request.conference_id.get(),
-                            call_reference: request.call_reference.get(),
-                            passthrough_party_id: request.passthrough_party_id.get(),
-                            transport: request.transport.wire_value(),
-                        },
-                    )?
-                };
+                    ),
+                    _ => encode(wire_id::PORT_REQUEST, &base),
+                }?;
                 wire_id::PORT_REQUEST
             }
             Self::PortClose(close) => {
-                p = if protocol.wire() >= 20 {
-                    encode(
+                let base = WirePortClose {
+                    conference_id: close.conference_id.get(),
+                    call_reference: close.call_reference.get(),
+                    passthrough_party_id: close.passthrough_party_id.get(),
+                };
+                p = match protocol.wire() {
+                    20.. => encode(
                         wire_id::PORT_CLOSE,
-                        &WirePortCloseFrom20 {
-                            conference_id: close.conference_id.get(),
-                            call_reference: close.call_reference.get(),
-                            passthrough_party_id: close.passthrough_party_id.get(),
+                        &WirePortCloseV20 {
+                            base,
                             media_type: close
                                 .media_type
                                 .ok_or(CodecError::InvalidValue {
@@ -5681,17 +5537,9 @@ impl ServerMessage {
                                 })?
                                 .wire_value(),
                         },
-                    )?
-                } else {
-                    encode(
-                        wire_id::PORT_CLOSE,
-                        &WirePortClosePre20 {
-                            conference_id: close.conference_id.get(),
-                            call_reference: close.call_reference.get(),
-                            passthrough_party_id: close.passthrough_party_id.get(),
-                        },
-                    )?
-                };
+                    ),
+                    _ => encode(wire_id::PORT_CLOSE, &base),
+                }?;
                 wire_id::PORT_CLOSE
             }
             Self::SubscriptionStatus {
@@ -6464,7 +6312,7 @@ fn encode_open_receive(
         |value| value.requested_address_type,
     );
     let encryption = WireEncryptionInfo::from_public(encryption);
-    let base_v17 = WireOpenReceiveV17 {
+    let base = WireOpenReceiveV11 {
         conference_id,
         passthrough_party_id: party,
         packet_millis: packet_ms,
@@ -6477,18 +6325,22 @@ fn encode_open_receive(
         associated_stream_id,
         rfc2833_payload: u32::from(telephone_event_payload),
         dtmf_type,
-        mixing_mode,
-        direction,
-        remote: WireExtendedAddress::from_ip(source_address),
-        remote_port: u32::from(source_port),
-        requested_address_type,
     };
     match protocol.wire() {
         21.. => encode(
             wire_id::OPEN_RECEIVE_CHANNEL,
             &WireOpenReceiveV21 {
                 base: WireOpenReceiveV18 {
-                    base: base_v17,
+                    base: WireOpenReceiveV17 {
+                        base: WireOpenReceiveAddressed {
+                            base,
+                            mixing_mode,
+                            direction,
+                            remote: WireExtendedAddress::from_ip(source_address),
+                            remote_port: u32::from(source_port),
+                        },
+                        requested_address_type,
+                    },
                     audio_level_adjustment: wire.map_or(0, |value| value.audio_level_adjustment),
                 },
                 latent_capabilities: WireLatentCapabilities {
@@ -6499,57 +6351,50 @@ fn encode_open_receive(
         18..=20 => encode(
             wire_id::OPEN_RECEIVE_CHANNEL,
             &WireOpenReceiveV18 {
-                base: base_v17,
+                base: WireOpenReceiveV17 {
+                    base: WireOpenReceiveAddressed {
+                        base,
+                        mixing_mode,
+                        direction,
+                        remote: WireExtendedAddress::from_ip(source_address),
+                        remote_port: u32::from(source_port),
+                    },
+                    requested_address_type,
+                },
                 audio_level_adjustment: wire.map_or(0, |value| value.audio_level_adjustment),
             },
         ),
-        17 => encode(wire_id::OPEN_RECEIVE_CHANNEL, &base_v17),
+        17 => encode(
+            wire_id::OPEN_RECEIVE_CHANNEL,
+            &WireOpenReceiveV17 {
+                base: WireOpenReceiveAddressed {
+                    base,
+                    mixing_mode,
+                    direction,
+                    remote: WireExtendedAddress::from_ip(source_address),
+                    remote_port: u32::from(source_port),
+                },
+                requested_address_type,
+            },
+        ),
         version => {
-            let IpAddr::V4(source_address) = source_address else {
-                return Err(CodecError::InvalidValue {
-                    message_id: wire_id::OPEN_RECEIVE_CHANNEL,
-                    field: "IP address family for pre-v17 protocol",
-                    value: 1,
-                });
-            };
-            let base = WireOpenReceiveV11 {
-                conference_id,
-                passthrough_party_id: party,
-                packet_millis: packet_ms,
-                codec: codec.skinny(),
-                vad: echo_cancellation.wire_value(),
-                g723_bitrate,
-                call_reference: call,
-                encryption,
-                stream_passthrough_id,
-                associated_stream_id,
-                rfc2833_payload: u32::from(telephone_event_payload),
-                dtmf_type,
-            };
-            if version >= 12 {
-                encode(
+            let remote = WireIpv4Address::from_ip(
+                source_address,
+                wire_id::OPEN_RECEIVE_CHANNEL,
+                "IP address family for pre-v17 protocol",
+            )?;
+            match version {
+                12.. => encode(
                     wire_id::OPEN_RECEIVE_CHANNEL,
                     &WireOpenReceiveV12 {
-                        conference_id: base.conference_id,
-                        passthrough_party_id: base.passthrough_party_id,
-                        packet_millis: base.packet_millis,
-                        codec: base.codec,
-                        vad: base.vad,
-                        g723_bitrate: base.g723_bitrate,
-                        call_reference: base.call_reference,
-                        encryption: base.encryption,
-                        stream_passthrough_id: base.stream_passthrough_id,
-                        associated_stream_id: base.associated_stream_id,
-                        rfc2833_payload: base.rfc2833_payload,
-                        dtmf_type: base.dtmf_type,
+                        base,
                         mixing_mode,
                         direction,
-                        remote_ipv4: source_address.octets(),
+                        remote,
                         remote_port: u32::from(source_port),
                     },
-                )
-            } else {
-                encode(wire_id::OPEN_RECEIVE_CHANNEL, &base)
+                ),
+                _ => encode(wire_id::OPEN_RECEIVE_CHANNEL, &base),
             }
         }
     }
@@ -6583,92 +6428,96 @@ fn encode_start_media(
     let mixing_mode = wire.map_or(0, |value| value.mixing_mode);
     let direction = wire.map_or(1, |value| value.direction);
     let encryption = WireEncryptionInfo::from_public(encryption);
-    if protocol.wire() >= 17 {
-        let base = WireStartMediaV17 {
-            conference_id,
-            passthrough_party_id: party,
-            remote: WireExtendedAddress::from_ip(endpoint.address),
-            remote_port: u32::from(endpoint.rtp_port),
-            packet_millis: endpoint.packet_ms,
-            codec: endpoint.codec.skinny(),
-            precedence,
-            silence_suppression: silence_suppression.wire_value(),
-            max_frames_per_packet: endpoint.max_frames_per_packet,
-            g723_bitrate,
-            call_reference: call,
-            encryption,
-            stream_passthrough_id,
-            associated_stream_id,
-            rfc2833_payload: u32::from(endpoint.telephone_event_payload),
-            dtmf_type,
-            mixing_mode,
-            direction,
-        };
-        if protocol.wire() >= 21 {
-            encode(
-                wire_id::START_MEDIA_TRANSMISSION,
-                &WireStartMediaV21 {
-                    base,
-                    latent_capabilities: WireLatentCapabilities {
-                        bytes: wire.map_or([0; 36], |value| value.latent_capabilities),
+    match protocol.wire() {
+        21.. => encode(
+            wire_id::START_MEDIA_TRANSMISSION,
+            &WireStartMediaV21 {
+                base: WireStartMediaV17 {
+                    base: WireStartMediaBase {
+                        conference_id,
+                        passthrough_party_id: party,
+                        remote: WireExtendedAddress::from_ip(endpoint.address),
+                        remote_port: u32::from(endpoint.rtp_port),
+                        packet_millis: endpoint.packet_ms,
+                        codec: endpoint.codec.skinny(),
+                        precedence,
+                        silence_suppression: silence_suppression.wire_value(),
+                        max_frames_per_packet: endpoint.max_frames_per_packet,
+                        g723_bitrate,
+                        call_reference: call,
+                        encryption,
+                        stream_passthrough_id,
+                        associated_stream_id,
+                        rfc2833_payload: u32::from(endpoint.telephone_event_payload),
+                        dtmf_type,
                     },
-                },
-            )
-        } else {
-            encode(wire_id::START_MEDIA_TRANSMISSION, &base)
-        }
-    } else {
-        let IpAddr::V4(address) = endpoint.address else {
-            return Err(CodecError::InvalidValue {
-                message_id: wire_id::START_MEDIA_TRANSMISSION,
-                field: "IP address family for pre-v17 protocol",
-                value: 1,
-            });
-        };
-        let base = WireStartMediaV11 {
-            conference_id,
-            passthrough_party_id: party,
-            remote_ipv4: address.octets(),
-            remote_port: u32::from(endpoint.rtp_port),
-            packet_millis: endpoint.packet_ms,
-            codec: endpoint.codec.skinny(),
-            precedence,
-            silence_suppression: silence_suppression.wire_value(),
-            max_frames_per_packet: endpoint.max_frames_per_packet,
-            g723_bitrate,
-            call_reference: call,
-            encryption,
-            stream_passthrough_id,
-            associated_stream_id,
-            rfc2833_payload: u32::from(endpoint.telephone_event_payload),
-            dtmf_type,
-        };
-        if protocol.wire() >= 12 {
-            encode(
-                wire_id::START_MEDIA_TRANSMISSION,
-                &WireStartMediaV12 {
-                    conference_id: base.conference_id,
-                    passthrough_party_id: base.passthrough_party_id,
-                    remote_ipv4: base.remote_ipv4,
-                    remote_port: base.remote_port,
-                    packet_millis: base.packet_millis,
-                    codec: base.codec,
-                    precedence: base.precedence,
-                    silence_suppression: base.silence_suppression,
-                    max_frames_per_packet: base.max_frames_per_packet,
-                    g723_bitrate: base.g723_bitrate,
-                    call_reference: base.call_reference,
-                    encryption: base.encryption,
-                    stream_passthrough_id: base.stream_passthrough_id,
-                    associated_stream_id: base.associated_stream_id,
-                    rfc2833_payload: base.rfc2833_payload,
-                    dtmf_type: base.dtmf_type,
                     mixing_mode,
                     direction,
                 },
-            )
-        } else {
-            encode(wire_id::START_MEDIA_TRANSMISSION, &base)
+                latent_capabilities: WireLatentCapabilities {
+                    bytes: wire.map_or([0; 36], |value| value.latent_capabilities),
+                },
+            },
+        ),
+        17..=20 => encode(
+            wire_id::START_MEDIA_TRANSMISSION,
+            &WireStartMediaV17 {
+                base: WireStartMediaBase {
+                    conference_id,
+                    passthrough_party_id: party,
+                    remote: WireExtendedAddress::from_ip(endpoint.address),
+                    remote_port: u32::from(endpoint.rtp_port),
+                    packet_millis: endpoint.packet_ms,
+                    codec: endpoint.codec.skinny(),
+                    precedence,
+                    silence_suppression: silence_suppression.wire_value(),
+                    max_frames_per_packet: endpoint.max_frames_per_packet,
+                    g723_bitrate,
+                    call_reference: call,
+                    encryption,
+                    stream_passthrough_id,
+                    associated_stream_id,
+                    rfc2833_payload: u32::from(endpoint.telephone_event_payload),
+                    dtmf_type,
+                },
+                mixing_mode,
+                direction,
+            },
+        ),
+        version => {
+            let base = WireStartMediaV11 {
+                conference_id,
+                passthrough_party_id: party,
+                remote: WireIpv4Address::from_ip(
+                    endpoint.address,
+                    wire_id::START_MEDIA_TRANSMISSION,
+                    "IP address family for pre-v17 protocol",
+                )?,
+                remote_port: u32::from(endpoint.rtp_port),
+                packet_millis: endpoint.packet_ms,
+                codec: endpoint.codec.skinny(),
+                precedence,
+                silence_suppression: silence_suppression.wire_value(),
+                max_frames_per_packet: endpoint.max_frames_per_packet,
+                g723_bitrate,
+                call_reference: call,
+                encryption,
+                stream_passthrough_id,
+                associated_stream_id,
+                rfc2833_payload: u32::from(endpoint.telephone_event_payload),
+                dtmf_type,
+            };
+            match version {
+                12.. => encode(
+                    wire_id::START_MEDIA_TRANSMISSION,
+                    &WireStartMediaV12 {
+                        base,
+                        mixing_mode,
+                        direction,
+                    },
+                ),
+                _ => encode(wire_id::START_MEDIA_TRANSMISSION, &base),
+            }
         }
     }
 }
@@ -6677,10 +6526,10 @@ fn encode_start_multicast_reception(
     message: &MulticastMediaReception,
     protocol: ProtocolVersion,
 ) -> Result<Vec<u8>, CodecError> {
-    if protocol.wire() >= 17 {
-        encode(
+    match protocol.wire() {
+        17.. => encode(
             wire_id::START_MULTICAST_MEDIA_RECEPTION,
-            &WireStartMulticastReceptionV17 {
+            &WireStartMulticastReception::<WireExtendedAddress> {
                 conference_id: message.conference_id.get(),
                 passthrough_party_id: message.passthrough_party_id.get(),
                 address: WireExtendedAddress::from_ip(message.address),
@@ -6691,21 +6540,17 @@ fn encode_start_multicast_reception(
                 g723_bitrate: message.g723_bitrate.wire_value(),
                 call_reference: message.call_reference.get(),
             },
-        )
-    } else {
-        let IpAddr::V4(address) = message.address else {
-            return Err(CodecError::InvalidValue {
-                message_id: wire_id::START_MULTICAST_MEDIA_RECEPTION,
-                field: "IP address family for pre-v17 protocol",
-                value: 1,
-            });
-        };
-        encode(
+        ),
+        _ => encode(
             wire_id::START_MULTICAST_MEDIA_RECEPTION,
-            &WireStartMulticastReceptionV3 {
+            &WireStartMulticastReception::<WireIpv4Address> {
                 conference_id: message.conference_id.get(),
                 passthrough_party_id: message.passthrough_party_id.get(),
-                address: address.octets(),
+                address: WireIpv4Address::from_ip(
+                    message.address,
+                    wire_id::START_MULTICAST_MEDIA_RECEPTION,
+                    "IP address family for pre-v17 protocol",
+                )?,
                 port: u32::from(message.port),
                 packet_millis: message.packet_millis,
                 codec: message.codec.wire_value(),
@@ -6713,7 +6558,7 @@ fn encode_start_multicast_reception(
                 g723_bitrate: message.g723_bitrate.wire_value(),
                 call_reference: message.call_reference.get(),
             },
-        )
+        ),
     }
 }
 
@@ -6723,34 +6568,39 @@ fn decode_start_multicast_reception(
     message_id: u32,
 ) -> Result<ServerMessage, CodecError> {
     let (conference_id, party_id, address, port, packet_millis, codec, echo, g723, call_reference) =
-        if protocol.wire() >= 17 {
-            validate_exact_payload(payload, message_id, 52)?;
-            let value: WireStartMulticastReceptionV17 = decode(message_id, payload)?;
-            (
-                value.conference_id,
-                value.passthrough_party_id,
-                value.address.to_ip(message_id)?,
-                value.port,
-                value.packet_millis,
-                value.codec,
-                value.echo_cancellation,
-                value.g723_bitrate,
-                value.call_reference,
-            )
-        } else {
-            validate_exact_payload(payload, message_id, 36)?;
-            let value: WireStartMulticastReceptionV3 = decode(message_id, payload)?;
-            (
-                value.conference_id,
-                value.passthrough_party_id,
-                IpAddr::V4(Ipv4Addr::from(value.address)),
-                value.port,
-                value.packet_millis,
-                value.codec,
-                value.echo_cancellation,
-                value.g723_bitrate,
-                value.call_reference,
-            )
+        match protocol.wire() {
+            17.. => {
+                validate_exact_payload(payload, message_id, 52)?;
+                let value: WireStartMulticastReception<WireExtendedAddress> =
+                    decode(message_id, payload)?;
+                (
+                    value.conference_id,
+                    value.passthrough_party_id,
+                    value.address.to_ip(message_id)?,
+                    value.port,
+                    value.packet_millis,
+                    value.codec,
+                    value.echo_cancellation,
+                    value.g723_bitrate,
+                    value.call_reference,
+                )
+            }
+            _ => {
+                validate_exact_payload(payload, message_id, 36)?;
+                let value: WireStartMulticastReception<WireIpv4Address> =
+                    decode(message_id, payload)?;
+                (
+                    value.conference_id,
+                    value.passthrough_party_id,
+                    value.address.to_ip(message_id)?,
+                    value.port,
+                    value.packet_millis,
+                    value.codec,
+                    value.echo_cancellation,
+                    value.g723_bitrate,
+                    value.call_reference,
+                )
+            }
         };
     Ok(ServerMessage::StartMulticastMediaReception(
         MulticastMediaReception {
@@ -6771,10 +6621,10 @@ fn encode_start_multicast_transmission(
     message: &MulticastMediaTransmission,
     protocol: ProtocolVersion,
 ) -> Result<Vec<u8>, CodecError> {
-    if protocol.wire() >= 17 {
-        encode(
+    match protocol.wire() {
+        17.. => encode(
             wire_id::START_MULTICAST_MEDIA_TRANSMISSION,
-            &WireStartMulticastTransmissionV17 {
+            &WireStartMulticastTransmission::<WireExtendedAddress> {
                 conference_id: message.conference_id.get(),
                 passthrough_party_id: message.passthrough_party_id.get(),
                 address: WireExtendedAddress::from_ip(message.address),
@@ -6787,21 +6637,17 @@ fn encode_start_multicast_transmission(
                 g723_bitrate: message.g723_bitrate.wire_value(),
                 call_reference: message.call_reference.get(),
             },
-        )
-    } else {
-        let IpAddr::V4(address) = message.address else {
-            return Err(CodecError::InvalidValue {
-                message_id: wire_id::START_MULTICAST_MEDIA_TRANSMISSION,
-                field: "IP address family for pre-v17 protocol",
-                value: 1,
-            });
-        };
-        encode(
+        ),
+        _ => encode(
             wire_id::START_MULTICAST_MEDIA_TRANSMISSION,
-            &WireStartMulticastTransmissionV3 {
+            &WireStartMulticastTransmission::<WireIpv4Address> {
                 conference_id: message.conference_id.get(),
                 passthrough_party_id: message.passthrough_party_id.get(),
-                address: address.octets(),
+                address: WireIpv4Address::from_ip(
+                    message.address,
+                    wire_id::START_MULTICAST_MEDIA_TRANSMISSION,
+                    "IP address family for pre-v17 protocol",
+                )?,
                 port: u32::from(message.port),
                 packet_millis: message.packet_millis,
                 codec: message.codec.wire_value(),
@@ -6811,7 +6657,7 @@ fn encode_start_multicast_transmission(
                 g723_bitrate: message.g723_bitrate.wire_value(),
                 call_reference: message.call_reference.get(),
             },
-        )
+        ),
     }
 }
 
@@ -6832,38 +6678,43 @@ fn decode_start_multicast_transmission(
         max_frames,
         g723,
         call_reference,
-    ) = if protocol.wire() >= 17 {
-        validate_exact_payload(payload, message_id, 60)?;
-        let value: WireStartMulticastTransmissionV17 = decode(message_id, payload)?;
-        (
-            value.conference_id,
-            value.passthrough_party_id,
-            value.address.to_ip(message_id)?,
-            value.port,
-            value.packet_millis,
-            value.codec,
-            value.precedence,
-            value.silence_suppression,
-            value.max_frames_per_packet,
-            value.g723_bitrate,
-            value.call_reference,
-        )
-    } else {
-        validate_exact_payload(payload, message_id, 44)?;
-        let value: WireStartMulticastTransmissionV3 = decode(message_id, payload)?;
-        (
-            value.conference_id,
-            value.passthrough_party_id,
-            IpAddr::V4(Ipv4Addr::from(value.address)),
-            value.port,
-            value.packet_millis,
-            value.codec,
-            value.precedence,
-            value.silence_suppression,
-            value.max_frames_per_packet,
-            value.g723_bitrate,
-            value.call_reference,
-        )
+    ) = match protocol.wire() {
+        17.. => {
+            validate_exact_payload(payload, message_id, 60)?;
+            let value: WireStartMulticastTransmission<WireExtendedAddress> =
+                decode(message_id, payload)?;
+            (
+                value.conference_id,
+                value.passthrough_party_id,
+                value.address.to_ip(message_id)?,
+                value.port,
+                value.packet_millis,
+                value.codec,
+                value.precedence,
+                value.silence_suppression,
+                value.max_frames_per_packet,
+                value.g723_bitrate,
+                value.call_reference,
+            )
+        }
+        _ => {
+            validate_exact_payload(payload, message_id, 44)?;
+            let value: WireStartMulticastTransmission<WireIpv4Address> =
+                decode(message_id, payload)?;
+            (
+                value.conference_id,
+                value.passthrough_party_id,
+                value.address.to_ip(message_id)?,
+                value.port,
+                value.packet_millis,
+                value.codec,
+                value.precedence,
+                value.silence_suppression,
+                value.max_frames_per_packet,
+                value.g723_bitrate,
+                value.call_reference,
+            )
+        }
     };
     Ok(ServerMessage::StartMulticastMediaTransmission(
         MulticastMediaTransmission {
@@ -6902,23 +6753,27 @@ fn decode_open_receive(
         21.. => {
             let value: WireOpenReceiveV21 = decode(message_id, payload)?;
             (
-                value.base.base.call_reference,
-                value.base.base.passthrough_party_id,
-                value.base.base.packet_millis,
-                value.base.base.codec,
-                value.base.base.vad,
-                value.base.base.rfc2833_payload,
-                value.base.base.remote.to_ip(message_id)?,
-                decode_port(value.base.base.remote_port, message_id, "source RTP port")?,
-                value.base.base.encryption,
+                value.base.base.base.base.call_reference,
+                value.base.base.base.base.passthrough_party_id,
+                value.base.base.base.base.packet_millis,
+                value.base.base.base.base.codec,
+                value.base.base.base.base.vad,
+                value.base.base.base.base.rfc2833_payload,
+                value.base.base.base.remote.to_ip(message_id)?,
+                decode_port(
+                    value.base.base.base.remote_port,
+                    message_id,
+                    "source RTP port",
+                )?,
+                value.base.base.base.base.encryption,
                 OpenReceiveChannelWire {
-                    conference_id: value.base.base.conference_id,
-                    g723_bitrate: value.base.base.g723_bitrate,
-                    stream_passthrough_id: value.base.base.stream_passthrough_id,
-                    associated_stream_id: value.base.base.associated_stream_id,
-                    dtmf_type: value.base.base.dtmf_type,
-                    mixing_mode: value.base.base.mixing_mode,
-                    direction: value.base.base.direction,
+                    conference_id: value.base.base.base.base.conference_id,
+                    g723_bitrate: value.base.base.base.base.g723_bitrate,
+                    stream_passthrough_id: value.base.base.base.base.stream_passthrough_id,
+                    associated_stream_id: value.base.base.base.base.associated_stream_id,
+                    dtmf_type: value.base.base.base.base.dtmf_type,
+                    mixing_mode: value.base.base.base.mixing_mode,
+                    direction: value.base.base.base.direction,
                     requested_address_type: value.base.base.requested_address_type,
                     audio_level_adjustment: value.base.audio_level_adjustment,
                     latent_capabilities: value.latent_capabilities.bytes,
@@ -6928,23 +6783,23 @@ fn decode_open_receive(
         18..=20 => {
             let value: WireOpenReceiveV18 = decode(message_id, payload)?;
             (
-                value.base.call_reference,
-                value.base.passthrough_party_id,
-                value.base.packet_millis,
-                value.base.codec,
-                value.base.vad,
-                value.base.rfc2833_payload,
-                value.base.remote.to_ip(message_id)?,
-                decode_port(value.base.remote_port, message_id, "source RTP port")?,
-                value.base.encryption,
+                value.base.base.base.call_reference,
+                value.base.base.base.passthrough_party_id,
+                value.base.base.base.packet_millis,
+                value.base.base.base.codec,
+                value.base.base.base.vad,
+                value.base.base.base.rfc2833_payload,
+                value.base.base.remote.to_ip(message_id)?,
+                decode_port(value.base.base.remote_port, message_id, "source RTP port")?,
+                value.base.base.base.encryption,
                 OpenReceiveChannelWire {
-                    conference_id: value.base.conference_id,
-                    g723_bitrate: value.base.g723_bitrate,
-                    stream_passthrough_id: value.base.stream_passthrough_id,
-                    associated_stream_id: value.base.associated_stream_id,
-                    dtmf_type: value.base.dtmf_type,
-                    mixing_mode: value.base.mixing_mode,
-                    direction: value.base.direction,
+                    conference_id: value.base.base.base.conference_id,
+                    g723_bitrate: value.base.base.base.g723_bitrate,
+                    stream_passthrough_id: value.base.base.base.stream_passthrough_id,
+                    associated_stream_id: value.base.base.base.associated_stream_id,
+                    dtmf_type: value.base.base.base.dtmf_type,
+                    mixing_mode: value.base.base.mixing_mode,
+                    direction: value.base.base.direction,
                     requested_address_type: value.base.requested_address_type,
                     audio_level_adjustment: value.audio_level_adjustment,
                     latent_capabilities: [0; 36],
@@ -6954,23 +6809,23 @@ fn decode_open_receive(
         17 => {
             let value: WireOpenReceiveV17 = decode(message_id, payload)?;
             (
-                value.call_reference,
-                value.passthrough_party_id,
-                value.packet_millis,
-                value.codec,
-                value.vad,
-                value.rfc2833_payload,
-                value.remote.to_ip(message_id)?,
-                decode_port(value.remote_port, message_id, "source RTP port")?,
-                value.encryption,
+                value.base.base.call_reference,
+                value.base.base.passthrough_party_id,
+                value.base.base.packet_millis,
+                value.base.base.codec,
+                value.base.base.vad,
+                value.base.base.rfc2833_payload,
+                value.base.remote.to_ip(message_id)?,
+                decode_port(value.base.remote_port, message_id, "source RTP port")?,
+                value.base.base.encryption,
                 OpenReceiveChannelWire {
-                    conference_id: value.conference_id,
-                    g723_bitrate: value.g723_bitrate,
-                    stream_passthrough_id: value.stream_passthrough_id,
-                    associated_stream_id: value.associated_stream_id,
-                    dtmf_type: value.dtmf_type,
-                    mixing_mode: value.mixing_mode,
-                    direction: value.direction,
+                    conference_id: value.base.base.conference_id,
+                    g723_bitrate: value.base.base.g723_bitrate,
+                    stream_passthrough_id: value.base.base.stream_passthrough_id,
+                    associated_stream_id: value.base.base.associated_stream_id,
+                    dtmf_type: value.base.base.dtmf_type,
+                    mixing_mode: value.base.mixing_mode,
+                    direction: value.base.direction,
                     requested_address_type: value.requested_address_type,
                     audio_level_adjustment: 0,
                     latent_capabilities: [0; 36],
@@ -6980,21 +6835,21 @@ fn decode_open_receive(
         12..=16 => {
             let value: WireOpenReceiveV12 = decode(message_id, payload)?;
             (
-                value.call_reference,
-                value.passthrough_party_id,
-                value.packet_millis,
-                value.codec,
-                value.vad,
-                value.rfc2833_payload,
-                IpAddr::V4(Ipv4Addr::from(value.remote_ipv4)),
+                value.base.call_reference,
+                value.base.passthrough_party_id,
+                value.base.packet_millis,
+                value.base.codec,
+                value.base.vad,
+                value.base.rfc2833_payload,
+                value.remote.to_ip(message_id)?,
                 decode_port(value.remote_port, message_id, "source RTP port")?,
-                value.encryption,
+                value.base.encryption,
                 OpenReceiveChannelWire {
-                    conference_id: value.conference_id,
-                    g723_bitrate: value.g723_bitrate,
-                    stream_passthrough_id: value.stream_passthrough_id,
-                    associated_stream_id: value.associated_stream_id,
-                    dtmf_type: value.dtmf_type,
+                    conference_id: value.base.conference_id,
+                    g723_bitrate: value.base.g723_bitrate,
+                    stream_passthrough_id: value.base.stream_passthrough_id,
+                    associated_stream_id: value.base.associated_stream_id,
+                    dtmf_type: value.base.dtmf_type,
                     mixing_mode: value.mixing_mode,
                     direction: value.direction,
                     requested_address_type: 0,
@@ -7072,6 +6927,32 @@ fn decode_start_media(
         21.. => {
             let value: WireStartMediaV21 = decode(message_id, payload)?;
             (
+                value.base.base.call_reference,
+                value.base.base.passthrough_party_id,
+                value.base.base.remote.to_ip(message_id)?,
+                value.base.base.remote_port,
+                value.base.base.packet_millis,
+                value.base.base.codec,
+                value.base.base.precedence,
+                value.base.base.silence_suppression,
+                value.base.base.max_frames_per_packet,
+                value.base.base.rfc2833_payload,
+                value.base.base.encryption,
+                StartMediaTransmissionWire {
+                    conference_id: value.base.base.conference_id,
+                    g723_bitrate: value.base.base.g723_bitrate,
+                    stream_passthrough_id: value.base.base.stream_passthrough_id,
+                    associated_stream_id: value.base.base.associated_stream_id,
+                    dtmf_type: value.base.base.dtmf_type,
+                    mixing_mode: value.base.mixing_mode,
+                    direction: value.base.direction,
+                    latent_capabilities: value.latent_capabilities.bytes,
+                },
+            )
+        }
+        17..=20 => {
+            let value: WireStartMediaV17 = decode(message_id, payload)?;
+            (
                 value.base.call_reference,
                 value.base.passthrough_party_id,
                 value.base.remote.to_ip(message_id)?,
@@ -7089,32 +6970,6 @@ fn decode_start_media(
                     stream_passthrough_id: value.base.stream_passthrough_id,
                     associated_stream_id: value.base.associated_stream_id,
                     dtmf_type: value.base.dtmf_type,
-                    mixing_mode: value.base.mixing_mode,
-                    direction: value.base.direction,
-                    latent_capabilities: value.latent_capabilities.bytes,
-                },
-            )
-        }
-        17..=20 => {
-            let value: WireStartMediaV17 = decode(message_id, payload)?;
-            (
-                value.call_reference,
-                value.passthrough_party_id,
-                value.remote.to_ip(message_id)?,
-                value.remote_port,
-                value.packet_millis,
-                value.codec,
-                value.precedence,
-                value.silence_suppression,
-                value.max_frames_per_packet,
-                value.rfc2833_payload,
-                value.encryption,
-                StartMediaTransmissionWire {
-                    conference_id: value.conference_id,
-                    g723_bitrate: value.g723_bitrate,
-                    stream_passthrough_id: value.stream_passthrough_id,
-                    associated_stream_id: value.associated_stream_id,
-                    dtmf_type: value.dtmf_type,
                     mixing_mode: value.mixing_mode,
                     direction: value.direction,
                     latent_capabilities: [0; 36],
@@ -7124,23 +6979,23 @@ fn decode_start_media(
         12..=16 => {
             let value: WireStartMediaV12 = decode(message_id, payload)?;
             (
-                value.call_reference,
-                value.passthrough_party_id,
-                IpAddr::V4(Ipv4Addr::from(value.remote_ipv4)),
-                value.remote_port,
-                value.packet_millis,
-                value.codec,
-                value.precedence,
-                value.silence_suppression,
-                value.max_frames_per_packet,
-                value.rfc2833_payload,
-                value.encryption,
+                value.base.call_reference,
+                value.base.passthrough_party_id,
+                value.base.remote.to_ip(message_id)?,
+                value.base.remote_port,
+                value.base.packet_millis,
+                value.base.codec,
+                value.base.precedence,
+                value.base.silence_suppression,
+                value.base.max_frames_per_packet,
+                value.base.rfc2833_payload,
+                value.base.encryption,
                 StartMediaTransmissionWire {
-                    conference_id: value.conference_id,
-                    g723_bitrate: value.g723_bitrate,
-                    stream_passthrough_id: value.stream_passthrough_id,
-                    associated_stream_id: value.associated_stream_id,
-                    dtmf_type: value.dtmf_type,
+                    conference_id: value.base.conference_id,
+                    g723_bitrate: value.base.g723_bitrate,
+                    stream_passthrough_id: value.base.stream_passthrough_id,
+                    associated_stream_id: value.base.associated_stream_id,
+                    dtmf_type: value.base.dtmf_type,
                     mixing_mode: value.mixing_mode,
                     direction: value.direction,
                     latent_capabilities: [0; 36],
@@ -7152,7 +7007,7 @@ fn decode_start_media(
             (
                 value.call_reference,
                 value.passthrough_party_id,
-                IpAddr::V4(Ipv4Addr::from(value.remote_ipv4)),
+                value.remote.to_ip(message_id)?,
                 value.remote_port,
                 value.packet_millis,
                 value.codec,
@@ -7463,7 +7318,7 @@ mod tests {
     #[test]
     fn connection_statistics_reject_oversized_quality_payloads() {
         let payload = WireConnectionStatisticsV22 {
-            directory_number: WireFixedText::new(
+            directory_number: WireAlignedText::new(
                 wire_id::CONNECTION_STATISTICS_RES,
                 "directory number",
                 "2002",
@@ -7472,13 +7327,15 @@ mod tests {
             call_reference: 42,
             processing: StatisticsProcessing::Clear.wire_value() as u8,
             statistics: WireConnectionStatisticsTail {
-                packets_sent: 1,
-                octets_sent: 2,
-                packets_received: 3,
-                octets_received: 4,
-                packets_lost: 5,
-                jitter_millis: 6,
-                latency_millis: 7,
+                counters: WireConnectionStatisticsCounters {
+                    packets_sent: 1,
+                    octets_sent: 2,
+                    packets_received: 3,
+                    octets_received: 4,
+                    packets_lost: 5,
+                    jitter_millis: 6,
+                    latency_millis: 7,
+                },
                 quality_size: (CONNECTION_QUALITY_MAX_BYTES + 1) as u32,
             },
             quality: vec![0; CONNECTION_QUALITY_MAX_BYTES + 1],
@@ -7505,7 +7362,7 @@ mod tests {
         let mut payload = encode(
             wire_id::CONNECTION_STATISTICS_RES,
             &WireConnectionStatisticsV22Prefix {
-                directory_number: WireFixedText::new(
+                directory_number: WireAlignedText::new(
                     wire_id::CONNECTION_STATISTICS_RES,
                     "directory number",
                     "2002",
@@ -7513,13 +7370,15 @@ mod tests {
                 .unwrap(),
                 call_reference: 0x1122_3344,
                 processing: StatisticsProcessing::DoNotClear.wire_value() as u8,
-                packets_sent: 0x0102_0304,
-                octets_sent: 0x1112_1314,
-                packets_received: 0x2122_2324,
-                octets_received: 0x3132_3334,
-                packets_lost: 0x4142_4344,
-                jitter_millis: 0x5152_5354,
-                latency_millis: 0x6162_6364,
+                counters: WireConnectionStatisticsCounters {
+                    packets_sent: 0x0102_0304,
+                    octets_sent: 0x1112_1314,
+                    packets_received: 0x2122_2324,
+                    octets_received: 0x3132_3334,
+                    packets_lost: 0x4142_4344,
+                    jitter_millis: 0x5152_5354,
+                    latency_millis: 0x6162_6364,
+                },
             },
         )
         .unwrap();
@@ -7708,7 +7567,16 @@ mod tests {
                 passthrough_party_id: 9,
                 call_reference: 7,
             };
-            assert_eq!(open.encode(protocol).unwrap().len() - 12, open_size);
+            let open_bytes = open.encode(protocol).unwrap();
+            assert_eq!(open_bytes.len() - 12, open_size);
+            assert_eq!(
+                ClientMessage::decode_with_version(
+                    FrameDecoder::new().push(&open_bytes).unwrap().remove(0),
+                    protocol,
+                )
+                .unwrap(),
+                open
+            );
 
             let start = ClientMessage::StartMediaTransmissionAck(MediaTransmissionAck {
                 conference_id: 6,
@@ -7736,7 +7604,16 @@ mod tests {
                 call_reference: 7,
                 status: MediaStatus::UnspecifiedError,
             };
-            assert_eq!(failure.encode(protocol).unwrap().len() - 12, failure_size);
+            let failure_bytes = failure.encode(protocol).unwrap();
+            assert_eq!(failure_bytes.len() - 12, failure_size);
+            assert_eq!(
+                ClientMessage::decode_with_version(
+                    FrameDecoder::new().push(&failure_bytes).unwrap().remove(0),
+                    protocol,
+                )
+                .unwrap(),
+                failure
+            );
         }
 
         for message_id in [
@@ -7858,10 +7735,9 @@ mod tests {
             });
             let bytes = message.encode(protocol).unwrap();
             assert_eq!(bytes.len() - 12, expected_size);
-            let traffic_class_offset = if protocol >= ProtocolVersion::V17 {
-                60
-            } else {
-                44
+            let traffic_class_offset = match protocol.wire() {
+                17.. => 60,
+                _ => 44,
             };
             assert_eq!(
                 &bytes[traffic_class_offset..traffic_class_offset + 4],
@@ -9032,23 +8908,27 @@ mod tests {
         );
 
         let connection_statistics = WireConnectionStatisticsV19 {
-            directory_number: WireFixedText::new(
-                wire_id::CONNECTION_STATISTICS_RES,
-                "directory number",
-                "2002",
-            )
-            .unwrap(),
-            alignment: [1, 0, 0],
+            directory_number: WireAlignedText {
+                value: WireFixedText::new(
+                    wire_id::CONNECTION_STATISTICS_RES,
+                    "directory number",
+                    "2002",
+                )
+                .unwrap(),
+                alignment: [1, 0, 0],
+            },
             call_reference: 42,
             processing: StatisticsProcessing::Clear.wire_value(),
             statistics: WireConnectionStatisticsTail {
-                packets_sent: 0,
-                octets_sent: 0,
-                packets_received: 0,
-                octets_received: 0,
-                packets_lost: 0,
-                jitter_millis: 0,
-                latency_millis: 0,
+                counters: WireConnectionStatisticsCounters {
+                    packets_sent: 0,
+                    octets_sent: 0,
+                    packets_received: 0,
+                    octets_received: 0,
+                    packets_lost: 0,
+                    jitter_millis: 0,
+                    latency_millis: 0,
+                },
                 quality_size: 0,
             },
             quality: Vec::new(),
