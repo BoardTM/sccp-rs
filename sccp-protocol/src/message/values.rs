@@ -209,335 +209,227 @@ pub enum LayoutProfile {
 wire_enum! {
     /// Station device model identifier.
     pub enum DeviceType {
-        /// Identifies the `Undefined` station, gateway, or service device type.
-        /// Uses SCCP device-type value `0` during registration and provisioning.
+        /// No concrete device model was supplied; used as the zero/default device type.
         Undefined = 0,
-        /// Identifies the `Phone30SpPlus` station, gateway, or service device type.
-        /// Uses SCCP device-type value `1` during registration and provisioning.
+        /// Legacy Cisco 30-button SP+ hardware station.
         Phone30SpPlus = 1,
-        /// Identifies the `Phone12SpPlus` station, gateway, or service device type.
-        /// Uses SCCP device-type value `2` during registration and provisioning.
+        /// Legacy Cisco 12-button SP+ hardware station.
         Phone12SpPlus = 2,
-        /// Identifies the `Phone12Sp` station, gateway, or service device type.
-        /// Uses SCCP device-type value `3` during registration and provisioning.
+        /// Legacy Cisco 12-button SP hardware station.
         Phone12Sp = 3,
-        /// Identifies the `Phone12` station, gateway, or service device type.
-        /// Uses SCCP device-type value `4` during registration and provisioning.
+        /// Legacy Cisco 12-button station without the SP feature set.
         Phone12 = 4,
-        /// Identifies the `Phone30Vip` station, gateway, or service device type.
-        /// Uses SCCP device-type value `5` during registration and provisioning.
+        /// Legacy Cisco 30-button VIP hardware station.
         Phone30Vip = 5,
-        /// Identifies the `Cisco7910` station, gateway, or service device type.
-        /// Uses SCCP device-type value `6` during registration and provisioning.
+        /// Cisco Unified IP Phone 7910, an early basic SCCP desk phone.
         Cisco7910 = 6,
-        /// Identifies the `Cisco7960` station, gateway, or service device type.
-        /// Uses SCCP device-type value `7` during registration and provisioning.
+        /// Cisco Unified IP Phone 7960, a six-line SCCP desk phone.
         Cisco7960 = 7,
-        /// Identifies the `Cisco7940` station, gateway, or service device type.
-        /// Uses SCCP device-type value `8` during registration and provisioning.
+        /// Cisco Unified IP Phone 7940, a two-line SCCP desk phone.
         Cisco7940 = 8,
-        /// Identifies the `Cisco7935` station, gateway, or service device type.
-        /// Uses SCCP device-type value `9` during registration and provisioning.
+        /// Cisco Unified IP Conference Station 7935.
         Cisco7935 = 9,
-        /// Identifies the `Vgc` station, gateway, or service device type.
-        /// Uses SCCP device-type value `10` during registration and provisioning.
+        /// A Cisco Voice Gateway Controller phone endpoint representing an analog gateway port.
         Vgc = 10,
-        /// Identifies the `Ata186` station, gateway, or service device type.
-        /// Uses SCCP device-type value `12` during registration and provisioning.
+        /// Cisco ATA 186 analog telephone adapter.
         Ata186 = 12,
-        /// Identifies the `Ata188` station, gateway, or service device type.
-        /// Uses SCCP device-type value `13` during registration and provisioning.
+        /// Cisco ATA 188 two-port analog telephone adapter with an Ethernet pass-through port.
         Ata188 = 13,
-        /// Identifies the `Virtual30SpPlus` station, gateway, or service device type.
-        /// Uses SCCP device-type value `20` during registration and provisioning.
+        /// The virtual counterpart of the legacy 30 SP+ station, used without matching physical hardware.
         Virtual30SpPlus = 20,
-        /// Identifies the `PhoneApplication` station, gateway, or service device type.
-        /// Uses SCCP device-type value `21` during registration and provisioning.
+        /// A software or application-controlled phone endpoint represented as a station device.
         PhoneApplication = 21,
-        /// Identifies the `AnalogAccess` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30` during registration and provisioning.
+        /// A generic analog-access gateway resource.
         AnalogAccess = 30,
-        /// Identifies the `DigitalAccessPri` station, gateway, or service device type.
-        /// Uses SCCP device-type value `40` during registration and provisioning.
+        /// A first-generation digital-access PRI resource, historically named DigitalAccessTitan1.
         DigitalAccessPri = 40,
-        /// Identifies the `DigitalAccessT1` station, gateway, or service device type.
-        /// Uses SCCP device-type value `41` during registration and provisioning.
+        /// A digital-access resource for a channelized T1 interface.
         DigitalAccessT1 = 41,
-        /// Identifies the `DigitalAccessTitan2` station, gateway, or service device type.
-        /// Uses SCCP device-type value `42` during registration and provisioning.
+        /// A second-generation digital-access gateway resource carrying Cisco's Titan2 codename.
         DigitalAccessTitan2 = 42,
-        /// Identifies the `AnalogAccessElvis` station, gateway, or service device type.
-        /// Uses SCCP device-type value `43` during registration and provisioning.
+        /// Historical Cisco tables identify this device type as DigitalAccessLennon or WS-X6608 digital access.
+        /// The Rust variant name appears to be swapped with `DigitalAccessLennon`.
         AnalogAccessElvis = 43,
-        /// Identifies the `DigitalAccessLennon` station, gateway, or service device type.
-        /// Uses SCCP device-type value `47` during registration and provisioning.
+        /// Historical Cisco tables identify this device type as AnalogAccessElvis or WS-X6624 analog access.
+        /// The Rust variant name appears to be swapped with `AnalogAccessElvis`.
         DigitalAccessLennon = 47,
-        /// Identifies the `ConferenceBridge` station, gateway, or service device type.
-        /// Uses SCCP device-type value `50` during registration and provisioning.
+        /// A generic CUCM conference-bridge media resource rather than a handset.
         ConferenceBridge = 50,
-        /// Identifies the `ConferenceBridgeYoko` station, gateway, or service device type.
-        /// Uses SCCP device-type value `51` during registration and provisioning.
+        /// A conference-bridge implementation generation carrying Cisco's Yoko codename.
         ConferenceBridgeYoko = 51,
-        /// Identifies the `ConferenceBridgeDixieland` station, gateway, or service device type.
-        /// Uses SCCP device-type value `52` during registration and provisioning.
+        /// A conference-bridge implementation generation carrying Cisco's Dixieland codename.
         ConferenceBridgeDixieland = 52,
-        /// Identifies the `ConferenceBridgeSummit` station, gateway, or service device type.
-        /// Uses SCCP device-type value `53` during registration and provisioning.
+        /// A conference-bridge implementation generation carrying Cisco's Summit codename.
         ConferenceBridgeSummit = 53,
-        /// Identifies the `H225` station, gateway, or service device type.
-        /// Uses SCCP device-type value `60` during registration and provisioning.
+        /// An H.225 call-signaling endpoint used by the H.323 stack.
         H225 = 60,
-        /// Identifies the `H323Phone` station, gateway, or service device type.
-        /// Uses SCCP device-type value `61` during registration and provisioning.
+        /// An H.323 telephone endpoint represented in CUCM's device table.
         H323Phone = 61,
-        /// Identifies the `H323Trunk` station, gateway, or service device type.
-        /// Uses SCCP device-type value `62` during registration and provisioning.
+        /// An H.323 gateway or trunk endpoint rather than an SCCP station.
         H323Trunk = 62,
-        /// Identifies the `MusicOnHold` station, gateway, or service device type.
-        /// Uses SCCP device-type value `70` during registration and provisioning.
+        /// A CUCM music-on-hold media resource.
         MusicOnHold = 70,
-        /// Identifies the `Pilot` station, gateway, or service device type.
-        /// Uses SCCP device-type value `71` during registration and provisioning.
+        /// A logical call-routing pilot rather than a physical endpoint.
         Pilot = 71,
-        /// Identifies the `TapiPort` station, gateway, or service device type.
-        /// Uses SCCP device-type value `72` during registration and provisioning.
+        /// A CTI/TAPI-controlled port used by telephony applications.
         TapiPort = 72,
-        /// Identifies the `TapiRoutePoint` station, gateway, or service device type.
-        /// Uses SCCP device-type value `73` during registration and provisioning.
+        /// A CTI/TAPI route point that applications use to receive and redirect calls.
         TapiRoutePoint = 73,
-        /// Identifies the `VoiceInbox` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80` during registration and provisioning.
+        /// A voicemail or voice-inbox port represented as a callable device.
         VoiceInbox = 80,
-        /// Identifies the `VoiceInboxAdmin` station, gateway, or service device type.
-        /// Uses SCCP device-type value `81` during registration and provisioning.
+        /// The administrative endpoint associated with a voice-inbox service.
         VoiceInboxAdmin = 81,
-        /// Identifies the `LineAnnunciator` station, gateway, or service device type.
-        /// Uses SCCP device-type value `82` during registration and provisioning.
+        /// A media resource that injects announcements or call-progress prompts on a line.
         LineAnnunciator = 82,
-        /// Identifies the `SoftwareMtpDixieland` station, gateway, or service device type.
-        /// Uses SCCP device-type value `83` during registration and provisioning.
+        /// A software media-termination-point implementation carrying Cisco's Dixieland codename.
         SoftwareMtpDixieland = 83,
-        /// Identifies the `CiscoMediaServer` station, gateway, or service device type.
-        /// Uses SCCP device-type value `84` during registration and provisioning.
+        /// A Cisco media-server resource providing media processing rather than station service.
         CiscoMediaServer = 84,
-        /// Identifies the `ConferenceBridgeFlint` station, gateway, or service device type.
-        /// Uses SCCP device-type value `85` during registration and provisioning.
+        /// A conference-bridge implementation generation carrying Cisco's Flint codename.
         ConferenceBridgeFlint = 85,
-        /// Identifies the `RouteList` station, gateway, or service device type.
-        /// Uses SCCP device-type value `90` during registration and provisioning.
+        /// A logical CUCM route list used to select trunks and gateways.
         RouteList = 90,
-        /// Identifies the `LoadSimulator` station, gateway, or service device type.
-        /// Uses SCCP device-type value `100` during registration and provisioning.
+        /// Cisco's synthetic station type for registration and call-load testing.
         LoadSimulator = 100,
-        /// Identifies the `MediaTerminationPoint` station, gateway, or service device type.
-        /// Uses SCCP device-type value `110` during registration and provisioning.
+        /// A generic media termination point used to relay or adapt media signaling.
         MediaTerminationPoint = 110,
-        /// Identifies the `MediaTerminationPointYoko` station, gateway, or service device type.
-        /// Uses SCCP device-type value `111` during registration and provisioning.
+        /// A hardware media termination point carrying Cisco's Yoko generation name.
         MediaTerminationPointYoko = 111,
-        /// Identifies the `MediaTerminationPointDixieland` station, gateway, or service device type.
-        /// Uses SCCP device-type value `112` during registration and provisioning.
+        /// A media termination point carrying Cisco's Dixieland generation name.
         MediaTerminationPointDixieland = 112,
-        /// Identifies the `MediaTerminationPointSummit` station, gateway, or service device type.
-        /// Uses SCCP device-type value `113` during registration and provisioning.
+        /// A media termination point carrying Cisco's Summit generation name.
         MediaTerminationPointSummit = 113,
-        /// Identifies the `Cisco7941` station, gateway, or service device type.
-        /// Uses SCCP device-type value `115` during registration and provisioning.
+        /// Cisco Unified IP Phone 7941G, a two-line programmable SCCP desk phone.
         Cisco7941 = 115,
-        /// Identifies the `Cisco7971` station, gateway, or service device type.
-        /// Uses SCCP device-type value `119` during registration and provisioning.
+        /// Cisco Unified IP Phone 7971G-GE, a color touch-screen SCCP desk phone with Gigabit Ethernet.
         Cisco7971 = 119,
-        /// Identifies the `MgcpStation` station, gateway, or service device type.
-        /// Uses SCCP device-type value `120` during registration and provisioning.
+        /// An analog station port controlled through MGCP.
         MgcpStation = 120,
-        /// Identifies the `MgcpTrunk` station, gateway, or service device type.
-        /// Uses SCCP device-type value `121` during registration and provisioning.
+        /// A trunk endpoint controlled through MGCP.
         MgcpTrunk = 121,
-        /// Identifies the `RasProxy` station, gateway, or service device type.
-        /// Uses SCCP device-type value `122` during registration and provisioning.
+        /// An H.323 Registration, Admission, and Status proxy resource.
         RasProxy = 122,
-        /// Identifies the `CiscoAddon7914` station, gateway, or service device type.
-        /// Uses SCCP device-type value `124` during registration and provisioning.
+        /// Cisco 7914 fourteen-button line expansion module attached to a compatible desk phone.
         CiscoAddon7914 = 124,
-        /// Identifies the `Trunk` station, gateway, or service device type.
-        /// Uses SCCP device-type value `125` during registration and provisioning.
+        /// A generic call-routing trunk whose more specific signaling family is not encoded here.
         Trunk = 125,
-        /// Identifies the `Annunciator` station, gateway, or service device type.
-        /// Uses SCCP device-type value `126` during registration and provisioning.
+        /// A CUCM annunciator media resource that plays tones and recorded prompts.
         Annunciator = 126,
-        /// Identifies the `MonitorBridge` station, gateway, or service device type.
-        /// Uses SCCP device-type value `127` during registration and provisioning.
+        /// A media bridge used to fork call audio for monitoring.
         MonitorBridge = 127,
-        /// Identifies the `Recorder` station, gateway, or service device type.
-        /// Uses SCCP device-type value `128` during registration and provisioning.
+        /// A recording media resource represented as a CUCM device.
         Recorder = 128,
-        /// Identifies the `MonitorBridgeYoko` station, gateway, or service device type.
-        /// Uses SCCP device-type value `129` during registration and provisioning.
+        /// A monitoring bridge implementation carrying Cisco's Yoko generation name.
         MonitorBridgeYoko = 129,
-        /// Identifies the `SipTrunk` station, gateway, or service device type.
-        /// Uses SCCP device-type value `131` during registration and provisioning.
+        /// A SIP signaling trunk represented in CUCM's common device-type namespace.
         SipTrunk = 131,
-        /// Identifies the `CiscoAddon7915_12` station, gateway, or service device type.
-        /// Uses SCCP device-type value `227` during registration and provisioning.
+        /// Cisco 7915 expansion module operating in its 12-button layout.
         CiscoAddon7915_12 = 227,
-        /// Identifies the `CiscoAddon7915_24` station, gateway, or service device type.
-        /// Uses SCCP device-type value `228` during registration and provisioning.
+        /// Cisco 7915 expansion module operating in its 24-button layout.
         CiscoAddon7915_24 = 228,
-        /// Identifies the `CiscoAddon7916_12` station, gateway, or service device type.
-        /// Uses SCCP device-type value `229` during registration and provisioning.
+        /// Cisco 7916 expansion module operating in its 12-button layout.
         CiscoAddon7916_12 = 229,
-        /// Identifies the `CiscoAddon7916_24` station, gateway, or service device type.
-        /// Uses SCCP device-type value `230` during registration and provisioning.
+        /// Cisco 7916 expansion module operating in its 24-button layout.
         CiscoAddon7916_24 = 230,
-        /// Identifies the `NokiaESeries` station, gateway, or service device type.
-        /// Uses SCCP device-type value `275` during registration and provisioning.
+        /// Nokia E-series mobile phone running a Cisco-compatible SCCP client.
         NokiaESeries = 275,
-        /// Identifies the `Cisco7985` station, gateway, or service device type.
-        /// Uses SCCP device-type value `302` during registration and provisioning.
+        /// Cisco Unified IP Phone 7985G desktop video phone.
         Cisco7985 = 302,
-        /// Identifies the `Cisco7911` station, gateway, or service device type.
-        /// Uses SCCP device-type value `307` during registration and provisioning.
+        /// Cisco Unified IP Phone 7911G, a basic single-line SCCP desk phone.
         Cisco7911 = 307,
-        /// Identifies the `Cisco7961Ge` station, gateway, or service device type.
-        /// Uses SCCP device-type value `308` during registration and provisioning.
+        /// Cisco Unified IP Phone 7961G-GE, the Gigabit Ethernet six-line model.
         Cisco7961Ge = 308,
-        /// Identifies the `Cisco7941Ge` station, gateway, or service device type.
-        /// Uses SCCP device-type value `309` during registration and provisioning.
+        /// Cisco Unified IP Phone 7941G-GE, the Gigabit Ethernet two-line model.
         Cisco7941Ge = 309,
-        /// Identifies the `Cisco7931` station, gateway, or service device type.
-        /// Uses SCCP device-type value `348` during registration and provisioning.
+        /// Cisco Unified IP Phone 7931G, a desk phone with a large set of programmable line and feature keys.
         Cisco7931 = 348,
-        /// Identifies the `Cisco7921` station, gateway, or service device type.
-        /// Uses SCCP device-type value `365` during registration and provisioning.
+        /// Cisco Unified Wireless IP Phone 7921G.
         Cisco7921 = 365,
-        /// Identifies the `Cisco7906` station, gateway, or service device type.
-        /// Uses SCCP device-type value `369` during registration and provisioning.
+        /// Cisco Unified IP Phone 7906G, a basic single-line SCCP desk phone.
         Cisco7906 = 369,
-        /// Identifies the `NokiaIcc` station, gateway, or service device type.
-        /// Uses SCCP device-type value `376` during registration and provisioning.
+        /// Nokia Internet Call Client acting as an SCCP software endpoint.
         NokiaIcc = 376,
-        /// Identifies the `Cisco7962` station, gateway, or service device type.
-        /// Uses SCCP device-type value `404` during registration and provisioning.
+        /// Cisco Unified IP Phone 7962G, a six-line monochrome SCCP desk phone.
         Cisco7962 = 404,
-        /// Identifies the `Cisco7937` station, gateway, or service device type.
-        /// Uses SCCP device-type value `431` during registration and provisioning.
+        /// Cisco Unified IP Conference Station 7937G.
         Cisco7937 = 431,
-        /// Identifies the `Cisco7942` station, gateway, or service device type.
-        /// Uses SCCP device-type value `434` during registration and provisioning.
+        /// Cisco Unified IP Phone 7942G, a two-line monochrome SCCP desk phone.
         Cisco7942 = 434,
-        /// Identifies the `Cisco7945` station, gateway, or service device type.
-        /// Uses SCCP device-type value `435` during registration and provisioning.
+        /// Cisco Unified IP Phone 7945G, a two-line color SCCP desk phone with Gigabit Ethernet.
         Cisco7945 = 435,
-        /// Identifies the `Cisco7965` station, gateway, or service device type.
-        /// Uses SCCP device-type value `436` during registration and provisioning.
+        /// Cisco Unified IP Phone 7965G, a six-line color SCCP desk phone with Gigabit Ethernet.
         Cisco7965 = 436,
-        /// Identifies the `Cisco7975` station, gateway, or service device type.
-        /// Uses SCCP device-type value `437` during registration and provisioning.
+        /// Cisco Unified IP Phone 7975G, an eight-line color touch-screen SCCP desk phone.
         Cisco7975 = 437,
-        /// Identifies the `Cisco7925` station, gateway, or service device type.
-        /// Uses SCCP device-type value `484` during registration and provisioning.
+        /// Cisco Unified Wireless IP Phone 7925G.
         Cisco7925 = 484,
-        /// Identifies the `Cisco6921` station, gateway, or service device type.
-        /// Uses SCCP device-type value `495` during registration and provisioning.
+        /// Cisco Unified IP Phone 6921, a two-line entry-level desk phone.
         Cisco6921 = 495,
-        /// Identifies the `Cisco6941` station, gateway, or service device type.
-        /// Uses SCCP device-type value `496` during registration and provisioning.
+        /// Cisco Unified IP Phone 6941, a four-line desk phone.
         Cisco6941 = 496,
-        /// Identifies the `Cisco6961` station, gateway, or service device type.
-        /// Uses SCCP device-type value `497` during registration and provisioning.
+        /// Cisco Unified IP Phone 6961, a twelve-line desk phone.
         Cisco6961 = 497,
-        /// Identifies the `Cisco6901` station, gateway, or service device type.
-        /// Uses SCCP device-type value `547` during registration and provisioning.
+        /// Cisco Unified SIP Phone 6901, a displayless single-line endpoint represented in the common device table.
         Cisco6901 = 547,
-        /// Identifies the `Cisco6911` station, gateway, or service device type.
-        /// Uses SCCP device-type value `548` during registration and provisioning.
+        /// Cisco Unified IP Phone 6911, a basic single-line endpoint.
         Cisco6911 = 548,
-        /// Identifies the `Cisco6945` station, gateway, or service device type.
-        /// Uses SCCP device-type value `564` during registration and provisioning.
+        /// Cisco Unified IP Phone 6945, a four-line desk phone with Gigabit Ethernet.
         Cisco6945 = 564,
-        /// Identifies the `Cisco7926` station, gateway, or service device type.
-        /// Uses SCCP device-type value `577` during registration and provisioning.
+        /// Cisco Unified Wireless IP Phone 7926G with an integrated barcode scanner.
         Cisco7926 = 577,
-        /// Identifies the `Cisco8945` station, gateway, or service device type.
-        /// Uses SCCP device-type value `585` during registration and provisioning.
+        /// Cisco Unified IP Phone 8945, a color video desk phone with Gigabit Ethernet.
         Cisco8945 = 585,
-        /// Identifies the `Cisco8941` station, gateway, or service device type.
-        /// Uses SCCP device-type value `586` during registration and provisioning.
+        /// Cisco Unified IP Phone 8941, a color video desk phone.
         Cisco8941 = 586,
-        /// Identifies the `CiscoIpCommunicator` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30016` during registration and provisioning.
+        /// Cisco IP Communicator, the Windows software-phone implementation of a Cisco desk phone.
         CiscoIpCommunicator = 30016,
-        /// Identifies the `Cisco7905` station, gateway, or service device type.
-        /// Uses SCCP device-type value `20000` during registration and provisioning.
+        /// Cisco Unified IP Phone 7905G, a basic single-line SCCP desk phone.
         Cisco7905 = 20000,
-        /// Identifies the `Cisco7920` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30002` during registration and provisioning.
+        /// Cisco Wireless IP Phone 7920, the first-generation Cisco SCCP Wi-Fi handset.
         Cisco7920 = 30002,
-        /// Identifies the `Cisco7970` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30006` during registration and provisioning.
+        /// Cisco Unified IP Phone 7970G, an eight-line color touch-screen SCCP desk phone.
         Cisco7970 = 30006,
-        /// Identifies the `Cisco7912` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30007` during registration and provisioning.
+        /// Cisco Unified IP Phone 7912G, a basic single-line SCCP desk phone with an Ethernet switch.
         Cisco7912 = 30007,
-        /// Identifies the `Cisco7902` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30008` during registration and provisioning.
+        /// Cisco Unified IP Phone 7902G, a displayless single-line SCCP desk phone.
         Cisco7902 = 30008,
-        /// Identifies the `Cisco7961` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30018` during registration and provisioning.
+        /// Cisco Unified IP Phone 7961G, a six-line programmable SCCP desk phone.
         Cisco7961 = 30018,
-        /// Identifies the `Cisco7936` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30019` during registration and provisioning.
+        /// Cisco Unified IP Conference Station 7936.
         Cisco7936 = 30019,
-        /// Identifies the `AnalogGateway` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30027` during registration and provisioning.
+        /// A virtual SCCP phone endpoint representing an analog gateway port.
         AnalogGateway = 30027,
-        /// Identifies the `BriGateway` station, gateway, or service device type.
-        /// Uses SCCP device-type value `30028` during registration and provisioning.
+        /// A virtual SCCP phone endpoint representing an ISDN BRI gateway port.
         BriGateway = 30028,
-        /// Identifies the `Spa521s` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80000` during registration and provisioning.
+        /// Cisco SPA521S small-business IP desk phone.
         Spa521s = 80000,
-        /// Identifies the `Spa524sg` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80001` during registration and provisioning.
+        /// Cisco SPA524SG small-business IP desk phone with Gigabit Ethernet.
         Spa524sg = 80001,
-        /// Identifies the `Spa502g` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80003` during registration and provisioning.
+        /// Cisco SPA502G one-line small-business IP desk phone.
         Spa502g = 80003,
-        /// Identifies the `Spa504g` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80004` during registration and provisioning.
+        /// Cisco SPA504G four-line small-business IP desk phone.
         Spa504g = 80004,
-        /// Identifies the `Spa525g` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80005` during registration and provisioning.
+        /// Cisco SPA525G five-line small-business color IP desk phone.
         Spa525g = 80005,
-        /// Identifies the `Spa508g` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80006` during registration and provisioning.
+        /// Cisco SPA508G eight-line small-business IP desk phone.
         Spa508g = 80006,
-        /// Identifies the `Spa509g` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80007` during registration and provisioning.
+        /// Cisco SPA509G twelve-line small-business IP desk phone.
         Spa509g = 80007,
-        /// Identifies the `Spa525g2` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80009` during registration and provisioning.
+        /// Second-generation Cisco SPA525G2 five-line color IP desk phone.
         Spa525g2 = 80009,
-        /// Identifies the `Spa303g` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80011` during registration and provisioning.
+        /// Cisco SPA303G three-line small-business IP desk phone.
         Spa303g = 80011,
-        /// Identifies the `Spa512g` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80012` during registration and provisioning.
+        /// Cisco SPA512G one-line small-business IP desk phone with Gigabit Ethernet.
         Spa512g = 80012,
-        /// Identifies the `Spa514g` station, gateway, or service device type.
-        /// Uses SCCP device-type value `80013` during registration and provisioning.
+        /// Cisco SPA514G four-line small-business IP desk phone with Gigabit Ethernet.
         Spa514g = 80013,
-        /// Identifies the `AddonSpa500s` station, gateway, or service device type.
-        /// Uses SCCP device-type value `99991` during registration and provisioning.
+        /// Cisco SPA500S 32-button sidecar expansion module.
         AddonSpa500s = 99991,
-        /// Identifies the `AddonSpa500ds` station, gateway, or service device type.
-        /// Uses SCCP device-type value `99992` during registration and provisioning.
+        /// Cisco SPA500DS digital sidecar expansion module.
         AddonSpa500ds = 99992,
-        /// Identifies the `AddonSpa932ds` station, gateway, or service device type.
-        /// Uses SCCP device-type value `99993` during registration and provisioning.
+        /// Cisco SPA932DS attendant-console expansion module.
         AddonSpa932ds = 99993,
-        /// Identifies the `NotDefined` station, gateway, or service device type.
-        /// Uses SCCP device-type value `99999` during registration and provisioning.
+        /// Cisco's explicit “not defined” sentinel used when no registered device type applies.
         NotDefined = 99999
     }
 }
@@ -556,221 +448,165 @@ pub enum CodecKind {
 wire_enum! {
     /// Skinny payload capability / codec identifier.
     pub enum Codec {
-        /// Selects the `None` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0000` in capability and media messages.
+        /// Indicates that no media encoding is selected or advertised.
         None = 0x0000,
-        /// Selects the `NonStandard` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0001` in capability and media messages.
+        /// Marks an implementation-specific media format.
+        /// The identifier alone does not define an interoperable encoding.
         NonStandard = 0x0001,
-        /// Selects the `Pcma` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0002` in capability and media messages.
+        /// G.711 A-law PCM at 64 kbit/s, commonly used by E-carrier telephony systems.
         Pcma = 0x0002,
-        /// Selects the `G711Alaw56k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0003` in capability and media messages.
+        /// G.711 A-law PCM carried through a 56 kbit/s bearer rather than a full 64 kbit/s channel.
         G711Alaw56k = 0x0003,
-        /// Selects the `Pcmu` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0004` in capability and media messages.
+        /// G.711 µ-law PCM at 64 kbit/s, commonly used by North American and Japanese telephony systems.
         Pcmu = 0x0004,
-        /// Selects the `G711Ulaw56k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0005` in capability and media messages.
+        /// G.711 µ-law PCM carried through a 56 kbit/s bearer rather than a full 64 kbit/s channel.
         G711Ulaw56k = 0x0005,
-        /// Selects the `G72264k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0006` in capability and media messages.
+        /// G.722 sub-band wideband speech using its 64 kbit/s mode.
         G72264k = 0x0006,
-        /// Selects the `G72256k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0007` in capability and media messages.
+        /// G.722 sub-band wideband speech using its 56 kbit/s mode.
         G72256k = 0x0007,
-        /// Selects the `G72248k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0008` in capability and media messages.
+        /// G.722 sub-band wideband speech using its 48 kbit/s mode.
         G72248k = 0x0008,
-        /// Selects the `G7231` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0009` in capability and media messages.
+        /// G.723.1 low-bit-rate narrowband speech, normally encoded at 5.3 or 6.3 kbit/s.
         G7231 = 0x0009,
-        /// Selects the `G728` media capability or payload format.
-        /// Uses SCCP codec identifier `0x000a` in capability and media messages.
+        /// G.728 low-delay CELP narrowband speech encoded at 16 kbit/s.
         G728 = 0x000a,
-        /// Selects the `G729` media capability or payload format.
-        /// Uses SCCP codec identifier `0x000b` in capability and media messages.
+        /// Base G.729 CS-ACELP narrowband speech encoded at 8 kbit/s.
         G729 = 0x000b,
-        /// Selects the `G729A` media capability or payload format.
-        /// Uses SCCP codec identifier `0x000c` in capability and media messages.
+        /// The reduced-complexity Annex A profile of G.729 at 8 kbit/s.
         G729A = 0x000c,
-        /// Selects the `Is11172` media capability or payload format.
-        /// Uses SCCP codec identifier `0x000d` in capability and media messages.
+        /// ISO/IEC 11172 MPEG-1 audio, retained as a legacy SCCP audio capability.
         Is11172 = 0x000d,
-        /// Selects the `Is13818` media capability or payload format.
-        /// Uses SCCP codec identifier `0x000e` in capability and media messages.
+        /// ISO/IEC 13818 MPEG-2 audio, retained as a legacy SCCP audio capability.
         Is13818 = 0x000e,
-        /// Selects the `G729B` media capability or payload format.
-        /// Uses SCCP codec identifier `0x000f` in capability and media messages.
+        /// G.729 with Annex B voice-activity detection and comfort-noise generation.
         G729B = 0x000f,
-        /// Selects the `G729Ab` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0010` in capability and media messages.
+        /// The reduced-complexity G.729 Annex A profile combined with Annex B silence suppression.
         G729Ab = 0x0010,
-        /// Selects the `GsmFullRate` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0012` in capability and media messages.
+        /// GSM Full Rate cellular speech coding.
+        /// This is distinct from the RTP GSM 06.10 capability represented by `Gsm`.
         GsmFullRate = 0x0012,
-        /// Selects the `GsmHalfRate` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0013` in capability and media messages.
+        /// GSM Half Rate cellular speech coding, trading speech quality for reduced radio bandwidth.
         GsmHalfRate = 0x0013,
-        /// Selects the `GsmEnhancedFullRate` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0014` in capability and media messages.
+        /// GSM Enhanced Full Rate cellular speech coding with improved quality over GSM Full Rate.
         GsmEnhancedFullRate = 0x0014,
-        /// Selects the `Wideband256k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0019` in capability and media messages.
+        /// Uncompressed 16-bit linear wideband PCM at 16 kHz, producing a 256 kbit/s audio stream.
         Wideband256k = 0x0019,
-        /// Selects the `Data64k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0020` in capability and media messages.
+        /// A transparent 64 kbit/s data bearer rather than an audio or video encoding.
         Data64k = 0x0020,
-        /// Selects the `Data56k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0021` in capability and media messages.
+        /// A transparent 56 kbit/s data bearer for rate-limited digital trunks.
         Data56k = 0x0021,
-        /// Selects the `G7221_32k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0028` in capability and media messages.
+        /// G.722.1 wideband transform audio at 32 kbit/s, commonly known as the Siren 7 family.
         G7221_32k = 0x0028,
-        /// Selects the `G7221_24k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0029` in capability and media messages.
+        /// G.722.1 wideband transform audio at 24 kbit/s, commonly known as the Siren 7 family.
         G7221_24k = 0x0029,
-        /// Selects the `Aac` media capability or payload format.
-        /// Uses SCCP codec identifier `0x002a` in capability and media messages.
+        /// Generic Advanced Audio Coding capability without a fixed SCCP LATM bit-rate selector.
         Aac = 0x002a,
-        /// Selects the `Mp4aLatm128` media capability or payload format.
-        /// Uses SCCP codec identifier `0x002b` in capability and media messages.
+        /// AAC audio transported with MPEG-4 LATM at a nominal 128 kbit/s.
+        /// Cisco capability tables associate this family with low-delay AAC.
         Mp4aLatm128 = 0x002b,
-        /// Selects the `Mp4aLatm64` media capability or payload format.
-        /// Uses SCCP codec identifier `0x002c` in capability and media messages.
+        /// AAC audio transported with MPEG-4 LATM at a nominal 64 kbit/s.
         Mp4aLatm64 = 0x002c,
-        /// Selects the `Mp4aLatm56` media capability or payload format.
-        /// Uses SCCP codec identifier `0x002d` in capability and media messages.
+        /// AAC audio transported with MPEG-4 LATM at a nominal 56 kbit/s.
         Mp4aLatm56 = 0x002d,
-        /// Selects the `Mp4aLatm48` media capability or payload format.
-        /// Uses SCCP codec identifier `0x002e` in capability and media messages.
+        /// AAC audio transported with MPEG-4 LATM at a nominal 48 kbit/s.
         Mp4aLatm48 = 0x002e,
-        /// Selects the `Mp4aLatm32` media capability or payload format.
-        /// Uses SCCP codec identifier `0x002f` in capability and media messages.
+        /// AAC audio transported with MPEG-4 LATM at a nominal 32 kbit/s.
         Mp4aLatm32 = 0x002f,
-        /// Selects the `Mp4aLatm24` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0030` in capability and media messages.
+        /// AAC audio transported with MPEG-4 LATM at a nominal 24 kbit/s.
         Mp4aLatm24 = 0x0030,
-        /// Selects the `Mp4aLatm` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0031` in capability and media messages.
+        /// AAC audio transported with MPEG-4 LATM when the bit rate is negotiated elsewhere or unspecified.
         Mp4aLatm = 0x0031,
-        /// Selects the `Gsm` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0050` in capability and media messages.
+        /// The RTP GSM 06.10 full-rate narrowband speech format.
+        /// This is the interoperable RTP profile rather than a cellular bearer-mode selector.
         Gsm = 0x0050,
-        /// Selects the `ActiveVoice` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0051` in capability and media messages.
+        /// A Cisco-defined narrowband `ActiveVoice` audio capability.
+        /// The audited SCCP sources name it but do not establish a public encoding specification.
         ActiveVoice = 0x0051,
-        /// Selects the `G726_32k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0052` in capability and media messages.
+        /// G.726 ADPCM narrowband speech encoded at 32 kbit/s.
         G726_32k = 0x0052,
-        /// Selects the `G726_24k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0053` in capability and media messages.
+        /// G.726 ADPCM narrowband speech encoded at 24 kbit/s.
         G726_24k = 0x0053,
-        /// Selects the `G726_16k` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0054` in capability and media messages.
+        /// G.726 ADPCM narrowband speech encoded at 16 kbit/s.
         G726_16k = 0x0054,
-        /// Selects the `G729AnnexB` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0055` in capability and media messages.
+        /// A later SCCP identifier for G.729 Annex B silence suppression.
+        /// It remains wire-distinct from the legacy `G729B` identifier.
         G729AnnexB = 0x0055,
-        /// Selects the `Ilbc` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0056` in capability and media messages.
+        /// iLBC packet-loss-resilient narrowband speech, normally using 20 ms or 30 ms frames.
         Ilbc = 0x0056,
-        /// Selects the `Isac` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0059` in capability and media messages.
+        /// iSAC adaptive wideband speech coding designed for variable IP-network conditions.
         Isac = 0x0059,
-        /// Selects the `Opus` media capability or payload format.
-        /// Uses SCCP codec identifier `0x005a` in capability and media messages.
+        /// Opus interactive audio, supporting speech and full-band audio with adaptive bit rate.
         Opus = 0x005a,
-        /// Selects the `Amr` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0061` in capability and media messages.
+        /// Adaptive Multi-Rate narrowband cellular speech coding.
         Amr = 0x0061,
-        /// Selects the `AmrWb` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0062` in capability and media messages.
+        /// Adaptive Multi-Rate Wideband speech coding, also standardized as G.722.2.
         AmrWb = 0x0062,
-        /// Selects the `H261` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0064` in capability and media messages.
+        /// H.261 video for audiovisual services over constant-rate digital channels.
         H261 = 0x0064,
-        /// Selects the `H263` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0065` in capability and media messages.
+        /// Base H.263 low-bit-rate video coding.
         H263 = 0x0065,
-        /// Selects the `H263Plus` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0066` in capability and media messages.
+        /// H.263+ video, incorporating the optional enhancements standardized in H.263 version 2.
         H263Plus = 0x0066,
-        /// Selects the `H264` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0067` in capability and media messages.
+        /// Base H.264/AVC video capability.
         H264 = 0x0067,
-        /// Selects the `H264Svc` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0068` in capability and media messages.
+        /// The scalable-video-coding extension of H.264/AVC, allowing layered temporal, spatial, or quality streams.
         H264Svc = 0x0068,
-        /// Selects the `T120` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0069` in capability and media messages.
+        /// T.120 real-time data-conferencing traffic such as shared whiteboards and application data.
+        /// It is a data capability, not a speech codec.
         T120 = 0x0069,
-        /// Selects the `H224` media capability or payload format.
-        /// Uses SCCP codec identifier `0x006a` in capability and media messages.
+        /// H.224 low-rate data-link traffic used by applications such as H.281 far-end camera control.
         H224 = 0x006a,
-        /// Selects the `T38Fax` media capability or payload format.
-        /// Uses SCCP codec identifier `0x006b` in capability and media messages.
+        /// T.38 real-time facsimile relay, transporting decoded fax data instead of modem audio.
         T38Fax = 0x006b,
-        /// Selects the `Tote` media capability or payload format.
-        /// Uses SCCP codec identifier `0x006c` in capability and media messages.
+        /// A Cisco-defined `TOTE` payload capability with no public encoding semantics established here.
+        /// Available SCCP sources disagree on whether to classify it as video or data.
         Tote = 0x006c,
-        /// Selects the `H265` media capability or payload format.
-        /// Uses SCCP codec identifier `0x006d` in capability and media messages.
+        /// H.265/HEVC video, the successor to H.264/AVC with improved compression efficiency.
         H265 = 0x006d,
-        /// Selects the `H264Uc` media capability or payload format.
-        /// Uses SCCP codec identifier `0x006e` in capability and media messages.
+        /// Cisco's distinct `H264_UC` video capability.
+        /// The audited sources do not define what the UC profile adds, so it is not treated as base H.264.
         H264Uc = 0x006e,
-        /// Selects the `Xv150ModemRelay711u` media capability or payload format.
-        /// Uses SCCP codec identifier `0x006f` in capability and media messages.
+        /// Cisco X-V.150 modem relay associated with a G.711 µ-law voiceband-data path.
+        /// Legacy chan-sccp sources identify it with modem traffic on VG224 gateways.
         Xv150ModemRelay711u = 0x006f,
-        /// Selects the `NseVbd711u` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0070` in capability and media messages.
+        /// Cisco named-signaling-event mode for voiceband data carried over G.711 µ-law.
         NseVbd711u = 0x0070,
-        /// Selects the `Xv150ModemRelay729a` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0071` in capability and media messages.
+        /// Cisco X-V.150 modem relay associated with a G.729 Annex A voice path.
+        /// Legacy chan-sccp sources identify it with modem traffic on VG224 gateways.
         Xv150ModemRelay729a = 0x0071,
-        /// Selects the `NseVbd729a` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0072` in capability and media messages.
+        /// Cisco named-signaling-event mode for voiceband data associated with G.729 Annex A.
         NseVbd729a = 0x0072,
-        /// Selects the `H264Fec` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0073` in capability and media messages.
+        /// Cisco's H.264 capability variant carrying forward-error-correction support.
+        /// It is negotiated separately because the backend has no equivalent base-H.264 flag.
         H264Fec = 0x0073,
-        /// Selects the `ClearChannel` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0078` in capability and media messages.
+        /// A transparent clear-channel bearer that preserves arbitrary digital data without transcoding.
         ClearChannel = 0x0078,
-        /// Selects the `UniversalTranscoder` media capability or payload format.
-        /// Uses SCCP codec identifier `0x00de` in capability and media messages.
+        /// A Cisco media-resource capability representing a universal transcoder.
+        /// It identifies a transformation service rather than a media encoding.
         UniversalTranscoder = 0x00de,
-        /// Selects the `DtmfOutOfBandRfc2833` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0101` in capability and media messages.
+        /// DTMF carried as RTP `telephone-event` packets using a dynamically negotiated payload type.
+        /// The historical name references RFC 2833; RFC 4733 later replaced it.
         DtmfOutOfBandRfc2833 = 0x0101,
-        /// Selects the `DtmfPassthrough` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0102` in capability and media messages.
+        /// Cisco's proprietary RTP DTMF passthrough payload rather than audible in-band tones.
         DtmfPassthrough = 0x0102,
-        /// Selects the `DtmfDynamic` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0103` in capability and media messages.
+        /// A Cisco DTMF event capability whose RTP payload number is negotiated dynamically.
         DtmfDynamic = 0x0103,
-        /// Selects the `DtmfOutOfBand` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0104` in capability and media messages.
+        /// Cisco out-of-band DTMF signaling, carrying digits separately from the voice samples.
         DtmfOutOfBand = 0x0104,
-        /// Selects the `DtmfInBandRfc2833` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0105` in capability and media messages.
+        /// Cisco's historical “in-band RFC 2833” event-payload mode.
+        /// Despite the label, it represents packetized digit events rather than acoustic DTMF audio.
         DtmfInBandRfc2833 = 0x0105,
-        /// Selects the `CfbTones` media capability or payload format.
-        /// Uses SCCP codec identifier `0x0106` in capability and media messages.
+        /// Conference-bridge tone events used by Cisco media resources.
+        /// This is a control/event payload, not an audio codec.
         CfbTones = 0x0106,
-        /// Selects the `DtmfNoAudio` media capability or payload format.
-        /// Uses SCCP codec identifier `0x012b` in capability and media messages.
+        /// DTMF event signaling without a companion audio stream.
         DtmfNoAudio = 0x012b,
-        /// Selects the `V150ModemRelay` media capability or payload format.
-        /// Uses SCCP codec identifier `0x012c` in capability and media messages.
+        /// The V.150.1 modem-relay media mode, carrying demodulated modem data across an IP network.
         V150ModemRelay = 0x012c,
-        /// Selects the `V150Sprt` media capability or payload format.
-        /// Uses SCCP codec identifier `0x012d` in capability and media messages.
+        /// The V.150.1 Simple Packet Relay Transport used for reliable modem-relay data.
         V150Sprt = 0x012d,
-        /// Selects the `V150Sse` media capability or payload format.
-        /// Uses SCCP codec identifier `0x012e` in capability and media messages.
+        /// The V.150.1 State Signalling Events channel used to coordinate transitions among audio, VBD, and relay modes.
         V150Sse = 0x012e
     }
 }
@@ -927,173 +763,117 @@ wire_enum! {
 wire_enum! {
     /// Physical or logical button stimulus reported by a station.
     pub enum Stimulus {
-        /// Represents the `Unused` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x00` in station input messages.
+        /// Reports an unassigned or inactive station control; no feature action is implied.
         Unused = 0x00,
-        /// Represents the `LastNumberRedial` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x01` in station input messages.
+        /// Reports use of the redial control to call the most recently dialed destination.
         LastNumberRedial = 0x01,
-        /// Represents the `SpeedDial` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x02` in station input messages.
+        /// Reports activation of a provisioned speed-dial entry.
         SpeedDial = 0x02,
-        /// Represents the `Hold` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x03` in station input messages.
+        /// Reports use of the hold control for the addressed call.
         Hold = 0x03,
-        /// Represents the `Transfer` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x04` in station input messages.
+        /// Reports use of the transfer control to start or complete a call transfer.
         Transfer = 0x04,
-        /// Represents the `ForwardAll` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x05` in station input messages.
+        /// Reports use of the call-forward-all control.
         ForwardAll = 0x05,
-        /// Represents the `ForwardBusy` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x06` in station input messages.
+        /// Reports use of the call-forward-on-busy control.
         ForwardBusy = 0x06,
-        /// Represents the `ForwardNoAnswer` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x07` in station input messages.
+        /// Reports use of the call-forward-on-no-answer control.
         ForwardNoAnswer = 0x07,
-        /// Represents the `Display` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x08` in station input messages.
+        /// Reports activation of a legacy display-oriented station control.
         Display = 0x08,
-        /// Represents the `Line` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x09` in station input messages.
+        /// Reports selection of a line appearance or a call on that appearance.
         Line = 0x09,
-        /// Represents the `T120Chat` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x0a` in station input messages.
+        /// Reports activation of the T.120 text-chat application.
         T120Chat = 0x0a,
-        /// Represents the `T120Whiteboard` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x0b` in station input messages.
+        /// Reports activation of the T.120 shared-whiteboard application.
         T120Whiteboard = 0x0b,
-        /// Represents the `T120ApplicationSharing` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x0c` in station input messages.
+        /// Reports activation of T.120 application sharing.
         T120ApplicationSharing = 0x0c,
-        /// Represents the `T120FileTransfer` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x0d` in station input messages.
+        /// Reports activation of T.120 conference file transfer.
         T120FileTransfer = 0x0d,
-        /// Represents the `Video` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x0e` in station input messages.
+        /// Reports use of the station's video control.
         Video = 0x0e,
-        /// Represents the `Voicemail` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x0f` in station input messages.
+        /// Reports activation of a voicemail access key.
         Voicemail = 0x0f,
-        /// Represents the `AnswerRelease` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x10` in station input messages.
+        /// Reports use of a combined answer/release control.
         AnswerRelease = 0x10,
-        /// Represents the `AutoAnswer` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x11` in station input messages.
+        /// Reports use of the station's automatic-answer control.
         AutoAnswer = 0x11,
-        /// Represents the `Select` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x12` in station input messages.
+        /// Reports use of the call-selection control for multi-call operations.
         Select = 0x12,
-        /// Represents the `Privacy` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x13` in station input messages.
+        /// Reports use of the call-privacy control.
         Privacy = 0x13,
-        /// Represents the `ServiceUrl` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x14` in station input messages.
+        /// Reports activation of a provisioned phone-service URL.
         ServiceUrl = 0x14,
-        /// Represents the `BlfSpeedDial` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x15` in station input messages.
+        /// Reports activation of a speed dial that also monitors its target through BLF.
         BlfSpeedDial = 0x15,
-        /// Represents the `DirectedPark` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x16` in station input messages.
+        /// Reports a directed-park request targeting a specific park destination.
         DirectedPark = 0x16,
-        /// Represents the `Intercom` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x17` in station input messages.
+        /// Reports activation of an intercom appearance or intercom call.
         Intercom = 0x17,
-        /// Represents the `MaliciousCall` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x1b` in station input messages.
+        /// Reports use of the malicious-call identification feature.
         MaliciousCall = 0x1b,
-        /// Represents the `GenericAppB1` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x21` in station input messages.
+        /// Reports application-defined programmable control B1; SCCP assigns no universal action.
         GenericAppB1 = 0x21,
-        /// Represents the `GenericAppB2` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x22` in station input messages.
+        /// Reports application-defined programmable control B2; SCCP assigns no universal action.
         GenericAppB2 = 0x22,
-        /// Represents the `GenericAppB3` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x23` in station input messages.
+        /// Reports application-defined programmable control B3; SCCP assigns no universal action.
         GenericAppB3 = 0x23,
-        /// Represents the `GenericAppB4` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x24` in station input messages.
+        /// Reports application-defined programmable control B4; SCCP assigns no universal action.
         GenericAppB4 = 0x24,
-        /// Represents the `GenericAppB5` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x25` in station input messages.
+        /// Reports application-defined programmable control B5; SCCP assigns no universal action.
         GenericAppB5 = 0x25,
-        /// Represents the `MultiblinkFeature` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x26` in station input messages.
+        /// Reports activation of a generic feature whose lamp can expose multiple blink states.
         MultiblinkFeature = 0x26,
-        /// Represents the `MeetMeConference` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x7b` in station input messages.
+        /// Reports activation of the dial-in Meet-Me conference workflow.
         MeetMeConference = 0x7b,
-        /// Represents the `Conference` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x7d` in station input messages.
+        /// Reports use of the station conference control for an active call.
         Conference = 0x7d,
-        /// Represents the `CallPark` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x7e` in station input messages.
+        /// Reports a request to park the current call.
         CallPark = 0x7e,
-        /// Represents the `CallPickup` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x7f` in station input messages.
+        /// Reports a request to answer a ringing call in the configured pickup scope.
         CallPickup = 0x7f,
-        /// Represents the `GroupCallPickup` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x80` in station input messages.
+        /// Reports a group-pickup request for a ringing call in another pickup group.
         GroupCallPickup = 0x80,
-        /// Represents the `Mobility` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x81` in station input messages.
+        /// Reports activation of the extension-mobility login or logout feature.
         Mobility = 0x81,
-        /// Represents the `DoNotDisturb` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x82` in station input messages.
+        /// Reports use of the do-not-disturb control.
         DoNotDisturb = 0x82,
-        /// Represents the `ConferenceList` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x83` in station input messages.
+        /// Reports a request to show or operate on the conference participant list.
         ConferenceList = 0x83,
-        /// Represents the `RemoveLastParticipant` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x84` in station input messages.
+        /// Reports a request to remove the most recently added conference participant.
         RemoveLastParticipant = 0x84,
-        /// Represents the `QualityReportTool` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x85` in station input messages.
+        /// Reports activation of Cisco's call-quality reporting tool.
         QualityReportTool = 0x85,
-        /// Represents the `Callback` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x86` in station input messages.
+        /// Reports a callback request for a busy or unavailable destination.
         Callback = 0x86,
-        /// Represents the `OtherPickup` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x87` in station input messages.
+        /// Reports use of Cisco's alternate call-pickup feature.
         OtherPickup = 0x87,
-        /// Represents the `VideoMode` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x88` in station input messages.
+        /// Reports a request to change the call's video mode.
         VideoMode = 0x88,
-        /// Represents the `NewCall` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x89` in station input messages.
+        /// Reports use of the new-call control to allocate an outbound call.
         NewCall = 0x89,
-        /// Represents the `EndCall` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x8a` in station input messages.
+        /// Reports use of the end-call control to release the addressed call.
         EndCall = 0x8a,
-        /// Represents the `HuntGroupLogin` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x8b` in station input messages.
+        /// Reports a hunt-group login or logout request.
         HuntGroupLogin = 0x8b,
-        /// Represents the `Queuing` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0x8f` in station input messages.
+        /// Reports activation of Cisco's call-queuing feature.
         Queuing = 0x8f,
-        /// Represents the `ParkingLot` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0xc0` in station input messages.
+        /// Reports activation of a parking-lot view or retrieval workflow.
         ParkingLot = 0xc0,
-        /// Represents the `Messages` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0xc2` in station input messages.
+        /// Reports use of the station's fixed Messages key.
         Messages = 0xc2,
-        /// Represents the `Directory` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0xc3` in station input messages.
+        /// Reports use of the station's fixed Directories key.
         Directory = 0xc3,
-        /// Represents the `Application` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0xc5` in station input messages.
+        /// Reports use of the station's fixed Applications or Services key.
         Application = 0xc5,
-        /// Represents the `Headset` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0xc6` in station input messages.
+        /// Reports a headset-control state change from the station.
         Headset = 0xc6,
-        /// Represents the `Keypad` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0xf0` in station input messages.
+        /// Identifies input originating from the station's physical keypad control block.
         Keypad = 0xf0,
-        /// Represents the `AcousticEchoCancellation` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0xfd` in station input messages.
+        /// Reports use of the station acoustic-echo-cancellation control.
         AcousticEchoCancellation = 0xfd,
-        /// Represents the `Undefined` physical or logical station stimulus.
-        /// Uses SCCP stimulus value `0xff` in station input messages.
+        /// Preserves a station stimulus that Cisco marks as undefined rather than unassigned.
         Undefined = 0xff
     }
 }
@@ -1199,182 +979,130 @@ wire_enum! {
 wire_enum! {
     /// Tone identifier used by tone and announcement commands.
     pub enum Tone {
-        /// Selects the `Silence` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x00` in tone and announcement messages.
+        /// Stops any current station tone; the server uses this as the explicit silent tone request.
         Silence = 0x00,
-        /// Selects the `Dtmf1` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x01` in tone and announcement messages.
+        /// The DTMF `1` signal: 697 Hz row tone combined with a 1,209 Hz column tone.
         Dtmf1 = 0x01,
-        /// Selects the `Dtmf2` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x02` in tone and announcement messages.
+        /// The DTMF `2` signal: 697 Hz row tone combined with a 1,336 Hz column tone.
         Dtmf2 = 0x02,
-        /// Selects the `Dtmf3` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x03` in tone and announcement messages.
+        /// The DTMF `3` signal: 697 Hz row tone combined with a 1,477 Hz column tone.
         Dtmf3 = 0x03,
-        /// Selects the `Dtmf4` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x04` in tone and announcement messages.
+        /// The DTMF `4` signal: 770 Hz row tone combined with a 1,209 Hz column tone.
         Dtmf4 = 0x04,
-        /// Selects the `Dtmf5` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x05` in tone and announcement messages.
+        /// The DTMF `5` signal: 770 Hz row tone combined with a 1,336 Hz column tone.
         Dtmf5 = 0x05,
-        /// Selects the `Dtmf6` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x06` in tone and announcement messages.
+        /// The DTMF `6` signal: 770 Hz row tone combined with a 1,477 Hz column tone.
         Dtmf6 = 0x06,
-        /// Selects the `Dtmf7` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x07` in tone and announcement messages.
+        /// The DTMF `7` signal: 852 Hz row tone combined with a 1,209 Hz column tone.
         Dtmf7 = 0x07,
-        /// Selects the `Dtmf8` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x08` in tone and announcement messages.
+        /// The DTMF `8` signal: 852 Hz row tone combined with a 1,336 Hz column tone.
         Dtmf8 = 0x08,
-        /// Selects the `Dtmf9` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x09` in tone and announcement messages.
+        /// The DTMF `9` signal: 852 Hz row tone combined with a 1,477 Hz column tone.
         Dtmf9 = 0x09,
-        /// Selects the `Dtmf0` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x0a` in tone and announcement messages.
+        /// The DTMF `0` signal: 941 Hz row tone combined with a 1,336 Hz column tone.
         Dtmf0 = 0x0a,
-        /// Selects the `DtmfStar` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x0e` in tone and announcement messages.
+        /// The DTMF `*` signal: 941 Hz row tone combined with a 1,209 Hz column tone.
         DtmfStar = 0x0e,
-        /// Selects the `DtmfPound` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x0f` in tone and announcement messages.
+        /// The DTMF `#` signal: 941 Hz row tone combined with a 1,477 Hz column tone.
         DtmfPound = 0x0f,
-        /// Selects the `DtmfA` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x10` in tone and announcement messages.
+        /// The DTMF `A` signal from the fourth keypad column used by AUTOVON and control systems.
+        /// Combines a 697 Hz row tone with a 1,633 Hz column tone.
         DtmfA = 0x10,
-        /// Selects the `DtmfB` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x11` in tone and announcement messages.
+        /// The DTMF `B` signal from the fourth keypad column used by AUTOVON and control systems.
+        /// Combines a 770 Hz row tone with a 1,633 Hz column tone.
         DtmfB = 0x11,
-        /// Selects the `DtmfC` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x12` in tone and announcement messages.
+        /// The DTMF `C` signal from the fourth keypad column used by AUTOVON and control systems.
+        /// Combines an 852 Hz row tone with a 1,633 Hz column tone.
         DtmfC = 0x12,
-        /// Selects the `DtmfD` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x13` in tone and announcement messages.
+        /// The DTMF `D` signal from the fourth keypad column used by AUTOVON and control systems.
+        /// Combines a 941 Hz row tone with a 1,633 Hz column tone.
         DtmfD = 0x13,
-        /// Selects the `InsideDial` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x21` in tone and announcement messages.
+        /// Dial tone indicating that the caller may dial an internal extension.
         InsideDial = 0x21,
-        /// Selects the `OutsideDial` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x22` in tone and announcement messages.
+        /// Dial tone indicating access to an external or public telephone network.
         OutsideDial = 0x22,
-        /// Selects the `LineBusy` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x23` in tone and announcement messages.
+        /// Busy tone indicating that the called line cannot accept the call.
         LineBusy = 0x23,
-        /// Selects the `Alerting` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x24` in tone and announcement messages.
+        /// Audible ringback indicating that the remote endpoint is being alerted.
         Alerting = 0x24,
-        /// Selects the `Reorder` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x25` in tone and announcement messages.
+        /// Fast-busy or reorder tone indicating congestion or an unusable dialing sequence.
         Reorder = 0x25,
-        /// Selects the `RecorderWarning` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x26` in tone and announcement messages.
+        /// Periodic warning beep informing participants that the call is being recorded.
         RecorderWarning = 0x26,
-        /// Selects the `RecorderDetected` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x27` in tone and announcement messages.
+        /// Station feedback indicating that a recording device or recording service was detected.
         RecorderDetected = 0x27,
-        /// Selects the `Reverting` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x28` in tone and announcement messages.
+        /// Recall tone used when a held, parked, or transferred call reverts to the station.
         Reverting = 0x28,
-        /// Selects the `ReceiverOffHook` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x29` in tone and announcement messages.
+        /// Loud off-hook warning tone played when the handset remains off hook without a call.
         ReceiverOffHook = 0x29,
-        /// Selects the `PartialDial` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x2a` in tone and announcement messages.
+        /// Intercept tone indicating that the supplied address or digit sequence is incomplete.
         PartialDial = 0x2a,
-        /// Selects the `NoSuchNumber` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x2b` in tone and announcement messages.
+        /// Intercept tone indicating that the dialed number does not exist.
         NoSuchNumber = 0x2b,
-        /// Selects the `BusyVerification` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x2c` in tone and announcement messages.
+        /// Special tone used while an operator performs busy-line verification.
         BusyVerification = 0x2c,
-        /// Selects the `CallWaiting` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x2d` in tone and announcement messages.
+        /// Brief in-call alert indicating that another call is waiting.
         CallWaiting = 0x2d,
-        /// Selects the `Confirmation` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x2e` in tone and announcement messages.
+        /// Positive confirmation tone indicating that a requested feature was accepted.
         Confirmation = 0x2e,
-        /// Selects the `CampOn` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x2f` in tone and announcement messages.
+        /// Tone indicating that the call is camped on a busy destination awaiting availability.
         CampOn = 0x2f,
-        /// Selects the `RecallDial` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x30` in tone and announcement messages.
+        /// Dial tone presented after recall or hook flash so the caller can enter another destination.
         RecallDial = 0x30,
-        /// Selects the `ZipZip` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x31` in tone and announcement messages.
+        /// Cisco's two-part “zip-zip” feature alert.
+        /// The exact user-facing meaning depends on the call feature that requests it.
         ZipZip = 0x31,
-        /// Selects the `Zip` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x32` in tone and announcement messages.
+        /// Cisco's short “zip” feature alert.
+        /// The exact user-facing meaning depends on the call feature that requests it.
         Zip = 0x32,
-        /// Selects the `BeepBonk` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x33` in tone and announcement messages.
+        /// Cisco's paired positive/negative feature-feedback sound.
         BeepBonk = 0x33,
-        /// Selects the `Music` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x34` in tone and announcement messages.
+        /// Requests the station's built-in music tone rather than an RTP music-on-hold stream.
         Music = 0x34,
-        /// Selects the `Hold` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x35` in tone and announcement messages.
+        /// Audible indication associated with placing or leaving a call on hold.
         Hold = 0x35,
-        /// Selects the `Test` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x36` in tone and announcement messages.
+        /// A station test tone used for diagnostics rather than normal call progress.
         Test = 0x36,
-        /// Selects the `MonitorWarning` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x37` in tone and announcement messages.
+        /// Warning tone indicating that the call is being monitored.
         MonitorWarning = 0x37,
-        /// Selects the `AddCallWaiting` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x40` in tone and announcement messages.
+        /// Call-waiting alert used when another waiting call is added.
         AddCallWaiting = 0x40,
-        /// Selects the `PriorityCallWaiting` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x41` in tone and announcement messages.
+        /// Higher-priority call-waiting alert for precedence-aware call handling.
         PriorityCallWaiting = 0x41,
-        /// Selects the `BargeIn` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x43` in tone and announcement messages.
+        /// Warning tone indicating that another party has barged into the call.
         BargeIn = 0x43,
-        /// Selects the `DistinctAlert` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x44` in tone and announcement messages.
+        /// Distinctive alerting cadence used to distinguish a call class from normal ringing.
         DistinctAlert = 0x44,
-        /// Selects the `PriorityAlert` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x45` in tone and announcement messages.
+        /// Priority alerting cadence used for a higher-precedence incoming call.
         PriorityAlert = 0x45,
-        /// Selects the `ReminderRing` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x46` in tone and announcement messages.
+        /// Short reminder ring for a held, parked, forwarded, or otherwise pending call.
         ReminderRing = 0x46,
-        /// Selects the `PrecedenceRingback` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x47` in tone and announcement messages.
+        /// Ringback used by Multilevel Precedence and Preemption calls.
         PrecedenceRingback = 0x47,
-        /// Selects the `Preemption` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x48` in tone and announcement messages.
+        /// Warning tone indicating that a lower-precedence call is being preempted.
         Preemption = 0x48,
-        /// Selects the `NoTone` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x7f` in tone and announcement messages.
+        /// Sentinel indicating that no call-progress tone is assigned.
+        /// Unlike `Silence`, it does not request an active silence tone.
         NoTone = 0x7f,
-        /// Selects the `MeetMeGreeting` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x80` in tone and announcement messages.
+        /// Conference-service greeting played when entering a Meet-Me flow.
         MeetMeGreeting = 0x80,
-        /// Selects the `MeetMeNumberInvalid` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x81` in tone and announcement messages.
+        /// Conference prompt indicating that the entered Meet-Me number is invalid.
         MeetMeNumberInvalid = 0x81,
-        /// Selects the `MeetMeNumberFailed` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x82` in tone and announcement messages.
+        /// Conference prompt indicating that the entered Meet-Me number could not be used.
         MeetMeNumberFailed = 0x82,
-        /// Selects the `MeetMeEnterPin` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x83` in tone and announcement messages.
+        /// Conference prompt requesting the participant PIN.
         MeetMeEnterPin = 0x83,
-        /// Selects the `MeetMeInvalidPin` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x84` in tone and announcement messages.
+        /// Conference prompt indicating that the participant PIN is invalid.
         MeetMeInvalidPin = 0x84,
-        /// Selects the `MeetMeFailedPin` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x85` in tone and announcement messages.
+        /// Conference prompt indicating that PIN validation failed.
         MeetMeFailedPin = 0x85,
-        /// Selects the `MeetMeCfbFailed` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x86` in tone and announcement messages.
+        /// Conference prompt indicating that allocation of the conference bridge failed.
         MeetMeCfbFailed = 0x86,
-        /// Selects the `MeetMeEnterAccessCode` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x87` in tone and announcement messages.
+        /// Conference prompt requesting an access code.
         MeetMeEnterAccessCode = 0x87,
-        /// Selects the `MeetMeAccessCodeInvalid` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x88` in tone and announcement messages.
+        /// Conference prompt indicating that the supplied access code is invalid.
         MeetMeAccessCodeInvalid = 0x88,
-        /// Selects the `MeetMeAccessCodeFailed` station tone or tone-control behavior.
-        /// Uses SCCP tone identifier `0x89` in tone and announcement messages.
+        /// Conference prompt indicating that access-code validation failed.
         MeetMeAccessCodeFailed = 0x89
     }
 }
@@ -1715,188 +1443,132 @@ wire_enum! {
     /// Button definitions use the stimulus values plus provisioning-only
     /// placeholder values in the 0xf1..=0xf5 range.
     pub enum ButtonType {
-        /// Defines a provisioned `Unused` button or template slot.
-        /// Uses SCCP button-type value `0x00` in station button templates.
+        /// An unassigned physical slot that should not present an actionable station key.
         Unused = 0x00,
-        /// Defines a provisioned `LastNumberRedial` button or template slot.
-        /// Uses SCCP button-type value `0x01` in station button templates.
+        /// A key that redials the most recently dialed destination.
         LastNumberRedial = 0x01,
-        /// Defines a provisioned `SpeedDial` button or template slot.
-        /// Uses SCCP button-type value `0x02` in station button templates.
+        /// A programmable key bound to a configured speed-dial destination.
         SpeedDial = 0x02,
-        /// Defines a provisioned `Hold` button or template slot.
-        /// Uses SCCP button-type value `0x03` in station button templates.
+        /// The station hold key used to hold or resume the current call.
         Hold = 0x03,
-        /// Defines a provisioned `Transfer` button or template slot.
-        /// Uses SCCP button-type value `0x04` in station button templates.
+        /// The station transfer key used to start or complete a call transfer.
         Transfer = 0x04,
-        /// Defines a provisioned `ForwardAll` button or template slot.
-        /// Uses SCCP button-type value `0x05` in station button templates.
+        /// A feature key for configuring or toggling call-forward-all.
         ForwardAll = 0x05,
-        /// Defines a provisioned `ForwardBusy` button or template slot.
-        /// Uses SCCP button-type value `0x06` in station button templates.
+        /// A feature key for configuring or toggling call-forward-on-busy.
         ForwardBusy = 0x06,
-        /// Defines a provisioned `ForwardNoAnswer` button or template slot.
-        /// Uses SCCP button-type value `0x07` in station button templates.
+        /// A feature key for configuring or toggling call-forward-on-no-answer.
         ForwardNoAnswer = 0x07,
-        /// Defines a provisioned `Display` button or template slot.
-        /// Uses SCCP button-type value `0x08` in station button templates.
+        /// A legacy display-oriented station key whose behavior is phone-model specific.
         Display = 0x08,
-        /// Defines a provisioned `Line` button or template slot.
-        /// Uses SCCP button-type value `0x09` in station button templates.
+        /// A line-appearance key representing a directory number and its calls.
         Line = 0x09,
-        /// Defines a provisioned `T120Chat` button or template slot.
-        /// Uses SCCP button-type value `0x0a` in station button templates.
+        /// A key launching the T.120 text-chat application.
         T120Chat = 0x0a,
-        /// Defines a provisioned `T120Whiteboard` button or template slot.
-        /// Uses SCCP button-type value `0x0b` in station button templates.
+        /// A key launching the T.120 shared-whiteboard application.
         T120Whiteboard = 0x0b,
-        /// Defines a provisioned `T120ApplicationSharing` button or template slot.
-        /// Uses SCCP button-type value `0x0c` in station button templates.
+        /// A key launching T.120 application sharing.
         T120ApplicationSharing = 0x0c,
-        /// Defines a provisioned `T120FileTransfer` button or template slot.
-        /// Uses SCCP button-type value `0x0d` in station button templates.
+        /// A key launching T.120 conference file transfer.
         T120FileTransfer = 0x0d,
-        /// Defines a provisioned `Video` button or template slot.
-        /// Uses SCCP button-type value `0x0e` in station button templates.
+        /// A station key assigned to video control.
         Video = 0x0e,
-        /// Defines a provisioned `Voicemail` button or template slot.
-        /// Uses SCCP button-type value `0x0f` in station button templates.
+        /// A programmable voicemail-access key, commonly paired with message-waiting indication.
         Voicemail = 0x0f,
-        /// Defines a provisioned `AnswerRelease` button or template slot.
-        /// Uses SCCP button-type value `0x10` in station button templates.
+        /// A combined key that answers an offered call or releases the current call.
         AnswerRelease = 0x10,
-        /// Defines a provisioned `AutoAnswer` button or template slot.
-        /// Uses SCCP button-type value `0x11` in station button templates.
+        /// A feature key controlling automatic call answer.
         AutoAnswer = 0x11,
-        /// Defines a provisioned `Select` button or template slot.
-        /// Uses SCCP button-type value `0x12` in station button templates.
+        /// A key that selects calls for transfer, conference, or other multi-call operations.
         Select = 0x12,
-        /// Defines a provisioned `Feature` button or template slot.
-        /// Uses SCCP button-type value `0x13` in station button templates.
+        /// A generic programmable feature key whose concrete action is supplied by provisioning.
         Feature = 0x13,
-        /// Defines a provisioned `ServiceUrl` button or template slot.
-        /// Uses SCCP button-type value `0x14` in station button templates.
+        /// A programmable key opening a provisioned phone-service URL.
         ServiceUrl = 0x14,
-        /// Defines a provisioned `BlfSpeedDial` button or template slot.
-        /// Uses SCCP button-type value `0x15` in station button templates.
+        /// A speed-dial key whose lamp also displays the target's busy-lamp-field state.
         BlfSpeedDial = 0x15,
-        /// Defines a provisioned `DirectedPark` button or template slot.
-        /// Uses SCCP button-type value `0x16` in station button templates.
+        /// A feature key that parks a call at a specified destination.
         DirectedPark = 0x16,
-        /// Defines a provisioned `Intercom` button or template slot.
-        /// Uses SCCP button-type value `0x17` in station button templates.
+        /// A key representing an intercom appearance or intercom destination.
         Intercom = 0x17,
-        /// Defines a provisioned `MaliciousCall` button or template slot.
-        /// Uses SCCP button-type value `0x1b` in station button templates.
+        /// A feature key for malicious-call identification.
         MaliciousCall = 0x1b,
-        /// Defines a provisioned `GenericAppB1` button or template slot.
-        /// Uses SCCP button-type value `0x21` in station button templates.
+        /// Application-defined programmable key B1; SCCP assigns no universal action.
         GenericAppB1 = 0x21,
-        /// Defines a provisioned `GenericAppB2` button or template slot.
-        /// Uses SCCP button-type value `0x22` in station button templates.
+        /// Application-defined programmable key B2; SCCP assigns no universal action.
         GenericAppB2 = 0x22,
-        /// Defines a provisioned `GenericAppB3` button or template slot.
-        /// Uses SCCP button-type value `0x23` in station button templates.
+        /// Application-defined programmable key B3; SCCP assigns no universal action.
         GenericAppB3 = 0x23,
-        /// Defines a provisioned `GenericAppB4` button or template slot.
-        /// Uses SCCP button-type value `0x24` in station button templates.
+        /// Application-defined programmable key B4; SCCP assigns no universal action.
         GenericAppB4 = 0x24,
-        /// Defines a provisioned `GenericAppB5` button or template slot.
-        /// Uses SCCP button-type value `0x25` in station button templates.
+        /// Application-defined programmable key B5; SCCP assigns no universal action.
         GenericAppB5 = 0x25,
-        /// Defines a provisioned `MultiblinkFeature` button or template slot.
-        /// Uses SCCP button-type value `0x26` in station button templates.
+        /// A generic feature key whose lamp can display multiple blink states.
         MultiblinkFeature = 0x26,
-        /// Defines a provisioned `MeetMeConference` button or template slot.
-        /// Uses SCCP button-type value `0x7b` in station button templates.
+        /// A feature key entering the dial-in Meet-Me conference workflow.
         MeetMeConference = 0x7b,
-        /// Defines a provisioned `Conference` button or template slot.
-        /// Uses SCCP button-type value `0x7d` in station button templates.
+        /// The station conference key used to build or manage an ad-hoc conference.
         Conference = 0x7d,
-        /// Defines a provisioned `CallPark` button or template slot.
-        /// Uses SCCP button-type value `0x7e` in station button templates.
+        /// A feature key that parks the current call.
         CallPark = 0x7e,
-        /// Defines a provisioned `CallPickup` button or template slot.
-        /// Uses SCCP button-type value `0x7f` in station button templates.
+        /// A feature key that answers a ringing call in the configured pickup scope.
         CallPickup = 0x7f,
-        /// Defines a provisioned `GroupCallPickup` button or template slot.
-        /// Uses SCCP button-type value `0x80` in station button templates.
+        /// A feature key for group pickup outside the station's immediate pickup group.
         GroupCallPickup = 0x80,
-        /// Defines a provisioned `Mobility` button or template slot.
-        /// Uses SCCP button-type value `0x81` in station button templates.
+        /// A feature key for extension-mobility login, logout, or appearance control.
         Mobility = 0x81,
-        /// Defines a provisioned `DoNotDisturb` button or template slot.
-        /// Uses SCCP button-type value `0x82` in station button templates.
+        /// A feature key that exposes and changes do-not-disturb state.
         DoNotDisturb = 0x82,
-        /// Defines a provisioned `ConferenceList` button or template slot.
-        /// Uses SCCP button-type value `0x83` in station button templates.
+        /// A feature key opening the conference participant list.
         ConferenceList = 0x83,
-        /// Defines a provisioned `RemoveLastParticipant` button or template slot.
-        /// Uses SCCP button-type value `0x84` in station button templates.
+        /// A conference key that removes the most recently added participant.
         RemoveLastParticipant = 0x84,
-        /// Defines a provisioned `QualityReportTool` button or template slot.
-        /// Uses SCCP button-type value `0x85` in station button templates.
+        /// A feature key launching Cisco's call-quality reporting tool.
         QualityReportTool = 0x85,
-        /// Defines a provisioned `Callback` button or template slot.
-        /// Uses SCCP button-type value `0x86` in station button templates.
+        /// A feature key requesting callback when a busy or unavailable destination becomes reachable.
         Callback = 0x86,
-        /// Defines a provisioned `OtherPickup` button or template slot.
-        /// Uses SCCP button-type value `0x87` in station button templates.
+        /// A feature key for Cisco's alternate call-pickup workflow.
         OtherPickup = 0x87,
-        /// Defines a provisioned `VideoMode` button or template slot.
-        /// Uses SCCP button-type value `0x88` in station button templates.
+        /// A feature key that changes the call's video mode.
         VideoMode = 0x88,
-        /// Defines a provisioned `NewCall` button or template slot.
-        /// Uses SCCP button-type value `0x89` in station button templates.
+        /// A key that creates a new outbound call appearance.
         NewCall = 0x89,
-        /// Defines a provisioned `EndCall` button or template slot.
-        /// Uses SCCP button-type value `0x8a` in station button templates.
+        /// A key that releases the selected call.
         EndCall = 0x8a,
-        /// Defines a provisioned `HuntGroupLogin` button or template slot.
-        /// Uses SCCP button-type value `0x8b` in station button templates.
+        /// A feature key that logs the station into or out of a hunt group.
         HuntGroupLogin = 0x8b,
-        /// Defines a provisioned `Queuing` button or template slot.
-        /// Uses SCCP button-type value `0x8f` in station button templates.
+        /// A feature key for Cisco call-queuing behavior.
         Queuing = 0x8f,
-        /// Defines a provisioned `ParkingLot` button or template slot.
-        /// Uses SCCP button-type value `0xc0` in station button templates.
+        /// A feature key opening a parking-lot view or retrieval workflow.
         ParkingLot = 0xc0,
-        /// Defines a provisioned `Messages` button or template slot.
-        /// Uses SCCP button-type value `0xc2` in station button templates.
+        /// The station's fixed Messages key rather than a programmable voicemail slot.
         Messages = 0xc2,
-        /// Defines a provisioned `Directory` button or template slot.
-        /// Uses SCCP button-type value `0xc3` in station button templates.
+        /// The station's fixed Directories key.
         Directory = 0xc3,
-        /// Defines a provisioned `Application` button or template slot.
-        /// Uses SCCP button-type value `0xc5` in station button templates.
+        /// The station's fixed Applications or Services key.
         Application = 0xc5,
-        /// Defines a provisioned `Headset` button or template slot.
-        /// Uses SCCP button-type value `0xc6` in station button templates.
+        /// The station's fixed headset-control key.
         Headset = 0xc6,
-        /// Defines a provisioned `Keypad` button or template slot.
-        /// Uses SCCP button-type value `0xf0` in station button templates.
+        /// A template entry representing the physical dialing keypad rather than one programmable key.
         Keypad = 0xf0,
-        /// Defines a provisioned `PlaceholderMulti` button or template slot.
-        /// Uses SCCP button-type value `0xf1` in station button templates.
+        /// Cisco template placeholder for a multi-purpose programmable position.
+        /// Provisioning is expected to replace it with a concrete button definition.
         PlaceholderMulti = 0xf1,
-        /// Defines a provisioned `PlaceholderLine` button or template slot.
-        /// Uses SCCP button-type value `0xf2` in station button templates.
+        /// Cisco template placeholder reserved for a line appearance.
+        /// Provisioning is expected to replace it with a concrete line definition.
         PlaceholderLine = 0xf2,
-        /// Defines a provisioned `PlaceholderSpeedDial` button or template slot.
-        /// Uses SCCP button-type value `0xf3` in station button templates.
+        /// Cisco template placeholder reserved for a speed dial.
+        /// Provisioning is expected to replace it with a concrete speed-dial definition.
         PlaceholderSpeedDial = 0xf3,
-        /// Defines a provisioned `PlaceholderHint` button or template slot.
-        /// Uses SCCP button-type value `0xf4` in station button templates.
+        /// Cisco template placeholder reserved for a monitored hint or BLF target.
+        /// Provisioning is expected to replace it with a concrete definition.
         PlaceholderHint = 0xf4,
-        /// Defines a provisioned `PlaceholderAbbreviatedDial` button or template slot.
-        /// Uses SCCP button-type value `0xf5` in station button templates.
+        /// Cisco template placeholder reserved for abbreviated dialing.
+        /// Provisioning is expected to replace it with a concrete definition.
         PlaceholderAbbreviatedDial = 0xf5,
-        /// Defines a provisioned `AcousticEchoCancellation` button or template slot.
-        /// Uses SCCP button-type value `0xfd` in station button templates.
+        /// A station control for acoustic echo-cancellation behavior.
         AcousticEchoCancellation = 0xfd,
-        /// Defines a provisioned `Undefined` button or template slot.
-        /// Uses SCCP button-type value `0xff` in station button templates.
+        /// A button definition Cisco marks as undefined; it is distinct from an intentionally unused slot.
         Undefined = 0xff
     }
 }
