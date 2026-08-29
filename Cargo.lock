@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "asterisk-module"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "bindgen",
  "form_urlencoded",
