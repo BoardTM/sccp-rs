@@ -295,48 +295,96 @@ struct RawValue {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum GeneralOption {
+    /// Selects whether configuration comes from files or a realtime backend.
+    /// Controls which loading and reload path supplies SCCP objects.
     ConfigurationSource,
     #[serde(rename = "dateformat")]
+    /// Sets the date template sent to registered stations.
+    /// Controls how phones render the server-provided calendar date.
     DateFormat,
     #[serde(rename = "tzoffset")]
+    /// Sets the station clock offset from server time.
+    /// Applies the configured offset in minutes to SCCP time updates.
     TimezoneOffset,
     #[serde(alias = "clearbind")]
+    /// Sets the combined SCCP listener endpoint.
+    /// Configures the address and port used for unencrypted signaling.
     Bind,
     #[serde(alias = "bindaddr", alias = "clearbindaddr")]
+    /// Sets the address of the unencrypted SCCP listener.
+    /// Combines with the configured port to form the listener endpoint.
     BindAddress,
     #[serde(alias = "clearport")]
+    /// Sets the port of the unencrypted SCCP listener.
+    /// Combines with the configured bind address to form the endpoint.
     Port,
+    /// Sets the legacy signaling address advertised to stations.
+    /// Provides an externally reachable address when it differs from the bind address.
     AdvertisedAddress,
     #[serde(alias = "advertisedaddressipv4")]
+    /// Sets the IPv4 signaling address advertised to stations.
+    /// Provides the station-facing IPv4 endpoint behind routing or NAT.
     AdvertisedIpv4,
     #[serde(alias = "advertisedaddressipv6")]
+    /// Sets the IPv6 signaling address advertised to stations.
+    /// Provides the station-facing IPv6 endpoint when available.
     AdvertisedIpv6,
     #[serde(alias = "securebind")]
+    /// Sets the combined TLS SCCP listener endpoint.
+    /// Configures the address and port used for encrypted signaling.
     TlsBind,
     #[serde(alias = "secbindaddr", alias = "tlsbindaddr")]
+    /// Sets the address of the TLS SCCP listener.
+    /// Combines with the TLS port to form the encrypted endpoint.
     TlsBindAddress,
     #[serde(alias = "secport", alias = "tlsport")]
+    /// Sets the port of the TLS SCCP listener.
+    /// Combines with the TLS bind address to form the encrypted endpoint.
     TlsPort,
     #[serde(alias = "certfile", alias = "tlscombinedpem")]
+    /// Sets a PEM file containing the TLS identity material.
+    /// Supplies the certificate and private key for encrypted SCCP sessions.
     TlsCombinedPem,
     #[serde(alias = "tlscertificatefile")]
+    /// Sets the TLS server certificate file.
+    /// Presents this certificate to stations during the TLS handshake.
     TlsCertificate,
     #[serde(alias = "tlsprivatekeyfile")]
+    /// Sets the TLS server private-key file.
+    /// Uses this key with the configured certificate for TLS sessions.
     TlsPrivateKey,
     #[serde(alias = "tlscafile")]
+    /// Sets the trusted certificate-authority file.
+    /// Controls certificate trust for authenticated TLS connections.
     TlsTrustStore,
+    /// Adds a source network to the general deny ACL.
+    /// Blocks matching station signaling connections unless a later rule permits them.
     Deny,
+    /// Adds a source network to the general permit ACL.
+    /// Allows matching station signaling connections under the configured ACL.
     Permit,
     #[serde(rename = "localnet")]
+    /// Declares an address range as locally routed.
+    /// Guides external-address and NAT decisions for station and media endpoints.
     LocalNetwork,
     #[serde(rename = "externip", alias = "externaladdress")]
+    /// Sets the fixed external address for NAT traversal.
+    /// Advertises this address to peers outside configured local networks.
     ExternalAddress,
     #[serde(rename = "externhost", alias = "externalhost")]
+    /// Sets a hostname used to discover the external address.
+    /// Supports deployments whose public address changes over time.
     ExternalHost,
     #[serde(rename = "externrefresh", alias = "externalrefresh")]
+    /// Sets how often the external hostname is resolved.
+    /// Refreshes dynamic public addressing at the configured interval.
     ExternalRefresh,
+    /// Sets the default NAT handling mode.
+    /// Controls address rewriting for station signaling and media endpoints.
     Nat,
     #[serde(rename = "sccp_tos", alias = "signalingtos")]
+    /// Sets the IP type-of-service byte for SCCP signaling.
+    /// Applies the traffic classification to signaling sockets.
     SignalingTos,
     #[serde(
         rename = "sccp_dscp",
@@ -344,104 +392,216 @@ enum GeneralOption {
         alias = "signalingdscp",
         alias = "signaling_dscp"
     )]
+    /// Sets the DSCP value for SCCP signaling.
+    /// Encodes the value into the signaling traffic-class byte.
     SignalingDscp,
     #[serde(rename = "sccp_cos", alias = "signalingcos", alias = "signaling_cos")]
+    /// Sets the layer-two class of service for SCCP signaling.
+    /// Applies the priority to supported signaling interfaces.
     SignalingCos,
     #[serde(alias = "audiotos")]
+    /// Sets the default IP type-of-service byte for audio.
+    /// Applies the traffic classification to station audio streams.
     AudioTos,
     #[serde(alias = "audiodscp")]
+    /// Sets the default DSCP value for audio.
+    /// Encodes the value into audio media traffic classes.
     AudioDscp,
     #[serde(alias = "audiocos")]
+    /// Sets the default layer-two class of service for audio.
+    /// Applies the priority to supported audio interfaces.
     AudioCos,
     #[serde(alias = "videotos")]
+    /// Sets the default IP type-of-service byte for video.
+    /// Applies the traffic classification to station video streams.
     VideoTos,
     #[serde(alias = "videodscp")]
+    /// Sets the default DSCP value for video.
+    /// Encodes the value into video media traffic classes.
     VideoDscp,
     #[serde(alias = "videocos")]
+    /// Sets the default layer-two class of service for video.
+    /// Applies the priority to supported video interfaces.
     VideoCos,
     #[serde(alias = "trustphoneip")]
+    /// Controls whether station-reported IP addresses are trusted.
+    /// Determines whether media uses reported addresses or the signaling peer address.
     TrustPhoneIp,
     #[serde(alias = "servername")]
+    /// Sets the signaling-server name presented to stations.
+    /// Identifies this SCCP server in provisioning responses.
     ServerName,
+    /// Sets the default Asterisk language for SCCP calls.
+    /// Provides the inherited language for devices and lines.
     Language,
     #[serde(rename = "accountcode")]
+    /// Sets the default Asterisk account code for SCCP calls.
+    /// Provides the inherited billing or CDR account identifier.
     AccountCode,
+    /// Sets the primary station keepalive interval.
+    /// Controls the normal signaling liveness cadence.
     Keepalive,
+    /// Sets the secondary station keepalive interval.
+    /// Controls the alternate liveness cadence advertised during registration.
     SecondaryKeepalive,
+    /// Adds a signaling-server endpoint advertised to stations.
+    /// Builds the primary and failover server list returned during provisioning.
     SignalingServer,
     #[serde(alias = "firstdigittimeout")]
+    /// Sets how long dialing waits for the first digit.
+    /// Controls collection timeout before any called-party digit arrives.
     FirstDigitTimeout,
+    /// Sets the millisecond timeout between dialed digits.
+    /// Controls when digit collection treats an entered number as complete.
     InterdigitTimeoutMs,
     #[serde(alias = "digittimeout")]
+    /// Sets the normal timeout between dialed digits.
+    /// Provides the legacy-duration form of the interdigit timer.
     DigitTimeout,
     #[serde(alias = "digittimeoutchar")]
+    /// Sets the character that immediately completes digit collection.
+    /// Lets callers bypass the remaining interdigit timeout.
     DigitTimeoutChar,
     #[serde(alias = "recorddigittimeoutchar")]
+    /// Controls whether the digit-completion character is retained.
+    /// Determines whether the terminator becomes part of the collected number.
     RecordDigitTimeoutChar,
+    /// Controls whether digit collection is presented as en-bloc dialing.
+    /// Defers call routing until the complete called number is available.
     SimulateEnbloc,
     #[serde(alias = "speeddialawaitfurtherdigits")]
+    /// Controls whether speed dials accept additional digits.
+    /// Keeps digit collection open after a speed-dial value is inserted.
     SpeedDialAwaitFurtherDigits,
     #[serde(alias = "allowoverlap")]
+    /// Controls overlap dialing by default.
+    /// Allows routing to begin before the full destination is known.
     AllowOverlap,
+    /// Controls whether hanging up completes an attended transfer.
+    /// Applies the transfer completion behavior to SCCP calls.
     TransferOnHangup,
     #[serde(alias = "callanswerorder")]
+    /// Sets which ringing call is answered first.
+    /// Controls selection when a station has multiple answerable calls.
     CallAnswerOrder,
     #[serde(alias = "ringtype")]
+    /// Sets the default station ring pattern.
+    /// Selects the ringer behavior used for incoming calls.
     RingType,
     #[serde(alias = "callwaitingtone")]
+    /// Sets the tone used for a waiting call.
+    /// Controls the in-call audible notification of another incoming call.
     CallWaitingTone,
     #[serde(alias = "callwaitinginterval")]
+    /// Sets how often the call-waiting tone repeats.
+    /// Controls the reminder cadence while another call waits.
     CallWaitingInterval,
+    /// Marks a signaling server as a fallback endpoint.
+    /// Influences how stations order and use advertised servers.
     Fallback,
+    /// Sets the registration retry delay for a signaling server.
+    /// Controls how long stations wait after a rejected token request.
     BackoffTime,
+    /// Sets the advertised priority of a signaling server.
+    /// Orders primary and failover endpoints presented to stations.
     ServerPriority,
+    /// Adds codecs to the default allowed media set.
+    /// Extends the codec policy inherited by SCCP lines and devices.
     Allow,
+    /// Removes codecs from the default allowed media set.
+    /// Restricts the codec policy inherited by SCCP lines and devices.
     Disallow,
     #[serde(rename = "meetme")]
+    /// Enables the default conference application integration.
+    /// Controls whether SCCP lines may invoke configured conferencing.
     ConferenceEnabled,
     #[serde(rename = "meetmeopts")]
+    /// Sets default options passed to the conference application.
+    /// Provides inherited conference behavior for SCCP calls.
     ConferenceOptions,
     #[serde(alias = "autoanswerringtime")]
+    /// Sets how long an auto-answer call rings before answering.
+    /// Controls the alerting delay for automatic answer.
     AutoanswerRingTime,
     #[serde(alias = "autoanswertone")]
+    /// Sets the tone played when a call auto-answers.
+    /// Provides an audible warning before the media path opens.
     AutoanswerTone,
     #[serde(alias = "remotehangup_tone")]
+    /// Sets the tone played after the remote party hangs up.
+    /// Controls station feedback when the far end clears a call.
     RemoteHangupTone,
     #[serde(alias = "hotlineenabled")]
+    /// Enables the default hotline behavior.
+    /// Controls whether eligible off-hook events immediately dial a destination.
     HotlineEnabled,
     #[serde(alias = "hotlineextension")]
+    /// Sets the default hotline destination.
+    /// Supplies the extension dialed by hotline-enabled appearances.
     HotlineExtension,
     #[serde(alias = "hotlinecontext")]
+    /// Sets the dialplan context for the default hotline.
+    /// Controls where the hotline extension is resolved.
     HotlineContext,
     #[serde(alias = "hotlinelabel")]
+    /// Sets the display label for the default hotline.
+    /// Provides station-facing text for the hotline appearance.
     HotlineLabel,
     #[serde(rename = "direct_media", alias = "directrtp")]
+    /// Controls whether media may flow directly between endpoints.
+    /// Avoids anchoring RTP at Asterisk when call conditions permit.
     DirectMedia,
     #[serde(rename = "early_media", alias = "earlyrtp")]
+    /// Controls whether media opens before call answer.
+    /// Allows progress audio or video during early call states.
     EarlyMedia,
     #[serde(alias = "audioencryption")]
+    /// Sets the default audio-encryption policy.
+    /// Controls whether SCCP audio channels negotiate encrypted media.
     AudioEncryption,
     #[serde(rename = "echocancel")]
+    /// Sets the default station echo-cancellation mode.
+    /// Applies the requested behavior when opening audio channels.
     EchoCancel,
     #[serde(rename = "silencesuppression")]
+    /// Sets the default silence-suppression mode.
+    /// Controls voice-activity transmission on station audio streams.
     SilenceSuppression,
     #[serde(alias = "jbenable")]
+    /// Enables the Asterisk jitter buffer for SCCP media.
+    /// Applies jitter smoothing to eligible received audio.
     JbEnable,
     #[serde(alias = "jbforce")]
+    /// Forces jitter buffering even when normally unnecessary.
+    /// Overrides automatic jitter-buffer activation decisions.
     JbForce,
     #[serde(alias = "jblog")]
+    /// Enables jitter-buffer frame logging.
+    /// Emits diagnostic details about buffered media frames.
     JbLog,
     #[serde(alias = "jbmaxsize")]
+    /// Sets the maximum jitter-buffer size in milliseconds.
+    /// Bounds how much received audio may be delayed for smoothing.
     JbMaxSize,
     #[serde(alias = "jbresyncthreshold")]
+    /// Sets the jitter-buffer resynchronization threshold.
+    /// Triggers timeline reset after a sufficiently large media discontinuity.
     JbResyncThreshold,
     #[serde(alias = "jbimpl")]
+    /// Selects the Asterisk jitter-buffer implementation.
+    /// Chooses the algorithm used for SCCP received audio.
     JbImplementation,
     #[serde(rename = "regcontext")]
+    /// Sets dialplan contexts populated by station registrations.
+    /// Creates or removes registration extensions as devices converge.
     RegistrationContext,
     #[serde(alias = "devicetable")]
+    /// Sets the realtime backend table for SCCP devices.
+    /// Selects where device definitions are loaded outside file configuration.
     DeviceTable,
     #[serde(alias = "linetable")]
+    /// Sets the realtime backend table for SCCP lines.
+    /// Selects where line definitions are loaded outside file configuration.
     LineTable,
 }
 
@@ -514,116 +674,198 @@ enum LineOption {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DeviceOption {
+    /// Declares the section as an SCCP device definition.
+    /// Selects device parsing and validation for the section.
     Type,
+    /// Sets the human-readable description of the device.
+    /// Exposes the label in diagnostics and Asterisk-facing device metadata.
     Description,
     #[serde(alias = "softkeyprofile")]
+    /// Selects the named soft-key profile assigned to the device.
+    /// Controls which actions appear in each station call mode.
     SoftkeyProfile,
     #[serde(
         rename = "cfwdall",
         alias = "forwardallenabled",
         alias = "forward_all_enabled"
     )]
+    /// Enables the call-forward-all feature on the device.
+    /// Controls whether its forwarding state can be used or changed.
     ForwardAllEnabled,
     #[serde(
         rename = "cfwdbusy",
         alias = "forwardbusyenabled",
         alias = "forward_busy_enabled"
     )]
+    /// Enables the call-forward-on-busy feature on the device.
+    /// Controls whether its forwarding state can be used or changed.
     ForwardBusyEnabled,
     #[serde(
         rename = "cfwdnoanswer",
         alias = "forwardnoanswerenabled",
         alias = "forward_no_answer_enabled"
     )]
+    /// Enables the call-forward-on-no-answer feature on the device.
+    /// Controls whether its forwarding state can be used or changed.
     ForwardNoAnswerEnabled,
     #[serde(
         rename = "forward_no_answer_timeout",
         alias = "cfwdnoanswertimeout",
         alias = "forwardnoanswertimeout"
     )]
+    /// Sets the no-answer delay before forwarding a call.
+    /// Applies the configured number of seconds to device forwarding.
     ForwardNoAnswerTimeout,
+    /// Sets the device's initial forward-all destination.
+    /// Provides the destination used when forward-all is active.
     ForwardAll,
+    /// Sets the device's initial forward-on-busy destination.
+    /// Provides the destination used when the line cannot accept another call.
     ForwardBusy,
+    /// Sets the device's initial forward-on-no-answer destination.
+    /// Provides the destination used after the no-answer timeout.
     ForwardNoAnswer,
     #[serde(alias = "dndfeature")]
+    /// Enables the do-not-disturb feature on the device.
+    /// Controls whether the station can expose and change DND state.
     DndFeature,
+    /// Sets the device's initial do-not-disturb mode.
+    /// Determines how incoming calls are handled before runtime changes.
     Dnd,
     #[serde(
         rename = "privacy_feature",
         alias = "private",
         alias = "privacyfeature"
     )]
+    /// Enables the privacy feature on the device.
+    /// Controls whether the station can expose and change privacy state.
     PrivacyFeature,
+    /// Sets the device's initial privacy state.
+    /// Determines whether calls begin with device privacy enabled.
     Privacy,
     #[serde(alias = "featuredefault")]
+    /// Sets the initial state of a provisioned feature button.
+    /// Maps a feature-button instance to its configured enabled state.
     FeatureDefault,
     #[serde(rename = "setvar")]
+    /// Adds an Asterisk channel variable for calls from the device.
+    /// Applies the name and value when the SCCP channel is created.
     SetVariable,
+    /// Enables call parking from the device.
+    /// Controls whether the station may invoke the configured parking flow.
     Park,
     #[serde(rename = "conf_allow", alias = "confallow", alias = "conference_allow")]
+    /// Allows the device to create or control conferences.
+    /// Gates conference operations independently of line configuration.
     ConferenceAllow,
     #[serde(
         rename = "conf_music_on_hold_class",
         alias = "confmusiconholdclass",
         alias = "conference_music_on_hold_class"
     )]
+    /// Sets the device conference music-on-hold class.
+    /// Selects audio played to held conference participants.
     ConferenceMusicOnHoldClass,
     #[serde(
         rename = "conf_play_general_announce",
         alias = "confplaygeneralannounce",
         alias = "conference_play_general_announce"
     )]
+    /// Controls general conference announcements for the device.
+    /// Enables or suppresses room-level prompts during conferences.
     ConferencePlayGeneralAnnounce,
     #[serde(
         rename = "conf_play_part_announce",
         alias = "confplaypartannounce",
         alias = "conference_play_participant_announce"
     )]
+    /// Controls participant conference announcements for the device.
+    /// Enables or suppresses join and leave prompts.
     ConferencePlayParticipantAnnounce,
     #[serde(
         rename = "conf_mute_on_entry",
         alias = "confmuteonentry",
         alias = "conference_mute_on_entry"
     )]
+    /// Controls whether device-created participants enter muted.
+    /// Sets the initial microphone state when joining a conference.
     ConferenceMuteOnEntry,
     #[serde(
         rename = "conf_show_conflist",
         alias = "confshowconflist",
         alias = "conference_show_list"
     )]
+    /// Controls whether the station shows the conference participant list.
+    /// Enables or suppresses the device conference-list interface.
     ConferenceShowList,
     #[serde(rename = "meetme")]
+    /// Enables conference access through the configured dial application.
+    /// Allows the device to invoke conference dialing from the station UI.
     ConferenceDialingEnabled,
     #[serde(rename = "meetmeopts")]
+    /// Sets application options for device conference dialing.
+    /// Passes the configured flags to the Asterisk conference application.
     ConferenceOptions,
     #[serde(alias = "useredialmenu")]
+    /// Controls whether redial opens the station redial menu.
+    /// Selects menu-based history instead of immediately dialing the last number.
     UseRedialMenu,
     #[serde(alias = "allowringinnotification")]
+    /// Enables ringing notifications for monitored hints.
+    /// Allows the device to alert when a subscribed target starts ringing.
     AllowRinginNotification,
     #[serde(alias = "mwilamp")]
+    /// Sets the lamp mode used for message-waiting indication.
+    /// Controls how the station signals waiting voicemail.
     MwiLamp,
     #[serde(alias = "mwioncall")]
+    /// Controls whether message-waiting indication remains active during calls.
+    /// Keeps or suppresses MWI while the device has an active call.
     MwiOnCall,
     #[serde(alias = "phonecodepage")]
+    /// Selects the legacy text code page used by the station.
+    /// Controls encoding of display strings for phones without UTF-8 support.
     PhoneCodePage,
     #[serde(alias = "allowoverlap")]
+    /// Controls overlap dialing for this device.
+    /// Overrides whether routing may begin before all digits arrive.
     AllowOverlap,
     #[serde(alias = "forcedtmfmode", alias = "force_dtmfmode")]
+    /// Forces the DTMF transport mode used by the device.
+    /// Selects signaling, RTP events, or in-band digit delivery.
     ForceDtmfMode,
     #[serde(rename = "direct_media", alias = "directrtp")]
+    /// Controls whether this device may use direct media.
+    /// Overrides the inherited RTP anchoring policy when call conditions permit.
     DirectMedia,
     #[serde(rename = "early_media", alias = "earlyrtp")]
+    /// Controls early media for this device.
+    /// Overrides whether media opens before the call is answered.
     EarlyMedia,
     #[serde(alias = "audioencryption")]
+    /// Sets the device audio-encryption policy.
+    /// Overrides whether its SCCP audio channels negotiate encrypted media.
     AudioEncryption,
+    /// Adds a source network to the device deny ACL.
+    /// Rejects matching registrations for this device unless a later rule permits them.
     Deny,
+    /// Adds a source network to the device permit ACL.
+    /// Allows matching registrations for this device under its ACL.
     Permit,
     #[serde(alias = "permithost")]
+    /// Adds a permitted signaling hostname for the device.
+    /// Restricts registration to peers whose resolved host identity is allowed.
     PermitHost,
+    /// Sets NAT handling for this device.
+    /// Overrides inherited address selection for signaling and media endpoints.
     Nat,
     #[serde(alias = "transportrequirement", alias = "transport_requirement")]
+    /// Sets the signaling transport required by the device.
+    /// Restricts registration to the configured clear-text or TLS transport.
     Transport,
     #[serde(rename = "sccp_tos", alias = "signalingtos")]
+    /// Sets the IP type-of-service byte for this device's signaling.
+    /// Converts the legacy traffic-class value into the device DSCP policy.
     SignalingTos,
     #[serde(
         rename = "sccp_dscp",
@@ -631,28 +873,56 @@ enum DeviceOption {
         alias = "signalingdscp",
         alias = "signaling_dscp"
     )]
+    /// Sets the DSCP value for this device's signaling.
+    /// Overrides the inherited SCCP signaling traffic classification.
     SignalingDscp,
     #[serde(rename = "sccp_cos", alias = "signalingcos", alias = "signaling_cos")]
+    /// Sets the layer-two class of service for this device's signaling.
+    /// Overrides the inherited SCCP signaling priority.
     SignalingCos,
     #[serde(alias = "audiotos")]
+    /// Sets the IP type-of-service byte for this device's audio.
+    /// Converts the legacy traffic-class value into the device audio policy.
     AudioTos,
     #[serde(alias = "audiodscp")]
+    /// Sets the DSCP value for this device's audio.
+    /// Overrides the inherited audio media traffic classification.
     AudioDscp,
     #[serde(alias = "audiocos")]
+    /// Sets the layer-two class of service for this device's audio.
+    /// Overrides the inherited audio media priority.
     AudioCos,
     #[serde(alias = "videotos")]
+    /// Sets the IP type-of-service byte for this device's video.
+    /// Converts the legacy traffic-class value into the device video policy.
     VideoTos,
     #[serde(alias = "videodscp")]
+    /// Sets the DSCP value for this device's video.
+    /// Overrides the inherited video media traffic classification.
     VideoDscp,
     #[serde(alias = "videocos")]
+    /// Sets the layer-two class of service for this device's video.
+    /// Overrides the inherited video media priority.
     VideoCos,
     #[serde(alias = "trustphoneip")]
+    /// Recognizes the obsolete device-level phone-IP trust option.
+    /// Rejects it because the signaling peer address is always authoritative.
     TrustPhoneIp,
     #[serde(alias = "dtmfmode")]
+    /// Recognizes the obsolete device-level DTMF mode option.
+    /// Rejects it and directs configuration to the force-DTMF option.
     ObsoleteDtmfMode,
+    /// Adds codecs to the device's allowed media set.
+    /// Extends the codec policy inherited from general configuration.
     Allow,
+    /// Removes codecs from the device's allowed media set.
+    /// Restricts the codec policy inherited from general configuration.
     Disallow,
+    /// Adds a line appearance button to the device.
+    /// Resolves the configured line and assigns its next device instance.
     Line,
+    /// Adds an explicitly typed button to the device layout.
+    /// Parses line, speed-dial, feature, service, and BLF button definitions.
     Button,
 }
 

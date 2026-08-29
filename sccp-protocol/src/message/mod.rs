@@ -1576,51 +1576,89 @@ impl Default for ButtonTemplateEntry {
 /// retains an unrecognized identifier. Decode with [`Self::decode`] during
 /// registration and [`Self::decode_with_version`] after version negotiation.
 pub enum ClientMessage {
+    /// Reports that the station connection remains active.
+    /// Refreshes the server-side keepalive deadline.
     KeepAlive,
+    /// Introduces a station and its requested SCCP protocol characteristics.
+    /// Starts registration and device authentication on the server.
     Register(RegistrationMessage),
+    /// Reports the UDP port on which the station expects media.
+    /// Supplies the station RTP port to server-side media setup.
     IpPort {
         rtp_port: u16,
     },
+    /// Reports a digit pressed on the station keypad.
+    /// Associates the input with its line and call when the wire layout permits.
     KeypadButton {
         button: Digit,
         line_instance: u32,
         call_reference: u32,
         wire_layout: Option<KeypadButtonWireLayout>,
     },
+    /// Submits a complete called-party number in one message.
+    /// Requests call setup without sending digits individually.
     EnblocCall {
         called_party: String,
         line_instance: u32,
     },
+    /// Reports a physical or logical station button stimulus.
+    /// Identifies the affected instance, call, and stimulus status.
     Stimulus {
         stimulus: Stimulus,
         instance: u32,
         call_reference: u32,
         status: u32,
     },
+    /// Reports that the station handset or audio path went off hook.
+    /// Starts or resumes call handling for the identified line and call.
     OffHook {
         line_instance: u32,
         call_reference: u32,
     },
+    /// Reports that the station handset or audio path went on hook.
+    /// Ends or releases call handling for the identified line and call.
     OnHook {
         line_instance: u32,
         call_reference: u32,
     },
+    /// Reports an off-hook transition with originating-party details.
+    /// Carries the calling number, mailbox, and selected line instance.
     OffHookWithCallingParty {
         calling_party_number: String,
         voice_mailbox: String,
         line_instance: u32,
     },
+    /// Requests the configured status of one station line.
+    /// Uses the line instance to select the directory number response.
     LineStatRequest {
         line_instance: u32,
     },
+    /// Requests the station's current device configuration.
+    /// Prompts the server to return its configuration status.
     ConfigStatRequest,
+    /// Requests the server's current date and time.
+    /// Prompts synchronization of the station clock.
     TimeDateRequest,
+    /// Requests the station's provisioned button layout.
+    /// Prompts one or more button-template chunks from the server.
     ButtonTemplateRequest,
+    /// Requests the firmware or load version assigned to the station.
+    /// Prompts the server's version response during provisioning.
     VersionRequest,
+    /// Reports the station's supported media capabilities.
+    /// Answers a server capability request with codec and media details.
     CapabilitiesResponse(Vec<MediaCapability>),
+    /// Reports a changed set of station media capabilities.
+    /// Lets the server refresh capabilities after initial negotiation.
     CapabilitiesUpdate(CapabilityUpdate),
+    /// Acknowledges opening a multimedia receive channel.
+    /// Reports the resulting endpoint and status for the requested stream.
     OpenMultimediaReceiveChannelAck(OpenMultimediaReceiveChannelAck),
+    /// Requests the station's configured signaling-server list.
+    /// Prompts the server response used for failover discovery.
     ServerRequest,
+    /// Reports a station alarm or diagnostic condition.
+    /// Carries severity, text, and optional vendor parameter words.
     Alarm {
         severity: AlarmSeverity,
         text: String,
@@ -1628,11 +1666,15 @@ pub enum ClientMessage {
         /// layout exactly.
         parameters: Option<[u32; 2]>,
     },
+    /// Acknowledges starting multicast media reception.
+    /// Reports status for the passthrough party and call.
     MulticastMediaReceptionAck {
         status: MediaStatus,
         passthrough_party_id: crate::types::PassthroughPartyId,
         call_reference: CallReference,
     },
+    /// Acknowledges opening an audio receive channel.
+    /// Reports status and the station's selected media endpoint.
     OpenReceiveChannelAck {
         status: MediaStatus,
         address: IpAddr,
@@ -1640,40 +1682,68 @@ pub enum ClientMessage {
         passthrough_party_id: u32,
         call_reference: u32,
     },
+    /// Requests the soft-key sets available to the station.
+    /// Prompts the server to send the active soft-key profile.
     SoftKeySetRequest,
+    /// Requests the station's soft-key action template.
+    /// Prompts the server to enumerate supported soft-key actions.
     SoftKeyTemplateRequest,
+    /// Reports activation of a station soft key.
+    /// Associates the action with its line and call context.
     SoftKeyEvent {
         event: u32,
         line_instance: u32,
         call_reference: u32,
     },
+    /// Requests removal of the station registration.
+    /// Carries the station-provided reason for ending the session.
     Unregister {
         reason: u32,
     },
+    /// Requests a registration token before full station registration.
+    /// Supplies the station identity used for token admission control.
     RegisterToken(RegisterTokenMessage),
+    /// Reports a hook-flash action on an analog-style call.
+    /// Associates the flash with its line and call context.
     HookFlash {
         line_instance: u32,
         call_reference: u32,
     },
+    /// Requests call-forwarding state for one line.
+    /// Prompts the server to return configured forwarding destinations.
     ForwardStatusRequest {
         line_instance: u32,
     },
+    /// Requests the contents of one speed-dial entry.
+    /// Uses the speed-dial instance to select the response.
     SpeedDialStatusRequest {
         speed_dial_instance: u32,
     },
+    /// Returns media connection statistics collected by the station.
+    /// Carries packet, jitter, latency, and quality data for a call.
     ConnectionStatisticsResponse(ConnectionStatistics),
+    /// Reports whether the station headset is enabled.
+    /// Updates the server's view of the station audio accessory state.
     HeadsetStatus {
         enabled: bool,
     },
+    /// Reports a station media-resource state change.
+    /// Carries the resource type, direction, and availability details.
     MediaResourceNotification(MediaResourceNotification),
+    /// Reports an event on a particular station media path.
+    /// Identifies both the media path and the observed event.
     MediaPathEvent {
         path: MediaPathId,
         event: MediaPathEvent,
     },
+    /// Reports a capability of a particular station media path.
+    /// Identifies the path and its supported media behavior.
     MediaPathCapability {
         path: MediaPathId,
         capability: MediaPathCapability,
     },
+    /// Reports failure of an active media transmission.
+    /// Identifies the stream endpoint, call, and failure status.
     MediaTransmissionFailure {
         conference_id: u32,
         passthrough_party_id: u32,
@@ -1682,47 +1752,97 @@ pub enum ClientMessage {
         call_reference: u32,
         status: MediaStatus,
     },
+    /// Reports how many line appearances the station can register.
+    /// Lets the server constrain provisioning to the station's capacity.
     RegisterAvailableLines {
         lines: u32,
     },
+    /// Requests the configured service URL at an index.
+    /// Prompts the server to return its URL, label, and extension text.
     ServiceUrlStatusRequest {
         index: u32,
     },
+    /// Requests the state of a provisioned feature button.
+    /// Carries the feature index and station capability bits.
     FeatureStatusRequest {
         index: u32,
         /// Station feature-capability bits included in the request layout.
         capabilities: u32,
     },
+    /// Acknowledges a request to start audio transmission.
+    /// Reports the station's result for the requested media stream.
     StartMediaTransmissionAck(MediaTransmissionAck),
+    /// Acknowledges a request to start multimedia transmission.
+    /// Reports the station's result for the requested video or data stream.
     StartMultimediaTransmissionAck(StartMultimediaTransmissionAck),
+    /// Reports capabilities supplied by an attached extension device.
+    /// Lets the server account for expansion-module and accessory features.
     ExtensionDeviceCapabilities(ExtensionDeviceCapabilities),
+    /// Carries legacy application data from the station to the server.
+    /// Uses the fixed-format device-to-user data layout.
     DeviceToUserData(UserDataMessage),
+    /// Returns a legacy station response to server application data.
+    /// Uses the fixed-format device-to-user response layout.
     DeviceToUserDataResponse(UserDataMessage),
+    /// Carries version-one application data from the station.
+    /// Supports the extended variable-length user-data layout.
     DeviceToUserDataV1(UserDataV1Message),
+    /// Returns a version-one station response to application data.
+    /// Supports the extended variable-length response layout.
     DeviceToUserDataResponseV1(UserDataV1Message),
+    /// Returns endpoint information requested for a station port.
+    /// Identifies the address and port selected by the station.
     PortResponse(PortEndpoint),
+    /// Requests status for a station feature subscription.
+    /// Carries the transaction and feature identifiers being queried.
     SubscriptionStatusRequest(SubscriptionRequest),
+    /// Acknowledges subscription to an RTP DTMF payload.
+    /// Identifies the negotiated payload associated with the subscription.
     SubscribeDtmfPayloadResponse(DtmfPayloadIdentity),
+    /// Acknowledges removal of an RTP DTMF payload subscription.
+    /// Identifies the payload whose subscription was removed.
     UnsubscribeDtmfPayloadResponse(DtmfPayloadIdentity),
+    /// Reports the station's location information as XML.
+    /// Provides location metadata for routing and emergency services.
     LocationInfo {
         /// Location XML limited to 2,400 bytes before its required terminator.
         xml: String,
     },
+    /// Reports a structured station alarm encoded as XML.
+    /// Carries the alarm payload and its associated station metadata.
     XmlAlarm(XmlAlarmMessage),
+    /// Requests the server's current call-count information.
+    /// Preserves the request word used by the station wire layout.
     CallCountRequest {
         /// Request word retained without assigning a narrower semantic meaning.
         value: u32,
     },
+    /// Returns the result of creating a conference.
+    /// Correlates the station outcome with the requested conference.
     CreateConferenceResponse(CreateConferenceResponse),
+    /// Returns the result of deleting a conference.
+    /// Identifies the conference and its deletion result.
     DeleteConferenceResponse {
         conference_id: ConferenceId,
         result: DeleteConferenceResult,
     },
+    /// Returns the result of modifying a conference.
+    /// Carries the station outcome for the requested conference changes.
     ModifyConferenceResponse(ModifyConferenceResponse),
+    /// Returns station state for a conference audit.
+    /// Reports the conference details requested by the server.
     AuditConferenceResponse(AuditConferenceResponse),
+    /// Returns the result of adding a conference participant.
+    /// Identifies the conference participant and operation outcome.
     AddParticipantResponse(AddParticipantResponse),
+    /// Returns station state for a participant audit.
+    /// Reports the participant details requested by the server.
     AuditParticipantResponse(AuditParticipantResponse),
+    /// Preserves a recognized station-to-server message without typed decoding.
+    /// Retains its catalog identifier and payload bytes for lossless handling.
     KnownOpaque(KnownOpaqueMessage),
+    /// Preserves an unrecognized station-to-server message.
+    /// Retains the unknown identifier and raw payload for diagnostics or forwarding.
     Unknown(RawMessage),
 }
 
@@ -1734,6 +1854,8 @@ pub enum ClientMessage {
 /// [`Self::encode`] applies version-only selection. User-visible strings can be
 /// encoded through the explicit legacy-code-page entry points when required.
 pub enum ServerMessage {
+    /// Accepts station registration and supplies session parameters.
+    /// Carries keepalive intervals, protocol features, and the date template.
     RegisterAck {
         keepalive_seconds: u32,
         secondary_keepalive_seconds: u32,
@@ -1741,33 +1863,49 @@ pub enum ServerMessage {
         features: PhoneFeatures,
         date_template: DateTemplate,
     },
+    /// Rejects a station registration attempt.
+    /// Returns a human-readable reason for refusing the registration.
     RegisterReject {
         reason: String,
     },
+    /// Acknowledges a station keepalive message.
+    /// Confirms that the signaling session remains active.
     KeepAliveAck,
+    /// Acknowledges a station unregister request.
+    /// Confirms that the server has released the registration.
     UnregisterAck,
+    /// Requests the station's supported media capabilities.
+    /// Prompts a capability response used for media negotiation.
     CapabilitiesRequest,
+    /// Supplies the station's provisioned device configuration.
+    /// Carries user, service, and device settings needed after registration.
     ConfigStatus(ConfigurationStatus),
+    /// Supplies the configured identity of one station line.
+    /// Maps a line instance to its directory number and display name.
     LineStatus {
         instance: u32,
         number: String,
         display_name: String,
     },
-    /// One canonical chunk of a station's logical button template.
-    ///
-    /// SCCP reserves 42 definition slots in every frame. `offset` and `total`
-    /// let larger physical layouts, including expansion modules, span frames.
+    /// Supplies one chunk of the station's logical button layout.
+    /// Uses offset and total counts to span layouts across multiple frames.
     ButtonTemplate {
         offset: u32,
         total: u32,
         buttons: Vec<ButtonTemplateEntry>,
     },
+    /// Supplies the firmware or load version assigned to the station.
+    /// Answers the station's version request during provisioning.
     Version {
         firmware: String,
     },
+    /// Supplies the station's signaling-server list.
+    /// Provides primary and failover endpoints for server discovery.
     ServerResponse {
         servers: Vec<SignalingServerEndpoint>,
     },
+    /// Supplies the server's current date and time.
+    /// Synchronizes the station clock with calendar and Unix time fields.
     TimeDate {
         year: u32,
         month: u32,
@@ -1779,12 +1917,18 @@ pub enum ServerMessage {
         milliseconds: u32,
         unix_seconds: u32,
     },
+    /// Supplies the soft-key actions supported by the server.
+    /// Defines the action identifiers referenced by soft-key sets.
     SoftKeyTemplate {
         actions: Vec<values::SoftKey>,
     },
+    /// Supplies the station's soft-key set profile.
+    /// Maps call modes to ordered soft-key action lists.
     SoftKeySet {
         profile: SoftKeyProfile,
     },
+    /// Selects the soft-key set shown for a call.
+    /// Uses a validity mask to enable positions in the selected set.
     SelectSoftKeys {
         line_instance: u32,
         call_reference: u32,
@@ -1792,41 +1936,63 @@ pub enum ServerMessage {
         /// Bit mask over positions in the selected soft-key set.
         valid_mask: u32,
     },
+    /// Updates the station's state for a call appearance.
+    /// Associates the new call state with a line and call reference.
     CallState {
         state: CallState,
         line_instance: u32,
         call_reference: u32,
     },
+    /// Supplies calling and called party information for a call.
+    /// Updates the station's call-information display and metadata.
     CallInfo {
         info: CallInfo,
         line_instance: u32,
         call_reference: u32,
     },
+    /// Displays a call-specific prompt on the station.
+    /// Sets its text, timeout, line, and call context.
     DisplayPrompt {
         timeout_seconds: u32,
         text: String,
         line_instance: u32,
         call_reference: u32,
     },
+    /// Clears a call-specific prompt from the station.
+    /// Targets the prompt associated with a line and call reference.
     ClearPrompt {
         line_instance: u32,
         call_reference: u32,
     },
+    /// Displays a transient notification on the station.
+    /// Supplies notification text and its timeout.
     DisplayNotify {
         timeout_seconds: u32,
         text: String,
     },
+    /// Clears the station's transient notification.
+    /// Removes the notification created by a display-notify message.
     ClearNotify,
+    /// Displays a prioritized transient notification.
+    /// Supplies its priority, text, and timeout.
     DisplayPriorityNotify {
         timeout_seconds: u32,
         priority: NotificationPriority,
         text: String,
     },
+    /// Clears notifications at a specified priority.
+    /// Leaves notifications at other priorities unaffected.
     ClearPriorityNotify {
         priority: NotificationPriority,
     },
+    /// Notifies the station of a DTMF tone state.
+    /// Carries digit and call context without requesting local tone generation.
     NotifyDtmfTone(DtmfToneControl),
+    /// Instructs the station to send a DTMF tone.
+    /// Carries the digit and call context for media signaling.
     SendDtmfTone(DtmfToneControl),
+    /// Starts an announcement for a conference.
+    /// Carries the announcement sequence, participants, mask, and play mode.
     StartAnnouncement {
         announcements: Vec<AnnouncementEntry>,
         end_of_ack: u32,
@@ -1835,86 +2001,146 @@ pub enum ServerMessage {
         hearing_conference_party_mask: u32,
         play_mode: u32,
     },
+    /// Stops the active announcement for a conference.
+    /// Targets the announcement by conference identifier.
     StopAnnouncement {
         conference_id: u32,
     },
+    /// Reports or confirms announcement completion to the station.
+    /// Carries the conference identifier and final play status.
     AnnouncementFinish {
         conference_id: u32,
         play_status: u32,
     },
+    /// Clears conference state maintained by the station.
+    /// Identifies the conference and associated service number.
     ClearConference {
         conference_id: ConferenceId,
         service_number: u32,
     },
+    /// Requests creation of a station-managed conference.
+    /// Carries the conference attributes and correlation identifiers.
     CreateConferenceRequest(CreateConferenceRequest),
+    /// Requests deletion of a station-managed conference.
+    /// Targets the conference by identifier.
     DeleteConferenceRequest {
         conference_id: ConferenceId,
     },
+    /// Requests changes to a station-managed conference.
+    /// Carries the updated conference attributes and identifiers.
     ModifyConferenceRequest(ModifyConferenceRequest),
+    /// Requests the station's current conference state.
+    /// Prompts an audit response for conference reconciliation.
     AuditConferenceRequest,
+    /// Requests adding a participant to a conference.
+    /// Carries the conference, call, and participant details.
     AddParticipantRequest(AddParticipantRequest),
+    /// Requests removal of a participant from a conference.
+    /// Targets the participant by conference and call reference.
     DropParticipantRequest {
         conference_id: ConferenceId,
         call_reference: CallReference,
     },
+    /// Requests the station's state for conference participants.
+    /// Targets the participant set associated with a conference.
     AuditParticipantRequest {
         conference_id: ConferenceId,
     },
+    /// Requests changes to a conference participant.
+    /// Carries updated participant attributes and identifiers.
     ChangeParticipantRequest(ChangeParticipantRequest),
+    /// Stops a station multimedia transmit stream.
+    /// Identifies the conference, party, and call owning the stream.
     StopMultimediaTransmission(MultimediaStreamControl),
+    /// Commands a station video stream to change its flow.
+    /// Carries the requested bit rate and stream identifiers.
     FlowControlCommand(VideoFlowControl),
+    /// Closes a station multimedia receive channel.
+    /// Identifies the conference, party, and call owning the channel.
     CloseMultimediaReceiveChannel(MultimediaStreamControl),
+    /// Selects the station's video display layout for a call.
+    /// Carries conference, call, and layout identifiers.
     VideoDisplayCommand {
         conference_id: ConferenceId,
         call_reference: CallReference,
         layout_id: u32,
     },
+    /// Notifies the station of video flow-control state.
+    /// Reports stream identifiers and the applicable bit rate.
     FlowControlNotify(VideoFlowControl),
+    /// Activates the station call-control plane for a line.
+    /// Makes the selected line instance the active call plane.
     ActivateCallPlane {
         line_instance: u32,
     },
+    /// Deactivates the station call-control plane.
+    /// Removes the currently active call-plane selection.
     DeactivateCallPlane,
+    /// Confirms processing of a dial-string backspace.
+    /// Associates the response with its line and call context.
     BackspaceResponse {
         line_instance: u32,
         call_reference: u32,
     },
+    /// Accepts a station registration-token request.
+    /// Allows the station to proceed with full registration.
     RegisterTokenAck,
+    /// Rejects a station registration-token request.
+    /// Supplies the delay before the station should retry.
     RegisterTokenReject {
         backoff_seconds: u32,
     },
+    /// Sets the station ringer behavior for a call.
+    /// Carries mode, duration, line, and call context.
     SetRinger {
         mode: RingerMode,
         duration: RingDuration,
         line_instance: u32,
         call_reference: u32,
     },
+    /// Sets the lamp state for a station button.
+    /// Targets a button type and instance with the requested lamp mode.
     SetLamp {
         stimulus: ButtonType,
         instance: u32,
         mode: LampMode,
     },
+    /// Starts local tone generation on the station.
+    /// Selects the tone, direction, line, and call context.
     StartTone {
         tone: Tone,
         direction: ToneDirection,
         line_instance: u32,
         call_reference: u32,
     },
+    /// Stops local tone generation for a call.
+    /// Targets the tone associated with a line and call reference.
     StopTone {
         line_instance: u32,
         call_reference: u32,
     },
+    /// Starts station reception of a multicast media stream.
+    /// Supplies multicast endpoint, codec, and stream identifiers.
     StartMulticastMediaReception(MulticastMediaReception),
+    /// Starts station transmission to a multicast media stream.
+    /// Supplies multicast endpoint, codec, and stream identifiers.
     StartMulticastMediaTransmission(MulticastMediaTransmission),
+    /// Stops station reception of a multicast media stream.
+    /// Targets the stream by conference, party, and call identifiers.
     StopMulticastMediaReception {
         conference_id: ConferenceId,
         passthrough_party_id: crate::types::PassthroughPartyId,
         call_reference: CallReference,
     },
+    /// Stops station transmission to a multicast media stream.
+    /// Targets the stream by conference, party, and call identifiers.
     StopMulticastMediaTransmission {
         conference_id: ConferenceId,
         passthrough_party_id: crate::types::PassthroughPartyId,
         call_reference: CallReference,
     },
+    /// Opens a station audio receive channel.
+    /// Supplies codec, packetization, source, encryption, and stream details.
     OpenReceiveChannel {
         call_reference: u32,
         passthrough_party_id: u32,
@@ -1930,12 +2156,18 @@ pub enum ServerMessage {
         /// runtime-created message.
         wire: Option<OpenReceiveChannelWire>,
     },
+    /// Closes a station audio receive channel.
+    /// Identifies the conference, party, and call owning the stream.
     CloseReceiveChannel(AudioStreamControl),
+    /// Requests media connection statistics from the station.
+    /// Selects the call, directory number, and statistics processing mode.
     ConnectionStatisticsRequest {
         directory_number: String,
         call_reference: u32,
         processing: StatisticsProcessing,
     },
+    /// Starts station audio transmission to a media endpoint.
+    /// Supplies endpoint, traffic class, encryption, and stream details.
     StartMediaTransmission {
         call_reference: u32,
         passthrough_party_id: u32,
@@ -1948,37 +2180,71 @@ pub enum ServerMessage {
         /// runtime-created message.
         wire: Option<StartMediaTransmissionWire>,
     },
+    /// Stops a station audio transmit stream.
+    /// Identifies the conference, party, and call owning the stream.
     StopMediaTransmission(AudioStreamControl),
+    /// Requests subscription to an RTP DTMF payload.
+    /// Carries the payload and transaction identity to subscribe.
     SubscribeDtmfPayloadRequest(DtmfPayloadRequest),
+    /// Reports failure to establish a DTMF payload subscription.
+    /// Identifies the payload and transaction that failed.
     SubscribeDtmfPayloadError(DtmfPayloadIdentity),
+    /// Requests removal of an RTP DTMF payload subscription.
+    /// Carries the payload and transaction identity to remove.
     UnsubscribeDtmfPayloadRequest(DtmfPayloadRequest),
+    /// Reports failure to remove a DTMF payload subscription.
+    /// Identifies the payload and transaction that failed.
     UnsubscribeDtmfPayloadError(DtmfPayloadIdentity),
+    /// Sets the station speakerphone mode.
+    /// Controls whether the station speaker audio path is active.
     SetSpeakerMode(SpeakerMode),
+    /// Sets the station microphone mode.
+    /// Controls whether the station microphone audio path is active.
     SetMicrophoneMode(MicrophoneMode),
+    /// Requests a station reset or restart.
+    /// Selects the reset behavior defined by the reset type.
     Reset(ResetType),
+    /// Displays text in the station's general display area.
+    /// Replaces the current non-call-specific display text.
     DisplayText {
         text: String,
     },
+    /// Clears the station's general display area.
+    /// Removes text previously sent with a display-text message.
     ClearDisplay,
+    /// Supplies call-forwarding state for one line.
+    /// Carries destinations for all, busy, and no-answer forwarding.
     ForwardStatus {
         line_instance: u32,
         forward_all: Option<String>,
         forward_busy: Option<String>,
         forward_no_answer: Option<String>,
     },
+    /// Supplies the contents of one station speed-dial entry.
+    /// Maps an entry instance to its number and display name.
     SpeedDialStatus {
         instance: u32,
         number: String,
         display_name: String,
     },
+    /// Displays or records the dialed number for a call.
+    /// Associates the number with its line and call reference.
     DialedNumber {
         number: String,
         line_instance: u32,
         call_reference: u32,
     },
+    /// Starts station monitoring for media-path failure.
+    /// Supplies thresholds and stream identifiers used for detection.
     StartMediaFailureDetection(MediaFailureDetection),
+    /// Carries legacy application data from the server to the station.
+    /// Uses the fixed-format user-to-device data layout.
     UserToDeviceData(UserDataMessage),
+    /// Carries version-one application data from the server.
+    /// Supports the extended variable-length user-data layout.
     UserToDeviceDataV1(UserDataV1Message),
+    /// Supplies the state of a provisioned feature button.
+    /// Carries its type, label, instance, and feature-specific state.
     FeatureStatus {
         instance: u32,
         button_type: ButtonType,
@@ -1986,6 +2252,8 @@ pub enum ServerMessage {
         /// Feature-specific state word interpreted according to `button_type`.
         state: u32,
     },
+    /// Supplies the configured service URL at an index.
+    /// Carries its URL, label, and optional extension text.
     ServiceUrlStatus {
         index: u32,
         url: String,
@@ -1993,40 +2261,66 @@ pub enum ServerMessage {
         /// Additional dynamic-layout text; empty in layouts that do not carry it.
         extension_text: String,
     },
+    /// Updates whether a call is selected on the station.
+    /// Associates the selection state with its line and call.
     CallSelectStatus {
         /// Selection-state word retained as an extensible numeric value.
         status: u32,
         call_reference: u32,
         line_instance: u32,
     },
+    /// Requests endpoint information for a station port.
+    /// Carries the port identity and addressing parameters to resolve.
     PortRequest(PortRequest),
+    /// Requests closure of a station port endpoint.
+    /// Identifies the endpoint and port resources to release.
     PortClose(PortClose),
+    /// Opens a station multimedia receive channel.
+    /// Supplies codec, endpoint, and stream negotiation details.
     OpenMultimediaChannel(OpenMultimediaChannel),
+    /// Starts station transmission of multimedia.
+    /// Supplies destination, codec, bandwidth, and stream identifiers.
     StartMultimediaTransmission(StartMultimediaTransmission),
+    /// Sends a stream-specific multimedia control command.
+    /// Carries command data for video, picture, or recovery behavior.
     MiscellaneousCommand(MiscellaneousCommand),
+    /// Supplies the result or state of a feature subscription.
+    /// Carries transaction, feature, timer, and cause values.
     SubscriptionStatus {
         transaction_id: u32,
         feature_id: u32,
         timer_seconds: u32,
         cause: SubscriptionCause,
     },
+    /// Sends a feature-subscription notification to the station.
+    /// Carries transaction state, feature state, and display text.
     Notification {
         transaction_id: u32,
         feature_id: u32,
         status: BusyLampFieldState,
         text: String,
     },
+    /// Sets how a call is represented in station call history.
+    /// Associates the disposition with its line and call reference.
     CallHistoryDisposition {
         disposition: CallHistoryDisposition,
         line_instance: u32,
         call_reference: u32,
     },
+    /// Returns the server's current call-count response.
+    /// Answers the corresponding station call-count request.
     CallCountResponse,
+    /// Updates the station's recording indicator for a call.
+    /// Carries the call reference and whether recording is active.
     RecordingStatus {
         call_reference: u32,
         active: bool,
     },
+    /// Preserves a recognized server-to-station message without typed decoding.
+    /// Retains its catalog identifier and payload bytes for lossless handling.
     KnownOpaque(KnownOpaqueMessage),
+    /// Preserves an unrecognized server-to-station message.
+    /// Retains the unknown identifier and raw payload for diagnostics or forwarding.
     Unknown(RawMessage),
 }
 
