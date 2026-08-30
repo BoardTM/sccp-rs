@@ -83,7 +83,8 @@ use crate::message::values::{
 };
 use crate::message::wire::{CodecError, FrameDecoder};
 use crate::message::{
-    AnnouncementEntry, AudioStreamControl, BoundedBytes, ButtonTemplateEntry, ClientMessage,
+    AnnouncementEntry, AudioStreamControl, BoundedBytes, ButtonTemplateEntry,
+    CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES, CallCountLineData, CallCountResponse, ClientMessage,
     ConnectionStatistics, MediaEncryption, MediaEndpointAddress, MediaRequestIdentity,
     MediaRequestToken, MiscellaneousCommand, MulticastMediaReception, MulticastMediaTransmission,
     MultimediaPayload, MultimediaPayloadDirection, MultimediaStreamControl, OpenMultimediaChannel,
@@ -149,6 +150,9 @@ const CONNECTION_STATISTICS_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_CONNECTION_STATISTICS: usize = 32;
 // Retired references prevent a late reply from binding to a replacement call.
 const MAX_STATISTICS_REFERENCES_PER_SESSION: usize = 4096;
+// Conservative defaults for phones that support multiple calls per line.
+const DEFAULT_MAX_CALLS_PER_LINE: u16 = 4;
+const DEFAULT_BUSY_TRIGGER_PER_LINE: u16 = 2;
 const PARKING_APPLICATION_ID: u32 = 9090;
 /// Shortest retry delay accepted for a rejected registration token.
 pub const MIN_REGISTRATION_BACKOFF: Duration = Duration::from_secs(30);
@@ -3385,7 +3389,7 @@ async fn handle_pre_registration_message(
         | ClientMessage::SubscriptionStatusRequest(_)
         | ClientMessage::SubscribeDtmfPayloadResponse(_)
         | ClientMessage::UnsubscribeDtmfPayloadResponse(_)
-        | ClientMessage::CallCountRequest { .. }
+        | ClientMessage::CallCountRequest(_)
         | ClientMessage::CreateConferenceResponse(_)
         | ClientMessage::DeleteConferenceResponse { .. }
         | ClientMessage::ModifyConferenceResponse(_)
@@ -4593,8 +4597,9 @@ async fn handle_client_message(
         ClientMessage::Unregister { .. } => {
             send_message(stream, &ServerMessage::UnregisterAck, protocol).await?;
         }
-        ClientMessage::CallCountRequest { .. } => {
-            send_message(stream, &ServerMessage::CallCountResponse, protocol).await?;
+        ClientMessage::CallCountRequest(_) => {
+            let response = call_count_response(&state.device)?;
+            send_message(stream, &response, protocol).await?;
         }
         ClientMessage::ConnectionStatisticsResponse(statistics) => {
             collect_connection_statistics(state, statistics, context).await?;
@@ -5177,6 +5182,31 @@ fn line_status(device: &DeviceDefinition, instance: u32) -> Option<ServerMessage
             number: appearance.line.number.clone(),
             display_name: appearance.display_label().to_owned(),
         })
+}
+
+fn call_count_response(device: &DeviceDefinition) -> Result<ServerMessage, CodecError> {
+    let lines = device.lines().collect::<Vec<_>>();
+    let total_configured_lines = u32::try_from(lines.len()).map_err(|_| {
+        CodecError::InvalidDefinition(format!(
+            "device {} has too many lines for a call-count response",
+            device.id
+        ))
+    })?;
+    let starting_line_instance = lines.first().map_or(0, |line| line.instance);
+    let line_data = lines
+        .into_iter()
+        .take(CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES)
+        .map(|_| CallCountLineData {
+            max_calls: DEFAULT_MAX_CALLS_PER_LINE,
+            busy_trigger: DEFAULT_BUSY_TRIGGER_PER_LINE,
+        })
+        .collect();
+
+    Ok(ServerMessage::CallCountResponse(CallCountResponse {
+        total_configured_lines,
+        starting_line_instance,
+        line_data,
+    }))
 }
 
 fn mobility_device_candidate(

@@ -253,7 +253,7 @@ wire_enum! {
         /// Historical Cisco tables identify this device type as AnalogAccessElvis or WS-X6624 analog access.
         /// The Rust variant name appears to be swapped with `AnalogAccessElvis`.
         DigitalAccessLennon = 47,
-        /// A generic CUCM conference-bridge media resource rather than a handset.
+        /// A generic conference-bridge media resource rather than a handset.
         ConferenceBridge = 50,
         /// A conference-bridge implementation generation carrying Cisco's Yoko codename.
         ConferenceBridgeYoko = 51,
@@ -263,11 +263,11 @@ wire_enum! {
         ConferenceBridgeSummit = 53,
         /// An H.225 call-signaling endpoint used by the H.323 stack.
         H225 = 60,
-        /// An H.323 telephone endpoint represented in CUCM's device table.
+        /// An H.323 telephone endpoint represented in the device table.
         H323Phone = 61,
         /// An H.323 gateway or trunk endpoint rather than an SCCP station.
         H323Trunk = 62,
-        /// A CUCM music-on-hold media resource.
+        /// A music-on-hold media resource.
         MusicOnHold = 70,
         /// A logical call-routing pilot rather than a physical endpoint.
         Pilot = 71,
@@ -287,7 +287,7 @@ wire_enum! {
         CiscoMediaServer = 84,
         /// A conference-bridge implementation generation carrying Cisco's Flint codename.
         ConferenceBridgeFlint = 85,
-        /// A logical CUCM route list used to select trunks and gateways.
+        /// A logical route list used to select trunks and gateways.
         RouteList = 90,
         /// Cisco's synthetic station type for registration and call-load testing.
         LoadSimulator = 100,
@@ -313,15 +313,15 @@ wire_enum! {
         CiscoAddon7914 = 124,
         /// A generic call-routing trunk whose more specific signaling family is not encoded here.
         Trunk = 125,
-        /// A CUCM annunciator media resource that plays tones and recorded prompts.
+        /// An annunciator media resource that plays tones and recorded prompts.
         Annunciator = 126,
         /// A media bridge used to fork call audio for monitoring.
         MonitorBridge = 127,
-        /// A recording media resource represented as a CUCM device.
+        /// A recording media resource represented as a call-control device.
         Recorder = 128,
         /// A monitoring bridge implementation carrying Cisco's Yoko generation name.
         MonitorBridgeYoko = 129,
-        /// A SIP signaling trunk represented in CUCM's common device-type namespace.
+        /// A SIP signaling trunk represented in the common device-type namespace.
         SipTrunk = 131,
         /// Cisco 7915 expansion module operating in its 12-button layout.
         CiscoAddon7915_12 = 227,

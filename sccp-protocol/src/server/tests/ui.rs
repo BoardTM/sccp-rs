@@ -1,6 +1,21 @@
 use super::support::*;
 
 #[test]
+fn call_count_response_advertises_the_configured_lines_and_standard_defaults() {
+    assert_eq!(
+        call_count_response(&definition()).unwrap(),
+        ServerMessage::CallCountResponse(CallCountResponse {
+            total_configured_lines: 1,
+            starting_line_instance: 1,
+            line_data: vec![CallCountLineData {
+                max_calls: DEFAULT_MAX_CALLS_PER_LINE,
+                busy_trigger: DEFAULT_BUSY_TRIGGER_PER_LINE,
+            }],
+        })
+    );
+}
+
+#[test]
 fn every_call_state_and_soft_key_has_an_explicit_availability_result() {
     let expected_modes = [
         (CallState::OffHook, KeyMode::OffHook),

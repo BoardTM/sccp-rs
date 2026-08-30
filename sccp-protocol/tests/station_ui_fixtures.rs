@@ -1,10 +1,11 @@
 use sccp_protocol::message::values::{PhoneFeatures, StationSessionContext};
 use sccp_protocol::{
-    BusyLampFieldState, ButtonTemplateEntry, ButtonType, CallDirection, CallHistoryDisposition,
-    CallInfo, CallState, ClientMessage, Digit, Frame, FrameDecoder, KeyMode, LampMode,
-    MediaPathEvent, MediaPathId, MessageId, MicrophoneMode, NotificationPriority, ProtocolVersion,
-    RingDuration, RingerMode, ServerMessage, SoftKey, SoftKeyProfile, SpeakerMode, Stimulus,
-    SubscriptionCause, SubscriptionRequest, Tone, ToneDirection,
+    BusyLampFieldState, ButtonTemplateEntry, ButtonType, CallCountLineData,
+    CallCountRequestPayload, CallCountResponse, CallDirection, CallHistoryDisposition, CallInfo,
+    CallState, ClientMessage, Digit, Frame, FrameDecoder, KeyMode, LampMode, MediaPathEvent,
+    MediaPathId, MessageId, MicrophoneMode, NotificationPriority, ProtocolVersion, RingDuration,
+    RingerMode, ServerMessage, SoftKey, SoftKeyProfile, SpeakerMode, Stimulus, SubscriptionCause,
+    SubscriptionRequest, Tone, ToneDirection,
 };
 
 fn raw_frame(protocol: ProtocolVersion, message_id: u32, payload: &[u8]) -> Vec<u8> {
@@ -244,8 +245,8 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
             "call-count request",
             ProtocolVersion::V22,
             MessageId::CallCountRequest.wire_value(),
-            4,
-            ClientMessage::CallCountRequest { value: 3 },
+            0,
+            ClientMessage::CallCountRequest(CallCountRequestPayload::Empty),
         ),
         (
             "BLF subscription request",
@@ -845,8 +846,15 @@ fn station_ui_control_fixtures_cover_call_plane_display_and_device_layouts() {
             "call-count response",
             ProtocolVersion::V22,
             MessageId::CallCountResponse.wire_value(),
-            0,
-            ServerMessage::CallCountResponse,
+            180,
+            ServerMessage::CallCountResponse(CallCountResponse {
+                total_configured_lines: 1,
+                starting_line_instance: 1,
+                line_data: vec![CallCountLineData {
+                    max_calls: 4,
+                    busy_trigger: 2,
+                }],
+            }),
         ),
         (
             "recording status",

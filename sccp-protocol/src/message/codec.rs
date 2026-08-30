@@ -1190,7 +1190,9 @@ words!(WireStimulus {
     status
 });
 
-#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+const CAPABILITIES_RESPONSE_MAX_ENTRIES: usize = 18;
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[brw(little)]
 struct WireMediaCapability {
     codec: u32,
@@ -1202,8 +1204,23 @@ struct WireMediaCapability {
 #[brw(little)]
 struct WireCapabilitiesResponse {
     count: u32,
-    #[br(count = count)]
-    capabilities: Vec<WireMediaCapability>,
+    capabilities: [WireMediaCapability; CAPABILITIES_RESPONSE_MAX_ENTRIES],
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[brw(little)]
+struct WireCallCountLineData {
+    max_calls: u16,
+    busy_trigger: u16,
+}
+
+#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireCallCountResponse {
+    total_configured_lines: u32,
+    starting_line_instance: u32,
+    line_data_entries: u32,
+    line_data: [WireCallCountLineData; CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES],
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
@@ -1953,18 +1970,19 @@ impl ClientMessage {
                     "audio capabilities",
                     decode_prefix::<WireOneWord>(frame.message_id, p)?.value,
                 )?;
-                if count > 18 {
+                if count > CAPABILITIES_RESPONSE_MAX_ENTRIES {
                     return Err(CodecError::CountTooLarge {
                         message_id: frame.message_id,
                         field: "audio capabilities",
                         count,
-                        maximum: 18,
+                        maximum: CAPABILITIES_RESPONSE_MAX_ENTRIES,
                     });
                 }
                 let value: WireCapabilitiesResponse = decode(frame.message_id, p)?;
                 let caps = value
                     .capabilities
                     .into_iter()
+                    .take(count)
                     .map(|capability| MediaCapability {
                         codec: Codec::from(capability.codec),
                         max_frames_per_packet: capability.max_frames_per_packet,
@@ -2268,8 +2286,31 @@ impl ClientMessage {
                 XmlAlarmMessage::from_wire_payload(p.to_vec()).map(Self::XmlAlarm)
             }
             wire_id::CALL_COUNT_REQ => {
-                let value: WireOneWord = decode(frame.message_id, p)?;
-                Ok(Self::CallCountRequest { value: value.value })
+                let payload = match p.len() {
+                    0 => CallCountRequestPayload::Empty,
+                    4 => CallCountRequestPayload::LegacyWord(
+                        decode::<WireOneWord>(frame.message_id, p)?.value,
+                    ),
+                    CALL_COUNT_REQUEST_EXTENDED_BYTES => {
+                        let extended =
+                            p.as_slice()
+                                .try_into()
+                                .map_err(|_| CodecError::InvalidValue {
+                                    message_id: frame.message_id,
+                                    field: "call-count request payload length",
+                                    value: p.len() as u64,
+                                })?;
+                        CallCountRequestPayload::Extended(extended)
+                    }
+                    _ => {
+                        return Err(CodecError::InvalidValue {
+                            message_id: frame.message_id,
+                            field: "call-count request payload length",
+                            value: p.len() as u64,
+                        });
+                    }
+                };
+                Ok(Self::CallCountRequest(payload))
             }
             wire_id::CREATE_CONFERENCE_RES => {
                 validate_conference_data_length(p, frame.message_id, 12, 8)?;
@@ -2664,13 +2705,22 @@ impl ClientMessage {
             Self::ButtonTemplateRequest => wire_id::BUTTON_TEMPLATE_REQ,
             Self::VersionRequest => wire_id::VERSION_REQ,
             Self::CapabilitiesResponse(capabilities) => {
-                if capabilities.len() > 18 {
+                if capabilities.len() > CAPABILITIES_RESPONSE_MAX_ENTRIES {
                     return Err(CodecError::CountTooLarge {
                         message_id: wire_id::CAPABILITIES_RES,
                         field: "audio capabilities",
                         count: capabilities.len(),
-                        maximum: 18,
+                        maximum: CAPABILITIES_RESPONSE_MAX_ENTRIES,
                     });
+                }
+                let mut wire_capabilities =
+                    [WireMediaCapability::default(); CAPABILITIES_RESPONSE_MAX_ENTRIES];
+                for (slot, capability) in wire_capabilities.iter_mut().zip(capabilities) {
+                    *slot = WireMediaCapability {
+                        codec: capability.codec.wire_value(),
+                        max_frames_per_packet: capability.max_frames_per_packet,
+                        codec_parameters: capability.codec_parameters,
+                    };
                 }
                 payload = encode(
                     wire_id::CAPABILITIES_RES,
@@ -2680,14 +2730,7 @@ impl ClientMessage {
                             "audio capabilities",
                             capabilities.len(),
                         )?,
-                        capabilities: capabilities
-                            .iter()
-                            .map(|capability| WireMediaCapability {
-                                codec: capability.codec.wire_value(),
-                                max_frames_per_packet: capability.max_frames_per_packet,
-                                codec_parameters: capability.codec_parameters,
-                            })
-                            .collect(),
+                        capabilities: wire_capabilities,
                     },
                 )?;
                 wire_id::CAPABILITIES_RES
@@ -3050,8 +3093,16 @@ impl ClientMessage {
                 payload = message.wire_payload().to_vec();
                 wire_id::XML_ALARM
             }
-            Self::CallCountRequest { value } => {
-                payload = encode(wire_id::CALL_COUNT_REQ, &WireOneWord { value: *value })?;
+            Self::CallCountRequest(request) => {
+                match request {
+                    CallCountRequestPayload::Empty => {}
+                    CallCountRequestPayload::LegacyWord(value) => {
+                        payload = encode(wire_id::CALL_COUNT_REQ, &WireOneWord { value: *value })?;
+                    }
+                    CallCountRequestPayload::Extended(extended) => {
+                        payload.extend_from_slice(extended);
+                    }
+                }
                 wire_id::CALL_COUNT_REQ
             }
             Self::CreateConferenceResponse(response) => {
@@ -4144,7 +4195,35 @@ impl ServerMessage {
                     call_reference: value.call_reference,
                 })
             }
-            wire_id::CALL_COUNT_RES => Ok(Self::CallCountResponse),
+            wire_id::CALL_COUNT_RES => {
+                let value: WireCallCountResponse = decode(frame.message_id, p)?;
+                let line_data_entries = usize_from_wire(
+                    frame.message_id,
+                    "call-count line data",
+                    value.line_data_entries,
+                )?;
+                if line_data_entries > CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: frame.message_id,
+                        field: "call-count line data",
+                        count: line_data_entries,
+                        maximum: CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES,
+                    });
+                }
+                Ok(Self::CallCountResponse(CallCountResponse {
+                    total_configured_lines: value.total_configured_lines,
+                    starting_line_instance: value.starting_line_instance,
+                    line_data: value
+                        .line_data
+                        .into_iter()
+                        .take(line_data_entries)
+                        .map(|entry| CallCountLineData {
+                            max_calls: entry.max_calls,
+                            busy_trigger: entry.busy_trigger,
+                        })
+                        .collect(),
+                }))
+            }
             wire_id::RECORDING_STATUS => {
                 let value: WireRecordingStatus = decode(frame.message_id, p)?;
                 Ok(Self::RecordingStatus {
@@ -5753,7 +5832,38 @@ impl ServerMessage {
                 )?;
                 wire_id::CALL_HISTORY_DISPOSITION
             }
-            Self::CallCountResponse => wire_id::CALL_COUNT_RES,
+            Self::CallCountResponse(response) => {
+                if response.line_data.len() > CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES {
+                    return Err(CodecError::CountTooLarge {
+                        message_id: wire_id::CALL_COUNT_RES,
+                        field: "call-count line data",
+                        count: response.line_data.len(),
+                        maximum: CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES,
+                    });
+                }
+                let mut line_data =
+                    [WireCallCountLineData::default(); CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES];
+                for (wire, entry) in line_data.iter_mut().zip(&response.line_data) {
+                    *wire = WireCallCountLineData {
+                        max_calls: entry.max_calls,
+                        busy_trigger: entry.busy_trigger,
+                    };
+                }
+                p = encode(
+                    wire_id::CALL_COUNT_RES,
+                    &WireCallCountResponse {
+                        total_configured_lines: response.total_configured_lines,
+                        starting_line_instance: response.starting_line_instance,
+                        line_data_entries: wire_count(
+                            wire_id::CALL_COUNT_RES,
+                            "call-count line data",
+                            response.line_data.len(),
+                        )?,
+                        line_data,
+                    },
+                )?;
+                wire_id::CALL_COUNT_RES
+            }
             Self::RecordingStatus {
                 call_reference,
                 active,
@@ -7475,6 +7585,99 @@ mod tests {
             let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
             assert_eq!(ClientMessage::decode(frame).unwrap(), message);
         }
+    }
+
+    #[test]
+    fn capabilities_response_consumes_all_eighteen_fixed_slots() {
+        let capabilities = (0_u32..12)
+            .map(|index| MediaCapability {
+                codec: if index.is_multiple_of(2) {
+                    Codec::Pcmu
+                } else {
+                    Codec::Pcma
+                },
+                max_frames_per_packet: index + 1,
+                codec_parameters: [index as u8; 8],
+            })
+            .collect::<Vec<_>>();
+        let message = ClientMessage::CapabilitiesResponse(capabilities);
+
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+
+        assert_eq!(frame.payload.len(), 4 + 18 * 16);
+        assert_eq!(ClientMessage::decode(frame).unwrap(), message);
+    }
+
+    #[test]
+    fn call_count_request_preserves_known_length_selected_dialects() {
+        for (message, expected_payload_len) in [
+            (
+                ClientMessage::CallCountRequest(CallCountRequestPayload::Empty),
+                0,
+            ),
+            (
+                ClientMessage::CallCountRequest(CallCountRequestPayload::LegacyWord(0x1234_5678)),
+                4,
+            ),
+            (
+                ClientMessage::CallCountRequest(CallCountRequestPayload::Extended(
+                    [0xa5; CALL_COUNT_REQUEST_EXTENDED_BYTES],
+                )),
+                CALL_COUNT_REQUEST_EXTENDED_BYTES,
+            ),
+        ] {
+            let bytes = message.encode(ProtocolVersion::V22).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+
+            assert_eq!(frame.payload.len(), expected_payload_len);
+            assert_eq!(ClientMessage::decode(frame).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn call_count_request_rejects_unknown_payload_length() {
+        let frame = Frame {
+            protocol_version: ProtocolVersion::V22.wire(),
+            message_id: wire_id::CALL_COUNT_REQ,
+            payload: vec![0; 8],
+        };
+
+        assert!(matches!(
+            ClientMessage::decode(frame),
+            Err(CodecError::InvalidValue {
+                field: "call-count request payload length",
+                value: 8,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn call_count_response_zero_pads_all_forty_two_line_slots() {
+        let message = ServerMessage::CallCountResponse(CallCountResponse {
+            total_configured_lines: 2,
+            starting_line_instance: 1,
+            line_data: vec![
+                CallCountLineData {
+                    max_calls: 4,
+                    busy_trigger: 2,
+                },
+                CallCountLineData {
+                    max_calls: 2,
+                    busy_trigger: 1,
+                },
+            ],
+        });
+
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+
+        assert_eq!(frame.payload.len(), 12 + 42 * 4);
+        assert_eq!(
+            ServerMessage::decode(frame, ProtocolVersion::V22).unwrap(),
+            message
+        );
     }
 
     #[test]

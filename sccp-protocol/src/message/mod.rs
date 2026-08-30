@@ -221,6 +221,38 @@ pub struct MediaCapability {
     pub codec_parameters: [u8; 8],
 }
 
+/// Width of the extended opaque call-count request body.
+pub const CALL_COUNT_REQUEST_EXTENDED_BYTES: usize = 152;
+/// Number of line records reserved by the fixed call-count response body.
+pub const CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES: usize = 42;
+
+/// Known wire dialects of the otherwise fieldless call-count request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CallCountRequestPayload {
+    /// Fieldless request emitted by Cisco 8945 firmware.
+    Empty,
+    /// One unknown word declared by legacy chan-sccp sources.
+    LegacyWord(u32),
+    /// Extended opaque request body used by one protocol dialect.
+    Extended([u8; CALL_COUNT_REQUEST_EXTENDED_BYTES]),
+}
+
+/// Per-line capacity advertised in a call-count response.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CallCountLineData {
+    pub max_calls: u16,
+    pub busy_trigger: u16,
+}
+
+/// Fixed-array response describing the configured capacity of station lines.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallCountResponse {
+    pub total_configured_lines: u32,
+    pub starting_line_instance: u32,
+    /// Active records; the wire body reserves 42 entries and zero-fills the rest.
+    pub line_data: Vec<CallCountLineData>,
+}
+
 pub const MEDIA_PORT_LIST_MAX_PORTS: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1834,11 +1866,7 @@ pub enum ClientMessage {
     /// Carries the alarm payload and its associated station metadata.
     XmlAlarm(XmlAlarmMessage),
     /// Requests the server's current call-count information.
-    /// Preserves the request word used by the station wire layout.
-    CallCountRequest {
-        /// Request word retained without assigning a narrower semantic meaning.
-        value: u32,
-    },
+    CallCountRequest(CallCountRequestPayload),
     /// Returns the result of creating a conference.
     /// Correlates the station outcome with the requested conference.
     CreateConferenceResponse(CreateConferenceResponse),
@@ -2354,9 +2382,8 @@ pub enum ServerMessage {
         line_instance: u32,
         call_reference: u32,
     },
-    /// Returns the server's current call-count response.
-    /// Answers the corresponding station call-count request.
-    CallCountResponse,
+    /// Returns the server's current per-line call capacity.
+    CallCountResponse(CallCountResponse),
     /// Updates the station's recording indicator for a call.
     /// Carries the call reference and whether recording is active.
     RecordingStatus {
@@ -3189,7 +3216,7 @@ mod tests {
             ProtocolVersion::V22,
         );
         assert_client_round_trip(
-            ClientMessage::CallCountRequest { value: 2 },
+            ClientMessage::CallCountRequest(CallCountRequestPayload::LegacyWord(2)),
             ProtocolVersion::V22,
         );
         assert_control_round_trip(
@@ -3375,7 +3402,23 @@ mod tests {
             },
             ProtocolVersion::V22,
         );
-        assert_server_round_trip(ServerMessage::CallCountResponse, ProtocolVersion::V22);
+        assert_server_round_trip(
+            ServerMessage::CallCountResponse(CallCountResponse {
+                total_configured_lines: 2,
+                starting_line_instance: 1,
+                line_data: vec![
+                    CallCountLineData {
+                        max_calls: 4,
+                        busy_trigger: 2,
+                    },
+                    CallCountLineData {
+                        max_calls: 2,
+                        busy_trigger: 1,
+                    },
+                ],
+            }),
+            ProtocolVersion::V22,
+        );
         for message in [
             ServerMessage::SubscribeDtmfPayloadRequest(DtmfPayloadRequest {
                 payload_type: 101,

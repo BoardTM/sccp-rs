@@ -101,8 +101,10 @@ pub use message::wire::{CodecError, Frame, FrameDecoder, MAX_FRAME_SIZE};
 pub use message::{
     AddParticipantRequest, AddParticipantResponse, AnnouncementEntry, AudioStreamControl,
     AuditConferenceEntry, AuditConferenceResponse, AuditParticipantResponse, BoundedBytes,
-    BoundedBytesError, ButtonTemplateEntry, CONNECTION_QUALITY_MAX_BYTES, ChangeParticipantRequest,
-    ClientMessage, ConferenceParticipant, ConferenceParticipantChange, ConfigurationStatus,
+    BoundedBytesError, ButtonTemplateEntry, CALL_COUNT_REQUEST_EXTENDED_BYTES,
+    CALL_COUNT_RESPONSE_MAX_LINE_ENTRIES, CONNECTION_QUALITY_MAX_BYTES, CallCountLineData,
+    CallCountRequestPayload, CallCountResponse, ChangeParticipantRequest, ClientMessage,
+    ConferenceParticipant, ConferenceParticipantChange, ConfigurationStatus,
     ConnectionQualityStatistics, ConnectionStatistics, ControlMessage, CreateConferenceRequest,
     CreateConferenceResponse, DtmfPayloadIdentity, DtmfPayloadRequest, DtmfToneControl,
     ExtensionDeviceCapabilities, KnownOpaqueMessage, MAX_MULTIMEDIA_PICTURE_FORMATS,
