@@ -2719,7 +2719,7 @@ async fn ipv6_signaling_requires_extended_layouts_and_preserves_station_addresse
         reported_address: None,
         reported_ipv6_address: Some(reported_ipv6),
         device_type: DeviceType::Cisco7962,
-        advertised_protocol: protocol.wire(),
+        advertised_protocol: Some(protocol.wire()),
         features: PhoneFeatures::empty(),
         firmware: "test-load".into(),
         configuration_version_stamp: crate::message::BoundedBytes::default(),

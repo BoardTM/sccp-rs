@@ -350,7 +350,7 @@ macro_rules! message_catalog {
 }
 message_catalog! {
     (KeepAlive => KEEP_ALIVE, 0x0000, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Empty, fixed_payload_bytes: Some(0), payload_size_bounds: Some(PayloadSizeBounds { minimum: 0, maximum: MAX_FRAME_SIZE - HEADER_SIZE }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("nominally empty request; bounded extension bytes are accepted but not modeled"), response: ResponseExpectation::Message(MessageId::KeepAliveAck), verification: ContractVerification::StructuralAndValidated }),
-    (Register => REGISTER, 0x0001, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::MinimumLengthPreserved, fixed_payload_bytes: None, payload_size_bounds: Some(PayloadSizeBounds { minimum: 124, maximum: 172 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::Message(MessageId::RegisterAck), verification: ContractVerification::StructuralAndValidated }),
+    (Register => REGISTER, 0x0001, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: Some(PayloadSizeBounds { minimum: 32, maximum: 172 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("device and firmware text are normalized while the exact length-selected layout is retained"), response: ResponseExpectation::Message(MessageId::RegisterAck), verification: ContractVerification::StructuralAndValidated }),
     (IpPort => IP_PORT, 0x0002, StationToControl, ContractMetadata { scope: ContractScope::Supplemental, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (KeypadButton => KEYPAD_BUTTON, 0x0003, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (EnblocCall => ENBLOC_CALL, 0x0004, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
@@ -603,7 +603,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "2325be04de50f9474c76fb84d589e0c0aca9d8e2e8bf268ccfc5a5b9f8f28c90"
+            "c90f9e1a9d000e75b5db873d5ea9b86e29d1f9c78c43be52f200a77f38a60cb6"
         );
     }
 
@@ -680,7 +680,6 @@ mod tests {
             MessageId::StartMediaTransmissionAck,
             MessageId::KeypadButton,
             MessageId::EnblocCall,
-            MessageId::Register,
             MessageId::Alarm,
             MessageId::DefineTimeDate,
         ] {
@@ -717,6 +716,7 @@ mod tests {
             MessageId::CapabilitiesResponse,
             MessageId::MediaTransmissionFailure,
             MessageId::PortResponse,
+            MessageId::Register,
         ] {
             assert!(matches!(
                 id.contract().unwrap().field_fidelity,

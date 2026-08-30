@@ -177,9 +177,8 @@ pub struct RegistrationMessage {
     pub reported_ipv6_address: Option<Ipv6Addr>,
     pub device_type: DeviceType,
     /// Raw protocol version advertised inside the registration body.
-    ///
     /// Session code must validate/negotiate this through [`ProtocolVersion`].
-    pub advertised_protocol: u32,
+    pub advertised_protocol: Option<u32>,
     /// Feature bits packed alongside the advertised body version.
     pub features: PhoneFeatures,
     pub firmware: String,
@@ -197,6 +196,7 @@ pub struct RegistrationMessage {
 /// decode/encode cycle from erasing capacity, scope, or station identity data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegistrationWireDetails {
+    pub layout: RegistrationWireLayout,
     pub station_user_id: u32,
     pub station_instance: u32,
     pub max_streams: u32,
@@ -210,6 +210,20 @@ pub struct RegistrationWireDetails {
     pub max_lines: u32,
     /// Address-scope word associated with the reported IPv6 address.
     pub ipv6_address_scope: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistrationWireLayout {
+    Alternate32,
+    Canonical {
+        prefix_bytes: u8,
+    },
+}
+
+impl Default for RegistrationWireLayout {
+    fn default() -> Self {
+        Self::Canonical { prefix_bytes: 124 }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

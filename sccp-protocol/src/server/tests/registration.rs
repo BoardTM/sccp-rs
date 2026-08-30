@@ -35,6 +35,56 @@ fn session_generations_are_nonzero_monotonic_and_fail_closed_at_exhaustion() {
 }
 
 #[tokio::test]
+async fn short_registration_prefixes_negotiate_from_field_presence() {
+    for (payload_bytes, advertised_protocol, expected_protocol) in [
+        (36, None, ProtocolVersion::V3),
+        (44, Some(0), ProtocolVersion::V3),
+        (
+            64,
+            Some(ProtocolVersion::V11.wire()),
+            ProtocolVersion::V11,
+        ),
+    ] {
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            advertised_address: Ipv4Addr::LOCALHOST,
+            ..ServerConfig::default()
+        };
+        let (server, handle, mut events) = Server::bind(config, [definition()]).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(server.run());
+        let mut phone = TcpStream::connect(address).await.unwrap();
+        let mut decoder = FrameDecoder::new();
+
+        let mut payload = vec![0_u8; payload_bytes];
+        let device_id = b"SEP001122334455";
+        payload[..device_id.len()].copy_from_slice(device_id);
+        payload[24..28].copy_from_slice(&Ipv4Addr::LOCALHOST.octets());
+        payload[28..32].copy_from_slice(&DeviceType::Cisco7925.wire_value().to_le_bytes());
+        payload[32..36].copy_from_slice(&5_u32.to_le_bytes());
+        if let Some(protocol) = advertised_protocol {
+            payload[40..44].copy_from_slice(&protocol.to_le_bytes());
+        }
+        phone
+            .write_all(&Frame::new(0, wire_id::REGISTER, payload).encode().unwrap())
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::Registered(DeviceRegistration { protocol, .. }),
+                ..
+            })) if protocol == expected_protocol
+        ));
+
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn registered_phone_receives_its_mixed_button_template() {
     let mut device = mixed_definition();
     device

@@ -1149,6 +1149,150 @@ struct WireRegister {
     firmware: WireFixedText<32>,
 }
 
+const REGISTER_ALTERNATE_BYTES: usize = 32;
+const REGISTER_CANONICAL_BYTES: usize = 124;
+const REGISTER_MAXIMUM_BYTES: usize = 172;
+
+const fn valid_registration_canonical_prefix(bytes: usize) -> bool {
+    matches!(bytes, 36 | 40 | 44 | 48 | 52 | 64 | 68 | 72 | 88 | 92 | 124)
+}
+
+fn registration_layout(
+    message_id: u32,
+    payload_bytes: usize,
+) -> Result<RegistrationWireLayout, CodecError> {
+    if payload_bytes < REGISTER_ALTERNATE_BYTES {
+        return Err(CodecError::Truncated {
+            message_id,
+            needed: REGISTER_ALTERNATE_BYTES,
+            actual: payload_bytes,
+        });
+    }
+    if payload_bytes > REGISTER_MAXIMUM_BYTES {
+        return Err(CodecError::TrailingBytes {
+            message_id,
+            count: payload_bytes - REGISTER_MAXIMUM_BYTES,
+        });
+    }
+    if payload_bytes == REGISTER_ALTERNATE_BYTES {
+        return Ok(RegistrationWireLayout::Alternate32);
+    }
+
+    let prefix_bytes = payload_bytes.min(REGISTER_CANONICAL_BYTES);
+    if !valid_registration_canonical_prefix(prefix_bytes) {
+        return Err(CodecError::InvalidValue {
+            message_id,
+            field: "registration payload length",
+            value: payload_bytes as u64,
+        });
+    }
+    Ok(RegistrationWireLayout::Canonical {
+        prefix_bytes: u8::try_from(prefix_bytes)
+            .expect("registration prefix is bounded to 124 bytes"),
+    })
+}
+
+fn registration_prefix_bytes(layout: RegistrationWireLayout) -> Result<usize, CodecError> {
+    match layout {
+        RegistrationWireLayout::Alternate32 => Ok(REGISTER_ALTERNATE_BYTES),
+        RegistrationWireLayout::Canonical { prefix_bytes } => {
+            let prefix_bytes = usize::from(prefix_bytes);
+            if valid_registration_canonical_prefix(prefix_bytes) {
+                Ok(prefix_bytes)
+            } else {
+                Err(CodecError::InvalidValue {
+                    message_id: wire_id::REGISTER,
+                    field: "canonical registration prefix length",
+                    value: prefix_bytes as u64,
+                })
+            }
+        }
+    }
+}
+
+fn validate_registration_fields(
+    registration: &RegistrationMessage,
+    wire: RegistrationWireDetails,
+    prefix_bytes: usize,
+) -> Result<(), CodecError> {
+    let alternate = wire.layout == RegistrationWireLayout::Alternate32;
+    let canonical_prefix = (!alternate).then_some(prefix_bytes);
+    let omits = |field_end| canonical_prefix.is_none_or(|bytes| bytes < field_end);
+    let incompatible_field = [
+        (
+            alternate && registration.reported_address.is_some(),
+            "reported IPv4 address",
+        ),
+        (alternate && !registration.features.is_empty(), "features"),
+        (omits(36) && wire.max_streams != 0, "maximum streams"),
+        (omits(40) && wire.active_streams != 0, "active streams"),
+        (
+            omits(48) && wire.max_conferences != 0,
+            "maximum conferences",
+        ),
+        (
+            omits(52) && wire.active_conferences != 0,
+            "active conferences",
+        ),
+        (
+            omits(64)
+                && wire
+                    .mac_address_and_padding
+                    .iter()
+                    .any(|byte| *byte != 0),
+            "MAC address and padding",
+        ),
+        (
+            omits(68) && wire.ipv4_address_scope != 0,
+            "IPv4 address scope",
+        ),
+        (omits(72) && wire.max_lines != 0, "maximum lines"),
+        (
+            omits(88) && registration.reported_ipv6_address.is_some(),
+            "reported IPv6 address",
+        ),
+        (
+            omits(92) && wire.ipv6_address_scope != 0,
+            "IPv6 address scope",
+        ),
+        (
+            omits(124) && !registration.firmware.is_empty(),
+            "firmware",
+        ),
+        (
+            omits(124) && !registration.configuration_version_stamp.is_empty(),
+            "configuration version stamp",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(incompatible, field)| incompatible.then_some(field));
+    if let Some(field) = incompatible_field {
+        return Err(CodecError::InvalidValue {
+            message_id: wire_id::REGISTER,
+            field,
+            value: prefix_bytes as u64,
+        });
+    }
+    if !alternate
+        && prefix_bytes < 44
+        && (registration.advertised_protocol.is_some() || !registration.features.is_empty())
+    {
+        return Err(CodecError::InvalidValue {
+            message_id: wire_id::REGISTER,
+            field: "protocol fields require a 44-byte registration prefix",
+            value: prefix_bytes as u64,
+        });
+    }
+    if !alternate && prefix_bytes >= 52 && registration.advertised_protocol.is_none() {
+        return Err(CodecError::InvalidValue {
+            message_id: wire_id::REGISTER,
+            field: "registration protocol is absent from a layout that carries it",
+            value: prefix_bytes as u64,
+        });
+    }
+    Ok(())
+}
+
 words!(WireKeypadButtonLegacy { button });
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
@@ -1817,48 +1961,63 @@ impl ClientMessage {
         match frame.message_id {
             wire_id::KEEP_ALIVE => Ok(Self::KeepAlive),
             wire_id::REGISTER => {
-                const REQUIRED_BYTES: usize = 124;
-                const MAXIMUM_BYTES: usize = REQUIRED_BYTES + 48;
-                if p.len() < REQUIRED_BYTES {
-                    return Err(CodecError::Truncated {
+                let layout = registration_layout(frame.message_id, p.len())?;
+                let prefix_bytes = registration_prefix_bytes(layout)?;
+                let mut canonical = [0; REGISTER_CANONICAL_BYTES];
+                canonical[..prefix_bytes].copy_from_slice(&p[..prefix_bytes]);
+                let value: WireRegister = decode(frame.message_id, &canonical)?;
+                let alternate = layout == RegistrationWireLayout::Alternate32;
+                if alternate && value.reported_address[1..].iter().any(|byte| *byte != 0) {
+                    return Err(CodecError::NonZeroPadding {
                         message_id: frame.message_id,
-                        needed: REQUIRED_BYTES,
-                        actual: p.len(),
+                        field: "alternate registration protocol",
                     });
                 }
-                if p.len() > MAXIMUM_BYTES {
-                    return Err(CodecError::TrailingBytes {
-                        message_id: frame.message_id,
-                        count: p.len() - MAXIMUM_BYTES,
-                    });
-                }
-                let value: WireRegister = decode(frame.message_id, &p[..REQUIRED_BYTES])?;
-                let reported_address = if value.reported_address.iter().any(|byte| *byte != 0) {
-                    Some(Ipv4Addr::from(value.reported_address))
+                let reported_address = (!alternate)
+                    .then(|| Ipv4Addr::from(value.reported_address))
+                    .filter(|address| !address.is_unspecified());
+                let reported_ipv6_address =
+                    if !alternate
+                        && prefix_bytes >= 88
+                        && value.ipv6_address.iter().any(|byte| *byte != 0)
+                    {
+                        Some(Ipv6Addr::from(value.ipv6_address))
+                    } else {
+                        None
+                    };
+                let advertised_protocol = if alternate {
+                    Some(u32::from(value.reported_address[0])).filter(|version| *version != 0)
+                } else if prefix_bytes >= 44 {
+                    Some(u32::from(value.protocol_features[0])).filter(|version| {
+                        *version != 0 || !matches!(prefix_bytes, 44 | 48)
+                    })
                 } else {
                     None
                 };
-                let reported_ipv6_address = if value.ipv6_address.iter().any(|byte| *byte != 0) {
-                    Some(Ipv6Addr::from(value.ipv6_address))
-                } else {
-                    None
-                };
-                let advertised_protocol = u32::from(value.protocol_features[0]);
                 Ok(Self::Register(RegistrationMessage {
                     device_id: DeviceId::new(value.device_id.text()?)?,
                     reported_address,
                     reported_ipv6_address,
                     device_type: DeviceType::from(value.device_type),
                     advertised_protocol,
-                    features: PhoneFeatures::from_bits_retain(
-                        u32::from_le_bytes(value.protocol_features) & !0xff,
-                    ),
-                    firmware: value.firmware.text()?,
+                    features: if !alternate && prefix_bytes >= 44 {
+                        PhoneFeatures::from_bits_retain(
+                            u32::from_le_bytes(value.protocol_features) & !0xff,
+                        )
+                    } else {
+                        PhoneFeatures::empty()
+                    },
+                    firmware: if !alternate && prefix_bytes >= REGISTER_CANONICAL_BYTES {
+                        value.firmware.text()?
+                    } else {
+                        String::new()
+                    },
                     configuration_version_stamp: BoundedBytes::try_from(
-                        p[REQUIRED_BYTES..].to_vec(),
+                        p[REGISTER_CANONICAL_BYTES.min(p.len())..].to_vec(),
                     )
                     .expect("registration suffix length was bounded before allocation"),
                     wire: Some(RegistrationWireDetails {
+                        layout,
                         station_user_id: value.station_user_id,
                         station_instance: value.station_instance,
                         max_streams: value.max_streams,
@@ -2483,6 +2642,7 @@ impl ClientMessage {
                 header_protocol = 0;
                 let feature_bytes = registration.features.bits().to_le_bytes();
                 let wire = registration.wire.unwrap_or(RegistrationWireDetails {
+                    layout: RegistrationWireLayout::default(),
                     station_user_id: 0,
                     station_instance: 1,
                     max_streams: 0,
@@ -2494,29 +2654,49 @@ impl ClientMessage {
                     max_lines: 0,
                     ipv6_address_scope: 0,
                 });
+                let prefix_bytes = registration_prefix_bytes(wire.layout)?;
+                validate_registration_fields(registration, wire, prefix_bytes)?;
+                let alternate = wire.layout == RegistrationWireLayout::Alternate32;
+                let device_id = WireFixedText::new(
+                    wire_id::REGISTER,
+                    "device ID",
+                    registration.device_id.as_str(),
+                )?;
+                let advertised_protocol = registration.advertised_protocol.unwrap_or(0);
+                let protocol_features = if alternate {
+                    [0; 4]
+                } else {
+                    [
+                        advertised_protocol.min(u32::from(u8::MAX)) as u8,
+                        feature_bytes[1],
+                        feature_bytes[2],
+                        feature_bytes[3],
+                    ]
+                };
+                let reported_address = if alternate {
+                    [
+                        advertised_protocol.min(u32::from(u8::MAX)) as u8,
+                        0,
+                        0,
+                        0,
+                    ]
+                } else {
+                    registration
+                        .reported_address
+                        .unwrap_or(Ipv4Addr::UNSPECIFIED)
+                        .octets()
+                };
                 payload = encode(
                     wire_id::REGISTER,
                     &WireRegister {
-                        device_id: WireFixedText::new(
-                            wire_id::REGISTER,
-                            "device ID",
-                            registration.device_id.as_str(),
-                        )?,
+                        device_id,
                         station_user_id: wire.station_user_id,
                         station_instance: wire.station_instance,
-                        reported_address: registration
-                            .reported_address
-                            .unwrap_or(Ipv4Addr::UNSPECIFIED)
-                            .octets(),
+                        reported_address,
                         device_type: registration.device_type.wire_value(),
                         max_streams: wire.max_streams,
                         active_streams: wire.active_streams,
-                        protocol_features: [
-                            registration.advertised_protocol.min(u32::from(u8::MAX)) as u8,
-                            feature_bytes[1],
-                            feature_bytes[2],
-                            feature_bytes[3],
-                        ],
+                        protocol_features,
                         max_conferences: wire.max_conferences,
                         active_conferences: wire.active_conferences,
                         mac_address: wire.mac_address_and_padding,
@@ -2534,7 +2714,10 @@ impl ClientMessage {
                         )?,
                     },
                 )?;
-                payload.extend_from_slice(registration.configuration_version_stamp.as_bytes());
+                payload.truncate(prefix_bytes);
+                if !alternate {
+                    payload.extend_from_slice(registration.configuration_version_stamp.as_bytes());
+                }
                 wire_id::REGISTER
             }
             Self::IpPort { rtp_port } => {
@@ -7490,11 +7673,12 @@ mod tests {
             reported_address: Some(Ipv4Addr::new(192, 0, 2, 10)),
             reported_ipv6_address: Some("2001:db8::10".parse().unwrap()),
             device_type: DeviceType::Cisco7962,
-            advertised_protocol: ProtocolVersion::V22.wire(),
+            advertised_protocol: Some(ProtocolVersion::V22.wire()),
             features: PhoneFeatures::empty(),
             firmware: "test-load".into(),
             configuration_version_stamp: BoundedBytes::default(),
             wire: Some(RegistrationWireDetails {
+                layout: RegistrationWireLayout::default(),
                 station_user_id: 17,
                 station_instance: 2,
                 max_streams: 5,
@@ -7516,17 +7700,182 @@ mod tests {
     }
 
     #[test]
+    fn registration_preserves_every_complete_canonical_prefix() {
+        let mut payload = [0_u8; REGISTER_CANONICAL_BYTES];
+        let device_id = b"SEP001122334455";
+        payload[..device_id.len()].copy_from_slice(device_id);
+        payload[16..20].copy_from_slice(&17_u32.to_le_bytes());
+        payload[20..24].copy_from_slice(&2_u32.to_le_bytes());
+        payload[24..28].copy_from_slice(&[192, 0, 2, 25]);
+        payload[28..32].copy_from_slice(&DeviceType::Cisco7925.wire_value().to_le_bytes());
+        payload[32..36].copy_from_slice(&5_u32.to_le_bytes());
+        payload[36..40].copy_from_slice(&1_u32.to_le_bytes());
+        payload[40..44].copy_from_slice(&ProtocolVersion::V11.wire().to_le_bytes());
+        payload[44..48].copy_from_slice(&3_u32.to_le_bytes());
+        payload[48..52].copy_from_slice(&1_u32.to_le_bytes());
+        payload[52..64]
+            .copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 1, 2, 3, 4, 5, 6]);
+        payload[64..68].copy_from_slice(&3_u32.to_le_bytes());
+        payload[68..72].copy_from_slice(&6_u32.to_le_bytes());
+        payload[72..88].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        payload[88..92].copy_from_slice(&2_u32.to_le_bytes());
+        payload[92..101].copy_from_slice(b"SCCP-test");
+
+        for prefix_bytes in [36, 40, 44, 48, 52, 64, 68, 72, 88, 92, 124] {
+            let expected_payload = payload[..prefix_bytes].to_vec();
+            let message = ClientMessage::decode_with_version(
+                Frame::new(0, wire_id::REGISTER, expected_payload.clone()),
+                ProtocolVersion::V22,
+            )
+            .unwrap();
+            let ClientMessage::Register(registration) = &message else {
+                unreachable!("registration frame decoded as another message")
+            };
+            assert_eq!(registration.device_type, DeviceType::Cisco7925);
+            assert_eq!(
+                registration.advertised_protocol,
+                (prefix_bytes >= 44).then_some(ProtocolVersion::V11.wire())
+            );
+            assert_eq!(
+                registration.reported_ipv6_address,
+                (prefix_bytes >= 88).then_some(Ipv6Addr::LOCALHOST)
+            );
+            assert_eq!(
+                registration.firmware,
+                if prefix_bytes == REGISTER_CANONICAL_BYTES {
+                    "SCCP-test"
+                } else {
+                    ""
+                }
+            );
+            assert!(matches!(
+                registration.wire,
+                Some(RegistrationWireDetails {
+                    layout: RegistrationWireLayout::Canonical {
+                        prefix_bytes: actual
+                    },
+                    ..
+                }) if usize::from(actual) == prefix_bytes
+            ));
+
+            let encoded = message.encode(ProtocolVersion::V22).unwrap();
+            let encoded_frame = FrameDecoder::new().push(&encoded).unwrap().remove(0);
+            assert_eq!(encoded_frame.payload, expected_payload);
+        }
+    }
+
+    #[test]
+    fn registration_preserves_alternate_32_byte_layout() {
+        let message = ClientMessage::Register(RegistrationMessage {
+            device_id: DeviceId::new("SEP001122334455").unwrap(),
+            reported_address: None,
+            reported_ipv6_address: None,
+            device_type: DeviceType::Cisco7920,
+            advertised_protocol: Some(ProtocolVersion::V3.wire()),
+            features: PhoneFeatures::empty(),
+            firmware: String::new(),
+            configuration_version_stamp: BoundedBytes::default(),
+            wire: Some(RegistrationWireDetails {
+                layout: RegistrationWireLayout::Alternate32,
+                station_user_id: 17,
+                station_instance: 2,
+                max_streams: 0,
+                active_streams: 0,
+                mac_address_and_padding: [0; 12],
+                max_conferences: 0,
+                active_conferences: 0,
+                ipv4_address_scope: 0,
+                max_lines: 0,
+                ipv6_address_scope: 0,
+            }),
+        });
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+        assert_eq!(frame.payload.len(), REGISTER_ALTERNATE_BYTES);
+        assert_eq!(
+            ClientMessage::decode_with_version(frame, ProtocolVersion::V22).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn short_zero_protocol_registration_uses_legacy_fallback_and_round_trips() {
+        for payload_bytes in [32, 44, 48] {
+            let mut payload = vec![0_u8; payload_bytes];
+            let device_id = b"SEP001122334455";
+            payload[..device_id.len()].copy_from_slice(device_id);
+            payload[28..32]
+                .copy_from_slice(&DeviceType::Cisco7925.wire_value().to_le_bytes());
+
+            let message = ClientMessage::decode_with_version(
+                Frame::new(0, wire_id::REGISTER, payload.clone()),
+                ProtocolVersion::V22,
+            )
+            .unwrap();
+            let ClientMessage::Register(registration) = &message else {
+                unreachable!("registration frame decoded as another message")
+            };
+            assert_eq!(registration.advertised_protocol, None);
+
+            let encoded = message.encode(ProtocolVersion::V22).unwrap();
+            let encoded_frame = FrameDecoder::new().push(&encoded).unwrap().remove(0);
+            assert_eq!(encoded_frame.payload, payload);
+        }
+    }
+
+    #[test]
+    fn registration_encoder_rejects_values_omitted_by_selected_prefix() {
+        let mut message = ClientMessage::Register(RegistrationMessage {
+            device_id: DeviceId::new("SEP001122334455").unwrap(),
+            reported_address: Some(Ipv4Addr::LOCALHOST),
+            reported_ipv6_address: None,
+            device_type: DeviceType::Cisco7925,
+            advertised_protocol: None,
+            features: PhoneFeatures::empty(),
+            firmware: String::new(),
+            configuration_version_stamp: BoundedBytes::default(),
+            wire: Some(RegistrationWireDetails {
+                layout: RegistrationWireLayout::Canonical { prefix_bytes: 36 },
+                station_user_id: 0,
+                station_instance: 1,
+                max_streams: 5,
+                active_streams: 0,
+                mac_address_and_padding: [0; 12],
+                max_conferences: 0,
+                active_conferences: 0,
+                ipv4_address_scope: 0,
+                max_lines: 0,
+                ipv6_address_scope: 0,
+            }),
+        });
+        assert!(message.encode(ProtocolVersion::V22).is_ok());
+
+        let ClientMessage::Register(registration) = &mut message else {
+            unreachable!("test message is registration")
+        };
+        registration.wire.as_mut().unwrap().active_streams = 1;
+        assert!(matches!(
+            message.encode(ProtocolVersion::V22),
+            Err(CodecError::InvalidValue {
+                field: "active streams",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn registration_preserves_every_bounded_configuration_suffix() {
         let base = ClientMessage::Register(RegistrationMessage {
             device_id: DeviceId::new("SEP001122334455").unwrap(),
             reported_address: None,
             reported_ipv6_address: None,
             device_type: DeviceType::Cisco7962,
-            advertised_protocol: ProtocolVersion::V22.wire(),
+            advertised_protocol: Some(ProtocolVersion::V22.wire()),
             features: PhoneFeatures::empty(),
             firmware: "test-load".into(),
             configuration_version_stamp: BoundedBytes::default(),
             wire: Some(RegistrationWireDetails {
+                layout: RegistrationWireLayout::default(),
                 station_user_id: 0,
                 station_instance: 1,
                 max_streams: 0,
@@ -7555,13 +7904,28 @@ mod tests {
                 message
             );
         }
+    }
 
+    #[test]
+    fn registration_rejects_unsupported_payload_lengths() {
+        for invalid_length in [33, 35, 37, 56, 76, 96, 123] {
+            assert!(matches!(
+                ClientMessage::decode_with_version(
+                    Frame::new(0, wire_id::REGISTER, vec![0; invalid_length]),
+                    ProtocolVersion::V22,
+                ),
+                Err(CodecError::InvalidValue {
+                    field: "registration payload length",
+                    ..
+                })
+            ));
+        }
         assert!(matches!(
             ClientMessage::decode_with_version(
-                Frame::new(0, wire_id::REGISTER, vec![0; 123]),
+                Frame::new(0, wire_id::REGISTER, vec![0; 31]),
                 ProtocolVersion::V22,
             ),
-            Err(CodecError::Truncated { .. })
+            Err(CodecError::Truncated { needed: 32, .. })
         ));
         assert!(matches!(
             ClientMessage::decode_with_version(

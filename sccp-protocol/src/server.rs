@@ -3000,7 +3000,11 @@ async fn handle_registration(
         .await?;
         return Ok(None);
     }
-    let protocol = ProtocolVersion::negotiate(registration.advertised_protocol)?;
+    let protocol = registration
+        .advertised_protocol
+        .map(ProtocolVersion::negotiate)
+        .transpose()?
+        .unwrap_or(ProtocolVersion::V3);
     if canonical_ip_address(context.peer.ip()).is_ipv6() && protocol < ProtocolVersion::V17 {
         drop(sessions);
         send_message(
