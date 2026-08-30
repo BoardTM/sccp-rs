@@ -11,11 +11,11 @@ use super::runtime::{
     direct_media_policy, enqueue_media_retarget, execute_answer_call_transition,
     execute_forwarding_mutation, format_for, handle_runtime_hangup_signal, install_mwi,
     local_media_endpoint, module_access, preferred_codec_upgrade, preferred_inbound_codec,
-    prepare_channel_allocation_text, publish_line, read_channel_metadata, read_party_snapshot,
-    registered_device_ids, reload, reload_selected, reload_sorcery, remove_channel,
-    render_runtime_cli_diagnostics, render_runtime_cli_inventory, requestor_auto_answer_mode,
-    retarget_station_to_anchor, state_from_channel, station_nat_active, take_state_from_channel,
-    uninstall_mwi,
+    prepare_channel_allocation_text, publish_line, queue_unavailable, read_channel_metadata,
+    read_party_snapshot, registered_device_ids, reload, reload_selected, reload_sorcery,
+    remove_channel, render_runtime_cli_diagnostics, render_runtime_cli_inventory,
+    requestor_auto_answer_mode, retarget_station_to_anchor, state_from_channel, station_nat_active,
+    take_state_from_channel, uninstall_mwi, with_channel,
 };
 use super::{
     AppearanceRingMode, Arc, AsteriskRealtime, AsteriskSorcerySource, AutoAnswerPolicy, CStr,
@@ -25,13 +25,14 @@ use super::{
     DeviceId, DeviceState, DirectMediaRoute, DndMode, DriverEffect, Duration,
     FeatureControlMutation, FeatureControlOutcome, ForwardingContext, ForwardingOperation,
     HandsetEffect, HashMap, HybridConfigurationProvider, InboundCallDisposition,
-    InboundDialRequest, InboundUnavailableReason, IncomingRing, LineBinding, LineInstance,
-    LogLevel, MAX_ASSIGNED_CHANNEL_ID_BYTES, MAX_BOOLEAN_BYTES, MAX_CALL_ID_BYTES,
-    MAX_DEVICE_SELECTOR_BYTES, MAX_DIAL_DESTINATION_BYTES, MAX_DND_MODE_BYTES,
-    MAX_LINE_SELECTOR_BYTES, MAX_MESSAGE_BYTES, MAX_TIMEOUT_BYTES, MODULE, MediaEndpoint,
-    ModuleConfig, NoAnswerPolicy, NonNull, PartySnapshot, PbxCallId, PhoneCommand,
-    PhoneCommandAction, REQUESTED_CHANNEL_UNAVAILABLE, ReloadSelection, ResetMode, RingDuration,
-    RingerMode, SharedNoAnswerRoute, SorceryConfigurationProvider, USER_BUSY, c_int,
+    InboundDialRequest, InboundUnavailableReason, IncomingOfferDelivery, IncomingOfferReceipt,
+    IncomingPresentation, IncomingRing, LineBinding, LineInstance, LogLevel,
+    MAX_ASSIGNED_CHANNEL_ID_BYTES, MAX_BOOLEAN_BYTES, MAX_CALL_ID_BYTES, MAX_DEVICE_SELECTOR_BYTES,
+    MAX_DIAL_DESTINATION_BYTES, MAX_DND_MODE_BYTES, MAX_LINE_SELECTOR_BYTES, MAX_MESSAGE_BYTES,
+    MAX_TIMEOUT_BYTES, MODULE, MediaEndpoint, ModuleConfig, NoAnswerPolicy, NonNull, PartySnapshot,
+    PbxCallId, PhoneCallState, PhoneCommand, PhoneCommandAction, REQUESTED_CHANNEL_UNAVAILABLE,
+    ReloadSelection, ResetMode, RingDuration, RingerMode, SharedNoAnswerRoute,
+    SorceryConfigurationProvider, StationSessionTarget, Tone, USER_BUSY, c_int,
     canonical_ip_address, complete_cli_device, complete_cli_value, compose_channel_metadata,
     controller_step, execute_cli_answer, execute_cli_device_control, execute_cli_dnd,
     execute_cli_end, execute_cli_message, execute_cli_originate, native_channel,
@@ -68,6 +69,71 @@ pub struct ChannelOperationReceipt(std::sync::mpsc::Receiver<RuntimeCallSignalDe
 impl ChannelOperationReceipt {
     pub fn wait(self) -> Result<(), ChannelOperationError> {
         Ok(self.0.recv()??)
+    }
+}
+
+async fn reconcile_incoming_offer(
+    access: Access,
+    pbx_id: PbxCallId,
+    call_id: CallId,
+    line: String,
+    tone: Option<Tone>,
+    tone_interval: Duration,
+    receipt: IncomingOfferReceipt,
+) {
+    match receipt.wait().await {
+        Ok(IncomingOfferDelivery::Presented) => {
+            let effects = controller_step(&access.shared.controller, |controller| {
+                controller.start_call_waiting_tone(call_id, tone, tone_interval, Instant::now())
+            });
+            for effect in effects {
+                let DriverEffect::Handset(HandsetEffect::StartTone {
+                    device_id,
+                    call_id,
+                    tone,
+                }) = effect
+                else {
+                    debug_assert!(false, "call-waiting policy emitted a non-tone effect");
+                    continue;
+                };
+                if let Err(error) = access.phone.try_send(PhoneCommand::new(
+                    device_id,
+                    PhoneCommandAction::StartTone { call_id, tone },
+                )) {
+                    controller_step(&access.shared.controller, |controller| {
+                        controller.cancel_call_waiting_tone(call_id)
+                    });
+                    ast_log(
+                        LogLevel::Warning,
+                        &format!("unable to enqueue SCCP call-waiting tone: {error}"),
+                    );
+                }
+            }
+        }
+        delivery => {
+            let removed_all = controller_step(&access.shared.controller, |controller| {
+                let removed = controller.cancel_inbound_offer(call_id);
+                controller.cancel_call_waiting_tone(call_id);
+                removed && controller.pbx_call(pbx_id).is_none()
+            });
+            if !removed_all
+                && controller_step(&access.shared.controller, |controller| {
+                    controller.call(call_id).is_some()
+                })
+            {
+                return;
+            }
+            ast_log(
+                LogLevel::Warning,
+                &format!("SCCP incoming presentation failed for call {call_id:?}: {delivery:?}"),
+            );
+            publish_line(&access, &line);
+            if removed_all {
+                let _ = with_channel(&access, pbx_id, |channel| unsafe {
+                    queue_unavailable(channel)
+                });
+            }
+        }
     }
 }
 
@@ -809,10 +875,17 @@ pub unsafe fn place_call(
         let Some(call) = controller.pbx_call(state.pbx_id) else {
             return None;
         };
-        Some((
-            call.line.clone(),
-            controller.inbound_offers_for_pbx(state.pbx_id),
-        ))
+        let offers = controller
+            .inbound_offers_for_pbx(state.pbx_id)
+            .into_iter()
+            .filter_map(|offer| {
+                let generation = controller
+                    .registered_device(&offer.device_id)?
+                    .session_generation;
+                Some((offer, generation))
+            })
+            .collect::<Vec<_>>();
+        Some((call.line.clone(), offers))
     }) else {
         return Err(ChannelOperationError::Invalid);
     };
@@ -820,7 +893,8 @@ pub unsafe fn place_call(
         return Err(ChannelOperationError::Invalid);
     }
     let mut offered = 0;
-    for offer in offers {
+    let mut enqueued = Vec::with_capacity(offers.len());
+    for (offer, session_generation) in offers {
         let Some(info) = controller_step(&access.shared.controller, |controller| {
             controller.call_info(offer.call_id).cloned()
         }) else {
@@ -837,46 +911,44 @@ pub unsafe fn place_call(
             }),
             AppearanceRingMode::Disabled => None,
         };
-        match access.phone.try_offer_incoming_call_with_id_and_ringer(
-            offer.device_id,
+        let presentation = match offer.state {
+            PhoneCallState::RingIn => IncomingPresentation::RingIn,
+            PhoneCallState::CallWaiting => IncomingPresentation::CallWaiting,
+            _ => {
+                debug_assert!(false, "incoming offer has a non-incoming call state");
+                continue;
+            }
+        };
+        match access.phone.try_offer_incoming_call_for_session(
+            StationSessionTarget::new(offer.device_id.clone(), session_generation),
             LineInstance::new(offer.line_instance),
             offer.call_id,
             info,
+            presentation,
             ringer,
         ) {
-            Ok(()) => {
+            Ok(receipt) => {
                 offered += 1;
-                let waiting_effects = controller_step(&access.shared.controller, |controller| {
-                    controller.start_call_waiting_tone(
-                        offer.call_id,
-                        config.general.call_waiting_tone,
-                        Duration::from_secs(config.general.call_waiting_interval_seconds.into()),
-                        Instant::now(),
-                    )
-                });
-                for effect in waiting_effects {
-                    let DriverEffect::Handset(HandsetEffect::StartTone {
-                        device_id,
+                enqueued.push((offer.device_id, offer.call_id));
+                let reconcile = access.clone();
+                let reconcile_line = line.clone();
+                let pbx_id = state.pbx_id;
+                let call_id = offer.call_id;
+                let tone = config.general.call_waiting_tone;
+                let tone_interval =
+                    Duration::from_secs(config.general.call_waiting_interval_seconds.into());
+                access.handle.spawn(async move {
+                    reconcile_incoming_offer(
+                        reconcile,
+                        pbx_id,
                         call_id,
+                        reconcile_line,
                         tone,
-                    }) = effect
-                    else {
-                        debug_assert!(false, "call-waiting policy emitted a non-tone effect");
-                        continue;
-                    };
-                    if let Err(error) = access.phone.try_send(PhoneCommand::new(
-                        device_id,
-                        PhoneCommandAction::StartTone { call_id, tone },
-                    )) {
-                        controller_step(&access.shared.controller, |controller| {
-                            controller.cancel_call_waiting_tone(offer.call_id)
-                        });
-                        ast_log(
-                            LogLevel::Warning,
-                            &format!("unable to enqueue SCCP call-waiting tone: {error}"),
-                        );
-                    }
-                }
+                        tone_interval,
+                        receipt,
+                    )
+                    .await;
+                });
             }
             Err(error) => {
                 controller_step(&access.shared.controller, |controller| {
@@ -894,6 +966,20 @@ pub unsafe fn place_call(
         return Err(ChannelOperationError::Invalid);
     }
     if unsafe { native_channel::start_ringing(channel) }.is_err() {
+        for (device_id, call_id) in enqueued {
+            controller_step(&access.shared.controller, |controller| {
+                controller.cancel_inbound_offer(call_id)
+            });
+            if let Err(error) = access.phone.try_send(PhoneCommand::new(
+                device_id,
+                PhoneCommandAction::CloseCall { call_id },
+            )) {
+                ast_log(
+                    LogLevel::Warning,
+                    &format!("unable to enqueue SCCP incoming-call cleanup: {error}"),
+                );
+            }
+        }
         publish_line(&access, &line);
         return Err(ChannelOperationError::Invalid);
     }
@@ -949,23 +1035,28 @@ pub unsafe fn hangup_channel(
     let Some(access) = module_access() else {
         return Ok(());
     };
+    let handset_call_id = controller_step(&access.shared.controller, |controller| {
+        controller
+            .active_or_primary_call_by_pbx(state.pbx_id)
+            .map(|call| call.sccp_id)
+    })
+    .unwrap_or(state.sccp_id);
     let binding = access
         .shared
         .channels
         .lock_unpoisoned()
-        .remove(&state.pbx_id);
+        .get(&state.pbx_id)
+        .cloned();
     if let Some(binding) = binding {
         drop(binding.close());
     }
     if !access.enqueue_call_signal(
         state.pbx_id,
-        RuntimeCallSignalKind::Hangup {
-            handset_call_id: state.sccp_id,
-        },
+        RuntimeCallSignalKind::Hangup { handset_call_id },
     ) {
         let cleanup = access.clone();
         access.handle.spawn(async move {
-            handle_runtime_hangup_signal(&cleanup, state.pbx_id, state.sccp_id).await;
+            handle_runtime_hangup_signal(&cleanup, state.pbx_id, handset_call_id).await;
         });
     }
     Ok(())
@@ -1066,19 +1157,16 @@ pub unsafe fn send_text_to_channel(
     let access = module_access().ok_or(ChannelOperationError::Invalid)?;
     let state =
         unsafe { state_from_channel(channel.as_ptr()) }.ok_or(ChannelOperationError::Invalid)?;
-    let device_id = controller_step(&access.shared.controller, |controller| {
-        controller
-            .call(state.sccp_id)
-            .filter(|call| call.pbx_id == state.pbx_id)
-            .map(|call| call.device_id.clone())
+    let call = controller_step(&access.shared.controller, |controller| {
+        controller.active_or_primary_call_by_pbx(state.pbx_id)
     })
     .ok_or(ChannelOperationError::Invalid)?;
     access
         .phone
         .try_send(PhoneCommand::new(
-            device_id,
+            call.device_id,
             PhoneCommandAction::DisplayPrompt {
-                call_id: state.sccp_id,
+                call_id: call.sccp_id,
                 timeout_seconds: 0,
                 text,
             },
@@ -1180,9 +1268,7 @@ pub unsafe fn set_channel_audio_format(
         .map(super::runtime::pbx_audio_format_from_native)
         .ok_or(ChannelOperationError::Invalid)?;
     let call = controller_step(&access.shared.controller, |controller| {
-        controller
-            .call(state.sccp_id)
-            .filter(|call| call.pbx_id == state.pbx_id)
+        controller.active_or_primary_call_by_pbx(state.pbx_id)
     })
     .ok_or(ChannelOperationError::Invalid)?;
     if pbx_audio_format(call.codec).is_ok_and(|current| current == requested) {
@@ -1197,7 +1283,7 @@ pub unsafe fn set_channel_audio_format(
     )
     .ok_or(ChannelOperationError::Invalid)?;
     let previous = controller_step(&access.shared.controller, |controller| {
-        controller.set_held_codec(state.pbx_id, state.sccp_id, codec)
+        controller.set_held_codec(state.pbx_id, call.sccp_id, codec)
     })
     .ok_or(ChannelOperationError::Invalid)?;
     if unsafe {
@@ -1209,7 +1295,7 @@ pub unsafe fn set_channel_audio_format(
     .is_err()
     {
         let _ = controller_step(&access.shared.controller, |controller| {
-            controller.set_held_codec(state.pbx_id, state.sccp_id, previous)
+            controller.set_held_codec(state.pbx_id, call.sccp_id, previous)
         });
         return Err(ChannelOperationError::Invalid);
     }
@@ -1217,7 +1303,7 @@ pub unsafe fn set_channel_audio_format(
         LogLevel::Notice,
         &format!(
             "upgraded held SCCP call {} from {:?} to {:?} for bridge compatibility",
-            state.sccp_id.0, previous, codec
+            call.sccp_id.0, previous, codec
         ),
     );
     Ok(())
@@ -1280,7 +1366,9 @@ pub unsafe fn update_rtp_peer(
             }
         }
         DirectMediaRoute::Anchored(_) => {
-            let Some(mut endpoint) = local_media_endpoint(&access, call.pbx_id, call.codec) else {
+            let Some(mut endpoint) =
+                local_media_endpoint(&access, call.pbx_id, &call.device_id, call.codec)
+            else {
                 return Err(ChannelOperationError::Invalid);
             };
             endpoint.packet_ms = packet_ms;

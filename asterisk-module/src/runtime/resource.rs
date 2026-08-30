@@ -109,6 +109,10 @@ impl<T: Clone> ResourceBinding<T> {
         self.changed.notify_all();
         state.current.take()
     }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        lock(&self.state).phase == BindingPhase::Closed
+    }
 }
 
 /// Keeps an operation's retained resource alive and releases its gate on drop.
@@ -183,6 +187,7 @@ mod tests {
         entrant.join().expect("entry thread");
 
         assert_eq!(binding.close(), Some(Token(2)));
+        assert!(binding.is_closed());
         assert!(binding.enter().is_none());
     }
 

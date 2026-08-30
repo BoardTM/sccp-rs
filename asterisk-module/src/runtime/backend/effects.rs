@@ -361,6 +361,7 @@ pub enum PbxEffect {
     /// so this effect deliberately has no handset follow-up.
     ConfigureMediaOnly {
         call_id: PbxCallId,
+        device_id: DeviceId,
         codec: Codec,
         remote: MediaEndpoint,
     },

@@ -4,8 +4,9 @@ use thiserror::Error;
 
 use super::{Access, Arc, DeviceFeatureState, DndMode, RuntimeInventoryProvider, controller_step};
 use crate::ami::cli::{
-    CliCapability, CliChannel, CliDeviceRuntime, CliFeature, CliInventoryCommand,
-    CliInventoryError, CliInventorySnapshot, complete_cli_inventory, render_cli_inventory,
+    CliCapability, CliCapabilityStatus, CliChannel, CliDeviceRuntime, CliFeature,
+    CliInventoryCommand, CliInventoryError, CliInventorySnapshot, complete_cli_inventory,
+    render_cli_inventory,
 };
 use crate::ami::inventory::{InventoryProvider, InventoryValue};
 use crate::ami::runtime::RuntimeStatusProvider;
@@ -54,26 +55,34 @@ fn runtime_cli_inventory_snapshot(
             .devices
             .iter()
             .map(|device| {
-                let capabilities = controller
-                    .registered_device(&device.id)
-                    .map(|registered| {
-                        registered
-                            .capabilities
-                            .audio()
-                            .iter()
-                            .map(|capability| CliCapability {
-                                codec: capability.codec,
-                                max_frames_per_packet: capability.max_frames_per_packet,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let (capability_status, capabilities) =
+                    match controller.registered_device(&device.id) {
+                        None => (CliCapabilityStatus::Unavailable, Vec::new()),
+                        Some(registered) => match registered.capabilities.as_ref() {
+                            None => (CliCapabilityStatus::Pending, Vec::new()),
+                            Some(capabilities) if capabilities.is_empty() => {
+                                (CliCapabilityStatus::ReportedEmpty, Vec::new())
+                            }
+                            Some(capabilities) => (
+                                CliCapabilityStatus::Ready,
+                                capabilities
+                                    .audio()
+                                    .iter()
+                                    .map(|capability| CliCapability {
+                                        codec: capability.codec,
+                                        max_frames_per_packet: capability.max_frames_per_packet,
+                                    })
+                                    .collect(),
+                            ),
+                        },
+                    };
                 let features = controller
                     .feature_state(&device.id)
                     .map(cli_features)
                     .unwrap_or_default();
                 CliDeviceRuntime {
                     device_id: device.id.clone(),
+                    capability_status,
                     capabilities,
                     features,
                 }

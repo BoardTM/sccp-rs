@@ -13,13 +13,6 @@
 //! Handset presentation, receive media, transmit media, and call ownership are
 //! therefore separate states rather than one broad "connected" flag.
 //!
-//! One explicit wire exception writes OpenReceiveChannel and
-//! StartMediaTransmission together for coupled outbound NAT media. A matching
-//! successful receive acknowledgement atomically settles both halves and
-//! emits [`DeviceEventKind::TransmitChannelImplied`]; ordinary staged media never infers
-//! transmit success from a receive acknowledgement.  Close, failure, timeout,
-//! disconnect, and replacement paths retire the coupled transaction.
-//!
 //! # Runtime workflow
 //!
 //! [`Server::bind`] creates a plain TCP listener, while
@@ -186,6 +179,65 @@ pub struct ParkingMenuEntry {
 pub struct IncomingRing {
     pub mode: RingerMode,
     pub duration: RingDuration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IncomingPresentation {
+    #[default]
+    RingIn,
+    CallWaiting,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IncomingOfferDelivery {
+    Presented,
+    SessionMissing,
+    SessionStale {
+        actual_generation: SessionGeneration,
+    },
+    CancelledBeforePresentation,
+    WriteFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StationSessionTarget {
+    device_id: DeviceId,
+    generation: SessionGeneration,
+}
+
+impl StationSessionTarget {
+    pub fn new(device_id: DeviceId, generation: SessionGeneration) -> Self {
+        Self {
+            device_id,
+            generation,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct IncomingOfferReceipt(oneshot::Receiver<IncomingOfferDelivery>);
+
+impl IncomingOfferReceipt {
+    pub fn try_recv(&mut self) -> Result<Option<IncomingOfferDelivery>, ServerError> {
+        match self.0.try_recv() {
+            Ok(delivery) => Ok(Some(delivery)),
+            Err(oneshot::error::TryRecvError::Empty) => Ok(None),
+            Err(oneshot::error::TryRecvError::Closed) => Err(ServerError::Stopped),
+        }
+    }
+
+    pub async fn wait(self) -> Result<IncomingOfferDelivery, ServerError> {
+        self.0.await.map_err(|_| ServerError::Stopped)
+    }
+}
+
+impl IncomingPresentation {
+    const fn call_state(self) -> CallState {
+        match self {
+            Self::RingIn => CallState::RingIn,
+            Self::CallWaiting => CallState::CallWaiting,
+        }
+    }
 }
 
 /// Device-wide do-not-disturb state rendered by configured feature buttons.
@@ -688,10 +740,7 @@ pub enum DeviceEventKind {
     },
     /// Reports one keypad digit associated with an addressable handset call.
     /// The digit is decoded but no dialing or in-call policy is applied here.
-    Digit {
-        call_id: CallId,
-        digit: Digit,
-    },
+    Digit { call_id: CallId, digit: Digit },
     /// Reports a complete en-bloc number submitted for a newly allocated call.
     /// The line and server-owned call identity are resolved before emission.
     EnblocCall {
@@ -729,19 +778,13 @@ pub enum DeviceEventKind {
     },
     /// Reports activation of a configured generic feature button.
     /// The instance identifies the exact feature definition on the station.
-    FeatureButton {
-        instance: LineInstance,
-    },
+    FeatureButton { instance: LineInstance },
     /// Reports activation of a configured do-not-disturb feature button.
     /// The instance identifies which station feature definition was pressed.
-    DoNotDisturbButton {
-        instance: LineInstance,
-    },
+    DoNotDisturbButton { instance: LineInstance },
     /// Reports activation of a configured mobility feature button.
     /// The instance identifies the owner of any temporary mobility appearance.
-    MobilityButton {
-        instance: LineInstance,
-    },
+    MobilityButton { instance: LineInstance },
     /// Reports a configured voicemail-button press on an exact line and call.
     /// The server allocates or resolves the addressable call before emission.
     VoicemailButton {
@@ -759,20 +802,13 @@ pub enum DeviceEventKind {
     },
     /// Reports a parking slot selected from the station parking menu.
     /// Carries the configured lot identity and numeric slot chosen by the user.
-    ParkingMenuSelection {
-        lot: String,
-        slot: u32,
-    },
+    ParkingMenuSelection { lot: String, slot: u32 },
     /// Reports a correlated response submitted by a station phone service.
     /// The typed response retains application routing and submitted form values.
-    PhoneServiceResponse {
-        response: PhoneServiceEvent,
-    },
+    PhoneServiceResponse { response: PhoneServiceEvent },
     /// Reports an action selected from a station conference service document.
     /// The typed action identifies its conference, participant, and operation.
-    ConferenceListAction {
-        action: ConferenceListAction,
-    },
+    ConferenceListAction { action: ConferenceListAction },
     /// Reports that the current audio receive request was acknowledged.
     /// Carries the correlated call, media status, and allocated station endpoint.
     ReceiveChannelOpened {
@@ -828,17 +864,9 @@ pub enum DeviceEventKind {
         codec: Codec,
         passthrough_party_id: PassthroughPartyId,
     },
-    /// Reports transmit success implied by a coupled receive acknowledgement.
-    /// Lets callers settle both outbound media halves once without a second ACK.
-    TransmitChannelImplied {
+    TransmitChannelOpen {
         call_id: CallId,
-        endpoint: MediaEndpoint,
-    },
-    /// Reports that the current audio transmit request was acknowledged directly.
-    /// Carries the correlated call, media status, and destination endpoint.
-    TransmitChannelStarted {
-        call_id: CallId,
-        status: MediaStatus,
+        outcome: TransmitOpenOutcome,
         endpoint: MediaEndpoint,
     },
     /// Reports expiry of an audio receive or transmit acknowledgement deadline.
@@ -892,9 +920,7 @@ pub enum DeviceEventKind {
     },
     /// Reports a correlated media-statistics response retained by the server.
     /// Carries the complete snapshot for the exact call and media generation.
-    ConnectionStatisticsCollected {
-        snapshot: MediaStatisticsSnapshot,
-    },
+    ConnectionStatisticsCollected { snapshot: MediaStatisticsSnapshot },
     /// Reports a decoded fixed-layout station alarm and optional parameters.
     /// Carries the station-provided severity and bounded human-readable text.
     Alarm {
@@ -904,19 +930,13 @@ pub enum DeviceEventKind {
     },
     /// Reports a typed alarm decoded from a station XML telemetry document.
     /// The parsed telemetry exposes only the validated alarm schema and values.
-    XmlAlarm {
-        telemetry: PhoneAlarmTelemetry,
-    },
+    XmlAlarm { telemetry: PhoneAlarmTelemetry },
     /// Reports typed station location data decoded from an XML document.
     /// The telemetry retains validated address and location fields in wire order.
-    LocationInformation {
-        telemetry: PhoneLocationTelemetry,
-    },
+    LocationInformation { telemetry: PhoneLocationTelemetry },
     /// Reports that the station headset-enabled state changed.
     /// Carries the newly reported boolean state for integration-side handling.
-    HeadsetStatusChanged {
-        enabled: bool,
-    },
+    HeadsetStatusChanged { enabled: bool },
     /// Reports a state transition on a station media path or accessory.
     /// Carries the typed path identity and the event reported for that path.
     MediaPathChanged {
@@ -925,16 +945,21 @@ pub enum DeviceEventKind {
     },
     /// Reports a valid client message with no implemented server-side behavior.
     /// Preserves the decoded message so integrations can observe or log it.
-    UnhandledMessage {
-        message: ClientMessage,
-    },
+    UnhandledMessage { message: ClientMessage },
 }
 
 /// Station acknowledgement whose correlation deadline expired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandsetAcknowledgement {
     OpenReceiveChannel,
-    StartMediaTransmission,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransmitOpenOutcome {
+    Acknowledged,
+    Implied,
+    NotReported,
+    Rejected(MediaStatus),
 }
 
 /// One station-targeted operation submitted through [`ServerHandle`].
@@ -983,40 +1008,22 @@ pub enum CommandAction {
     },
     /// Replaces the calling and called-party information shown for a call.
     /// Also updates the directory number used for later media statistics.
-    SetCallInfo {
-        call_id: CallId,
-        info: CallInfo,
-    },
+    SetCallInfo { call_id: CallId, info: CallInfo },
     /// Commits collected outbound digits and advances the call to proceeding.
     /// Updates call information, dialed-number history, lamps, and station UI.
-    CommitOutboundCall {
-        call_id: CallId,
-        info: CallInfo,
-    },
+    CommitOutboundCall { call_id: CallId, info: CallInfo },
     /// Presents an outbound call as accepted and currently proceeding.
     /// Stops dial tone and refreshes call information and the station prompt.
-    PresentOutboundProceeding {
-        call_id: CallId,
-        info: CallInfo,
-    },
+    PresentOutboundProceeding { call_id: CallId, info: CallInfo },
     /// Presents remote alerting for an outbound call on the station.
     /// Updates call information, prompt, soft keys, and local ringback tone.
-    PresentOutboundRinging {
-        call_id: CallId,
-        info: CallInfo,
-    },
+    PresentOutboundRinging { call_id: CallId, info: CallInfo },
     /// Changes the protocol-visible state of an existing station call.
     /// Reconciles active-call ownership, history, lamps, prompts, and soft keys.
-    SetCallState {
-        call_id: CallId,
-        state: CallState,
-    },
+    SetCallState { call_id: CallId, state: CallState },
     /// Marks or unmarks a call in the station's selected-call set.
     /// Emits the selection status for the call's current wire reference.
-    SetCallSelected {
-        call_id: CallId,
-        selected: bool,
-    },
+    SetCallSelected { call_id: CallId, selected: bool },
     /// Displays call-scoped prompt text for an optional number of seconds.
     /// Resolves the server call identity to the station line and wire call.
     DisplayPrompt {
@@ -1026,9 +1033,7 @@ pub enum CommandAction {
     },
     /// Clears the prompt currently associated with a station call.
     /// Targets the call's resolved line instance and current wire reference.
-    ClearPrompt {
-        call_id: CallId,
-    },
+    ClearPrompt { call_id: CallId },
     /// Replaces the station's persistent status notification and beep policy.
     /// Selects the appropriate static or dynamic display frames for the phone.
     SetStatusMessage {
@@ -1037,20 +1042,13 @@ pub enum CommandAction {
     },
     /// Enables or disables the station microphone outside a media renegotiation.
     /// Sends the handset microphone-mode command in command-queue order.
-    SetMicrophoneMode {
-        enabled: bool,
-    },
+    SetMicrophoneMode { enabled: bool },
     /// Shows or clears the recording indicator for a particular call.
     /// Resolves the call before emitting the station recording-status frame.
-    SetRecordingStatus {
-        call_id: CallId,
-        active: bool,
-    },
+    SetRecordingStatus { call_id: CallId, active: bool },
     /// Requests that the station reset using the selected reset behavior.
     /// The reset type controls whether the device restarts or resets its state.
-    ResetDevice {
-        reset_type: ResetType,
-    },
+    ResetDevice { reset_type: ResetType },
     /// Sets the message-waiting state for one configured line appearance.
     /// Caches the state and updates the corresponding station lamp immediately.
     SetMwi {
@@ -1184,10 +1182,7 @@ pub enum CommandAction {
     },
     /// Starts a user-direction tone for a call, or stops tone for `Silence`.
     /// Resolves the call to its current station line and wire reference.
-    StartTone {
-        call_id: CallId,
-        tone: Tone,
-    },
+    StartTone { call_id: CallId, tone: Tone },
     /// Carries a service-node request to start conference announcements.
     /// Station sessions reject it because announcement routing is not station-local.
     StartAnnouncement {
@@ -1203,9 +1198,7 @@ pub enum CommandAction {
     },
     /// Carries a service-node request to stop conference announcements.
     /// Station sessions reject it because announcement routing is not station-local.
-    StopAnnouncement {
-        conference_id: ConferenceId,
-    },
+    StopAnnouncement { conference_id: ConferenceId },
     /// Carries a conference announcement completion and playback result.
     /// Station sessions reject it because completion belongs to the service node.
     AnnouncementFinish {
@@ -1214,14 +1207,10 @@ pub enum CommandAction {
     },
     /// Starts audible ringing and the associated line indication for a call.
     /// Resolves the call to its current station line and wire reference.
-    StartRinging {
-        call_id: CallId,
-    },
+    StartRinging { call_id: CallId },
     /// Stops audible ringing and clears the associated call indication.
     /// Leaves the call itself intact for a following state transition or close.
-    StopRinging {
-        call_id: CallId,
-    },
+    StopRinging { call_id: CallId },
     /// Allocates the station's audio receive channel for a correlated request.
     /// Applies codec, packetization, DTMF, source, and processing constraints.
     OpenReceiveChannel {
@@ -1243,9 +1232,7 @@ pub enum CommandAction {
     },
     /// Closes the active multimedia receive channel for a call.
     /// Retires its request identity so late acknowledgements cannot settle it.
-    CloseMultimediaReceiveChannel {
-        call_id: CallId,
-    },
+    CloseMultimediaReceiveChannel { call_id: CallId },
     /// Starts station video transmission using an advertised transmit capability.
     /// Replacing an existing generation stops and retires that generation first.
     StartMultimediaTransmission {
@@ -1254,9 +1241,7 @@ pub enum CommandAction {
     },
     /// Stops the active multimedia transmission for a call.
     /// Retires its request identity so late acknowledgements cannot settle it.
-    StopMultimediaTransmission {
-        call_id: CallId,
-    },
+    StopMultimediaTransmission { call_id: CallId },
     /// Sets the maximum bit rate of an exact live station video encoder.
     /// Requires the current passthrough token to reject stale stream controls.
     SetMultimediaTransmitBitRate {
@@ -1293,9 +1278,7 @@ pub enum CommandAction {
     },
     /// Closes the station's audio receive leg for a call.
     /// Retires its pending request so a late acknowledgement is ignored.
-    CloseReceiveChannel {
-        call_id: CallId,
-    },
+    CloseReceiveChannel { call_id: CallId },
     /// Starts the station's audio transmit leg toward the supplied endpoint.
     /// Applies DTMF, processing, and traffic-class policy to the new generation.
     StartMedia {
@@ -1339,14 +1322,10 @@ pub enum CommandAction {
     },
     /// Stops the station's audio transmit leg for a call.
     /// Retires its pending request so a late acknowledgement is ignored.
-    StopMedia {
-        call_id: CallId,
-    },
+    StopMedia { call_id: CallId },
     /// Tears down all station media and presentation for a call.
     /// Requests final statistics when applicable and retires the call identity.
-    CloseCall {
-        call_id: CallId,
-    },
+    CloseCall { call_id: CallId },
     /// Drains all active media and terminates the target station session.
     /// Causes the running server to disconnect that device after command handling.
     DisconnectDevice {},
@@ -1610,6 +1589,7 @@ impl ServerHandle {
             line_instance,
             call_id,
             info,
+            IncomingPresentation::RingIn,
             audible_ring.then_some(IncomingRing::default()),
         )
         .await
@@ -1625,15 +1605,19 @@ impl ServerHandle {
         line_instance: LineInstance,
         call_id: CallId,
         info: CallInfo,
+        presentation: IncomingPresentation,
         ringer: Option<IncomingRing>,
     ) -> Result<(), ServerError> {
         self.command_tx
             .send(ServerCommand::OfferIncoming {
                 device_id,
+                expected_generation: None,
                 line_instance,
                 call_id,
                 info,
+                presentation,
                 ringer,
+                delivery: None,
             })
             .await
             .map_err(|_| ServerError::Stopped)?;
@@ -1670,6 +1654,7 @@ impl ServerHandle {
             line_instance,
             call_id,
             info,
+            IncomingPresentation::RingIn,
             audible_ring.then_some(IncomingRing::default()),
         )
     }
@@ -1680,20 +1665,86 @@ impl ServerHandle {
         line_instance: LineInstance,
         call_id: CallId,
         info: CallInfo,
+        presentation: IncomingPresentation,
         ringer: Option<IncomingRing>,
     ) -> Result<(), ServerError> {
         self.command_tx
             .try_send(ServerCommand::OfferIncoming {
                 device_id,
+                expected_generation: None,
                 line_instance,
                 call_id,
                 info,
+                presentation,
                 ringer,
+                delivery: None,
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => ServerError::CommandQueueFull,
                 mpsc::error::TrySendError::Closed(_) => ServerError::Stopped,
             })
+    }
+
+    pub async fn offer_incoming_call_for_session(
+        &self,
+        target: StationSessionTarget,
+        line_instance: LineInstance,
+        call_id: CallId,
+        info: CallInfo,
+        presentation: IncomingPresentation,
+        ringer: Option<IncomingRing>,
+    ) -> Result<IncomingOfferReceipt, ServerError> {
+        let (delivery, receipt) = oneshot::channel();
+        let StationSessionTarget {
+            device_id,
+            generation,
+        } = target;
+        self.command_tx
+            .send(ServerCommand::OfferIncoming {
+                device_id,
+                expected_generation: Some(generation),
+                line_instance,
+                call_id,
+                info,
+                presentation,
+                ringer,
+                delivery: Some(delivery),
+            })
+            .await
+            .map_err(|_| ServerError::Stopped)?;
+        Ok(IncomingOfferReceipt(receipt))
+    }
+
+    pub fn try_offer_incoming_call_for_session(
+        &self,
+        target: StationSessionTarget,
+        line_instance: LineInstance,
+        call_id: CallId,
+        info: CallInfo,
+        presentation: IncomingPresentation,
+        ringer: Option<IncomingRing>,
+    ) -> Result<IncomingOfferReceipt, ServerError> {
+        let (delivery, receipt) = oneshot::channel();
+        let StationSessionTarget {
+            device_id,
+            generation,
+        } = target;
+        self.command_tx
+            .try_send(ServerCommand::OfferIncoming {
+                device_id,
+                expected_generation: Some(generation),
+                line_instance,
+                call_id,
+                info,
+                presentation,
+                ringer,
+                delivery: Some(delivery),
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ServerError::CommandQueueFull,
+                mpsc::error::TrySendError::Closed(_) => ServerError::Stopped,
+            })?;
+        Ok(IncomingOfferReceipt(receipt))
     }
 
     /// Request orderly server shutdown.
@@ -1820,6 +1871,7 @@ pub struct Server {
 
 type Sessions = Arc<Mutex<HashMap<DeviceId, SessionSender>>>;
 type CommandWriteConfirmation = oneshot::Sender<Result<(), String>>;
+type IncomingOfferConfirmation = oneshot::Sender<IncomingOfferDelivery>;
 
 #[derive(Clone, Debug)]
 struct SessionSender {
@@ -1838,10 +1890,13 @@ enum ServerCommand {
     },
     OfferIncoming {
         device_id: DeviceId,
+        expected_generation: Option<SessionGeneration>,
         line_instance: LineInstance,
         call_id: CallId,
         info: CallInfo,
+        presentation: IncomingPresentation,
         ringer: Option<IncomingRing>,
+        delivery: Option<IncomingOfferConfirmation>,
     },
     Reconfigure {
         definitions: HashMap<DeviceId, DeviceDefinition>,
@@ -1879,7 +1934,9 @@ enum SessionCommand {
         line_instance: LineInstance,
         call_id: CallId,
         info: Box<CallInfo>,
+        presentation: IncomingPresentation,
         ringer: Option<IncomingRing>,
+        delivery: Option<IncomingOfferConfirmation>,
     },
     Disconnect,
 }
@@ -1893,6 +1950,7 @@ struct SessionCall {
     video_receive: VideoReceive,
     video_transmit: VideoTransmit,
     state: CallState,
+    ringer: Option<IncomingRing>,
     history_disposition: CallHistoryDisposition,
     dialed_number: String,
     statistics_directory_number: String,
@@ -1955,6 +2013,7 @@ struct CallMedia {
     max_frames_per_packet: u32,
     receive: MediaLeg,
     transmit: MediaLeg,
+    transmit_confirmation: TransmitConfirmation,
     /// Exact StartMediaTransmission endpoint paired with an outstanding
     /// OpenReceiveChannel in one outbound NAT compatibility transaction.
     /// A successful matching receive acknowledgement settles both halves.
@@ -1971,6 +2030,7 @@ impl CallMedia {
             max_frames_per_packet: DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET,
             receive: MediaLeg::default(),
             transmit: MediaLeg::default(),
+            transmit_confirmation: TransmitConfirmation::Inactive,
             coupled_transmit_endpoint: None,
             requested: false,
         }
@@ -1998,6 +2058,27 @@ enum MediaChannelState {
     Closed,
     Opening,
     Open,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TransmitConfirmation {
+    #[default]
+    Inactive,
+    Awaiting {
+        deadline: Instant,
+    },
+    NotReported,
+    Settled(TransmitOpenOutcome),
+}
+
+impl TransmitConfirmation {
+    fn acknowledgement_is_reportable(self, status: MediaStatus) -> Option<bool> {
+        match self {
+            Self::Awaiting { .. } => Some(true),
+            Self::NotReported => Some(status != MediaStatus::Ok),
+            Self::Inactive | Self::Settled(_) => None,
+        }
+    }
 }
 
 impl MediaChannelState {
@@ -2221,9 +2302,42 @@ impl Server {
                         Some(ServerCommand::Confirmed { command, written, expires_at }) => {
                             self.dispatch_confirmed(command, written, expires_at).await;
                         }
-                        Some(ServerCommand::OfferIncoming { device_id, line_instance, call_id, info, ringer }) => {
-                            if let Err(error) = self.dispatch(&device_id, SessionCommand::OfferIncoming { line_instance, call_id, info: Box::new(info), ringer }).await {
-                                warn!(%error, "discarding incoming offer for a retired session");
+                        Some(ServerCommand::OfferIncoming { device_id, expected_generation, line_instance, call_id, info, presentation, ringer, mut delivery }) => {
+                            let session = self.sessions.lock().await.get(&device_id).cloned();
+                            let Some(session) = session else {
+                                if let Some(delivery) = delivery.take() {
+                                    let _ = delivery.send(IncomingOfferDelivery::SessionMissing);
+                                }
+                                warn!(%device_id, "discarding incoming offer for a missing session");
+                                continue;
+                            };
+                            if let Some(expected) = expected_generation
+                                && session.generation != expected
+                            {
+                                if let Some(delivery) = delivery.take() {
+                                    let _ = delivery.send(IncomingOfferDelivery::SessionStale {
+                                        actual_generation: session.generation,
+                                    });
+                                }
+                                warn!(%device_id, ?expected, actual = ?session.generation, "discarding incoming offer for a stale session generation");
+                                continue;
+                            }
+                            if let Err(error) = session.tx.send(SessionCommand::OfferIncoming {
+                                line_instance,
+                                call_id,
+                                info: Box::new(info),
+                                presentation,
+                                ringer,
+                                delivery,
+                            }).await {
+                                if let SessionCommand::OfferIncoming {
+                                    delivery: Some(delivery),
+                                    ..
+                                } = error.0
+                                {
+                                    let _ = delivery.send(IncomingOfferDelivery::SessionMissing);
+                                }
+                                warn!(%device_id, "discarding incoming offer for a retired session");
                             }
                         }
                         Some(ServerCommand::Reconfigure { definitions, affected, applied }) => {
@@ -2685,6 +2799,7 @@ struct SessionRuntimeState {
     mobility_appearances: HashMap<u32, LineAppearance>,
     active_key_mode: KeyMode,
     active_call_id: Option<CallId>,
+    ringer_owner: Option<CallId>,
     pending_parking_menu: Option<PendingParkingMenu>,
     active_blf_alerts: BTreeMap<u32, HandsetStatusMessage>,
     visible_blf_alert: Option<HandsetStatusMessage>,
@@ -2714,6 +2829,7 @@ impl Default for SessionRuntimeState {
             mobility_appearances: HashMap::new(),
             active_key_mode: KeyMode::OnHook,
             active_call_id: None,
+            ringer_owner: None,
             pending_parking_menu: None,
             active_blf_alerts: BTreeMap::new(),
             visible_blf_alert: None,
@@ -3088,17 +3204,38 @@ async fn handle_session_command_result(
     command: SessionCommand,
     context: &SessionContext,
 ) -> Result<bool, ServerError> {
-    let Some((command, written)) = prepare_session_command(command) else {
+    let Some((mut command, written)) = prepare_session_command(command) else {
         return Ok(false);
     };
+    let offer_call_id = match &command {
+        SessionCommand::OfferIncoming { call_id, .. } => Some(*call_id),
+        _ => None,
+    };
+    let offer_delivery = match &mut command {
+        SessionCommand::OfferIncoming { delivery, .. } => delivery.take(),
+        _ => None,
+    };
+    if offer_call_id.is_some_and(|call_id| state.cancelled_calls.remove(&call_id)) {
+        if let Some(delivery) = offer_delivery {
+            let _ = delivery.send(IncomingOfferDelivery::CancelledBeforePresentation);
+        }
+        debug!(device_id = %state.device.id, ?offer_call_id, "discarding incoming call cancelled before it was offered");
+        return Ok(false);
+    }
     match handle_session_command(stream, state, command, context).await {
         Ok(disconnect) => {
+            if let Some(delivery) = offer_delivery {
+                let _ = delivery.send(IncomingOfferDelivery::Presented);
+            }
             if let Some(written) = written {
                 let _ = written.send(Ok(()));
             }
             Ok(disconnect)
         }
         Err(error) => {
+            if let Some(delivery) = offer_delivery {
+                let _ = delivery.send(IncomingOfferDelivery::WriteFailed);
+            }
             if let Some(written) = written {
                 let _ = written.send(Err(error.to_string()));
             }
@@ -3122,16 +3259,28 @@ async fn handle_session_deadlines(
     context: &SessionContext,
     now: Instant,
 ) -> Result<(), ServerError> {
-    for (call_id, acknowledgement) in expire_handset_acknowledgements(&mut state.calls_by_id, now) {
+    for expired in expire_handset_acknowledgements(&mut state.calls_by_id, now) {
+        let event = match expired {
+            ExpiredHandsetAcknowledgement::Receive { call_id } => {
+                DeviceEventKind::HandsetAcknowledgementTimedOut {
+                    call_id,
+                    acknowledgement: HandsetAcknowledgement::OpenReceiveChannel,
+                }
+            }
+            ExpiredHandsetAcknowledgement::Transmit { call_id, endpoint } => {
+                DeviceEventKind::TransmitChannelOpen {
+                    call_id,
+                    outcome: TransmitOpenOutcome::NotReported,
+                    endpoint,
+                }
+            }
+        };
         context
             .event_tx
             .send(Event::device(
                 state.device.id.clone(),
                 state.generation,
-                DeviceEventKind::HandsetAcknowledgementTimedOut {
-                    call_id,
-                    acknowledgement,
-                },
+                event,
             ))
             .await
             .map_err(|_| ServerError::Stopped)?;
@@ -3210,7 +3359,7 @@ async fn handle_session_deadlines(
 fn expire_handset_acknowledgements(
     calls_by_id: &mut HashMap<CallId, SessionCall>,
     now: Instant,
-) -> Vec<(CallId, HandsetAcknowledgement)> {
+) -> Vec<ExpiredHandsetAcknowledgement> {
     let mut calls = calls_by_id.keys().copied().collect::<Vec<_>>();
     calls.sort_unstable_by_key(|call_id| call_id.0);
     let mut expired = Vec::new();
@@ -3232,23 +3381,32 @@ fn expire_handset_acknowledgements(
                 call.media.transmit.state = MediaChannelState::Closed;
                 call.media.transmit.deadline = None;
                 call.media.transmit.peer = None;
+                call.media.transmit_confirmation = TransmitConfirmation::Inactive;
             }
-            expired.push((call_id, HandsetAcknowledgement::OpenReceiveChannel));
+            expired.push(ExpiredHandsetAcknowledgement::Receive { call_id });
         }
-        if call.media.transmit.state == MediaChannelState::Opening
-            && call
-                .media
-                .transmit
-                .deadline
-                .is_some_and(|deadline| deadline <= now)
-        {
-            call.media.transmit.state = MediaChannelState::Closed;
-            call.media.transmit.deadline = None;
-            call.media.transmit.peer = None;
-            expired.push((call_id, HandsetAcknowledgement::StartMediaTransmission));
+        if matches!(
+            call.media.transmit_confirmation,
+            TransmitConfirmation::Awaiting { deadline } if deadline <= now
+        ) {
+            call.media.transmit_confirmation = TransmitConfirmation::NotReported;
+            if let Some(endpoint) = call.media.transmit.peer {
+                expired.push(ExpiredHandsetAcknowledgement::Transmit { call_id, endpoint });
+            }
         }
     }
     expired
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpiredHandsetAcknowledgement {
+    Receive {
+        call_id: CallId,
+    },
+    Transmit {
+        call_id: CallId,
+        endpoint: MediaEndpoint,
+    },
 }
 
 async fn handle_pre_registration_message(
@@ -4430,6 +4588,8 @@ async fn handle_client_message(
                         stored.media.transmit.state = MediaChannelState::Open;
                         stored.media.transmit.peer = Some(endpoint);
                         stored.media.transmit.deadline = None;
+                        stored.media.transmit_confirmation =
+                            TransmitConfirmation::Settled(TransmitOpenOutcome::Implied);
                         Some(endpoint)
                     } else {
                         None
@@ -4441,6 +4601,7 @@ async fn handle_client_message(
                         stored.media.transmit.state = MediaChannelState::Closed;
                         stored.media.transmit.peer = None;
                         stored.media.transmit.deadline = None;
+                        stored.media.transmit_confirmation = TransmitConfirmation::Inactive;
                     }
                     None
                 };
@@ -4464,8 +4625,9 @@ async fn handle_client_message(
                         .send(Event::device(
                             state.device.id.clone(),
                             state.generation,
-                            DeviceEventKind::TransmitChannelImplied {
+                            DeviceEventKind::TransmitChannelOpen {
                                 call_id: call.call_id,
+                                outcome: TransmitOpenOutcome::Implied,
                                 endpoint,
                             },
                         ))
@@ -4486,11 +4648,24 @@ async fn handle_client_message(
                     .get(&call_id)
                     .expect("media call identifier came from session state")
                     .clone();
-                if call.media.transmit.state != MediaChannelState::Opening {
+                let Some(report_outcome) = call
+                    .media
+                    .transmit_confirmation
+                    .acknowledgement_is_reportable(ack.status)
+                else {
                     debug!(
                         device_id = %state.device.id,
                         call_id = ?call.call_id,
-                        state = ?call.media.transmit.state,
+                        confirmation = ?call.media.transmit_confirmation,
+                        "ignored stale transmit-channel acknowledgement"
+                    );
+                    return Ok(());
+                };
+                if call.media.transmit.state == MediaChannelState::Closed {
+                    debug!(
+                        device_id = %state.device.id,
+                        call_id = ?call.call_id,
+                        confirmation = ?call.media.transmit_confirmation,
                         "ignored stale transmit-channel acknowledgement"
                     );
                     return Ok(());
@@ -4509,32 +4684,40 @@ async fn handle_client_message(
                     .get_mut(&call_id)
                     .expect("media call identifier came from session state");
                 let coupled = stored.media.coupled_transmit_endpoint.take().is_some();
-                if ack.status == MediaStatus::Ok {
-                    stored.media.transmit.state = MediaChannelState::Open;
-                    stored.media.transmit.peer = Some(endpoint);
-                } else {
-                    stored.media.transmit.state = MediaChannelState::Closed;
-                    stored.media.transmit.peer = None;
-                    if coupled {
-                        stored.media.receive.state = MediaChannelState::Closed;
-                        stored.media.receive.deadline = None;
-                        stored.media.receive.peer = None;
+                let outcome = match ack.status {
+                    MediaStatus::Ok => {
+                        stored.media.transmit.state = MediaChannelState::Open;
+                        stored.media.transmit.peer = Some(endpoint);
+                        TransmitOpenOutcome::Acknowledged
                     }
-                }
+                    status => {
+                        stored.media.transmit.state = MediaChannelState::Closed;
+                        stored.media.transmit.peer = None;
+                        if coupled {
+                            stored.media.receive.state = MediaChannelState::Closed;
+                            stored.media.receive.deadline = None;
+                            stored.media.receive.peer = None;
+                        }
+                        TransmitOpenOutcome::Rejected(status)
+                    }
+                };
                 stored.media.transmit.deadline = None;
-                context
-                    .event_tx
-                    .send(Event::device(
-                        state.device.id.clone(),
-                        state.generation,
-                        DeviceEventKind::TransmitChannelStarted {
-                            call_id: call.call_id,
-                            status: ack.status,
-                            endpoint,
-                        },
-                    ))
-                    .await
-                    .map_err(|_| ServerError::Stopped)?;
+                stored.media.transmit_confirmation = TransmitConfirmation::Settled(outcome);
+                if report_outcome {
+                    context
+                        .event_tx
+                        .send(Event::device(
+                            state.device.id.clone(),
+                            state.generation,
+                            DeviceEventKind::TransmitChannelOpen {
+                                call_id: call.call_id,
+                                outcome,
+                                endpoint,
+                            },
+                        ))
+                        .await
+                        .map_err(|_| ServerError::Stopped)?;
+                }
             }
         }
         ClientMessage::Alarm {
@@ -4678,6 +4861,7 @@ async fn handle_client_message(
                 .expect("media call identifier came from session state");
             stored.media.transmit.state = MediaChannelState::Closed;
             stored.media.transmit.peer = None;
+            stored.media.transmit_confirmation = TransmitConfirmation::Inactive;
             context
                 .event_tx
                 .send(Event::device(
@@ -5043,6 +5227,20 @@ async fn complete_on_hook(
     line_instance: u32,
 ) -> Result<(), ServerError> {
     state.pending_media_path_release = None;
+    let order = *context
+        .call_answer_order
+        .read()
+        .expect("SCCP call-answer-order lock poisoned");
+    let successor = incoming_successor(state, call.call_id, order);
+    let successor_has_ringer = successor.is_some_and(|(call_id, _)| {
+        state
+            .calls_by_id
+            .get(&call_id)
+            .and_then(|call| incoming_ringer(call.ringer, CallState::RingIn))
+            .is_some_and(ringer_is_audible)
+    });
+    let stop_ringer =
+        !successor_has_ringer && state.ringer_owner.is_none_or(|owner| owner == call.call_id);
     context
         .event_tx
         .send(Event::device(
@@ -5064,6 +5262,7 @@ async fn complete_on_hook(
         &state.device.soft_keys,
         state.registration.protocol,
         context.config.timezone_offset_minutes,
+        stop_ringer,
     )
     .await?;
     request_connection_statistics(stream, state, &call, context).await?;
@@ -5073,12 +5272,19 @@ async fn complete_on_hook(
         stored.media.receive.deadline = None;
         stored.media.transmit.state = MediaChannelState::Closed;
         stored.media.transmit.deadline = None;
+        stored.media.transmit_confirmation = TransmitConfirmation::Inactive;
         stored.media.coupled_transmit_endpoint = None;
         stored.video_receive.leg = None;
         stored.video_transmit.leg = None;
     }
     if state.active_call_id == Some(call.call_id) {
         state.active_call_id = None;
+    }
+    if state.ringer_owner == Some(call.call_id) {
+        state.ringer_owner = None;
+    }
+    if let Some((call_id, promote)) = successor {
+        present_incoming_successor(stream, state, call_id, promote).await?;
     }
     Ok(())
 }
@@ -6094,12 +6300,10 @@ async fn handle_session_command(
             line_instance,
             call_id,
             info,
+            presentation,
             ringer,
+            delivery: _,
         } => {
-            if state.cancelled_calls.remove(&call_id) {
-                debug!(device_id = %state.device.id, ?call_id, "discarding incoming call cancelled before it was offered");
-                return Ok(false);
-            }
             let line_instance = normalize_line(state, line_instance.get());
             let statistics_directory_number = statistics_directory_for_call_info(&info).to_owned();
             let caller = match (
@@ -6111,25 +6315,14 @@ async fn handle_session_command(
                 (true, false) => info.calling_number.clone(),
                 (true, true) => "Unknown number".to_owned(),
             };
-            let incoming_state = if state.calls_by_id.values().any(|call| {
-                matches!(
-                    call.state,
-                    CallState::Connected
-                        | CallState::Hold
-                        | CallState::HoldYellow
-                        | CallState::HoldRed
-                )
-            }) {
-                CallState::CallWaiting
-            } else {
-                CallState::RingIn
-            };
+            let incoming_state = presentation.call_state();
             let call = insert_call(state, call_id, line_instance, Codec::Pcmu, incoming_state);
             if incoming_state == CallState::RingIn && state.active_call_id.is_none() {
                 state.active_call_id = Some(call.call_id);
             }
             if let Some(stored) = state.calls_by_id.get_mut(&call.call_id) {
                 stored.statistics_directory_number = statistics_directory_number;
+                stored.ringer = ringer;
             }
             send_message(
                 stream,
@@ -6171,17 +6364,23 @@ async fn handle_session_command(
             )
             .await?;
             if let Some(ringer) = incoming_ringer(ringer, incoming_state) {
-                send_message(
-                    stream,
-                    &ServerMessage::SetRinger {
-                        mode: ringer.mode,
-                        duration: ringer.duration,
-                        line_instance,
-                        call_reference: call.wire_reference,
-                    },
-                    protocol,
-                )
-                .await?;
+                let audible = ringer_is_audible(ringer);
+                if audible || state.ringer_owner.is_none() {
+                    send_message(
+                        stream,
+                        &ServerMessage::SetRinger {
+                            mode: ringer.mode,
+                            duration: ringer.duration,
+                            line_instance,
+                            call_reference: call.wire_reference,
+                        },
+                        protocol,
+                    )
+                    .await?;
+                }
+                if audible {
+                    state.ringer_owner = Some(call.call_id);
+                }
             }
             state.active_key_mode = KeyMode::RingIn;
             send_message(
@@ -7132,6 +7331,12 @@ async fn handle_session_command(
                 | CommandAction::StopRinging { call_id }) => {
                     let enabled = matches!(ringing, CommandAction::StartRinging { .. });
                     let call = require_call(state, call_id)?.clone();
+                    if let Some(stored) = state.calls_by_id.get_mut(&call_id) {
+                        stored.ringer = enabled.then_some(IncomingRing::default());
+                    }
+                    if !enabled && state.ringer_owner != Some(call_id) {
+                        return Ok(false);
+                    }
                     send_message(
                         stream,
                         &ServerMessage::SetRinger {
@@ -7147,6 +7352,17 @@ async fn handle_session_command(
                         protocol,
                     )
                     .await?;
+                    state.ringer_owner = enabled.then_some(call_id);
+                    if !enabled {
+                        let order = *context
+                            .call_answer_order
+                            .read()
+                            .expect("SCCP call-answer-order lock poisoned");
+                        if let Some((call_id, promote)) = incoming_successor(state, call_id, order)
+                        {
+                            present_incoming_successor(stream, state, call_id, promote).await?;
+                        }
+                    }
                 }
                 CommandAction::OpenReceiveChannel {
                     call_id,
@@ -7394,13 +7610,15 @@ async fn handle_session_command(
                     call.media.receive.deadline =
                         Some(Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT);
                     call.media.receive.request = Some(request);
-                    call.media.transmit.telephone_event_payload = telephone_event_payload;
-                    call.media.transmit.peer = None;
-                    call.media.transmit.state = MediaChannelState::Opening;
-                    call.media.transmit.deadline =
-                        Some(Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT);
-                    call.media.transmit.request = Some(request);
                     endpoint.telephone_event_payload = telephone_event_payload;
+                    call.media.transmit.telephone_event_payload = telephone_event_payload;
+                    call.media.transmit.peer = Some(endpoint);
+                    call.media.transmit.state = MediaChannelState::Open;
+                    call.media.transmit.deadline = None;
+                    call.media.transmit.request = Some(request);
+                    call.media.transmit_confirmation = TransmitConfirmation::Awaiting {
+                        deadline: Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT,
+                    };
                     call.media.coupled_transmit_endpoint = Some(endpoint);
                     let call = call.clone();
                     send_message(
@@ -7482,14 +7700,16 @@ async fn handle_session_command(
                     let call = require_call_mut(state, call_id)?;
                     call.media.requested = true;
                     call.media.transmit.telephone_event_payload = telephone_event_payload;
-                    call.media.transmit.peer = None;
-                    call.media.transmit.state = MediaChannelState::Opening;
-                    call.media.transmit.deadline =
-                        Some(Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT);
+                    endpoint.telephone_event_payload = telephone_event_payload;
+                    call.media.transmit.peer = Some(endpoint);
+                    call.media.transmit.state = MediaChannelState::Open;
+                    call.media.transmit.deadline = None;
                     call.media.transmit.request = Some(request);
+                    call.media.transmit_confirmation = TransmitConfirmation::Awaiting {
+                        deadline: Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT,
+                    };
                     call.media.coupled_transmit_endpoint = None;
                     let call = call.clone();
-                    endpoint.telephone_event_payload = telephone_event_payload;
                     send_message(
                         stream,
                         &ServerMessage::StartMediaTransmission {
@@ -7648,6 +7868,7 @@ async fn handle_session_command(
                     {
                         call.media.transmit.state = MediaChannelState::Closed;
                         call.media.transmit.deadline = None;
+                        call.media.transmit_confirmation = TransmitConfirmation::Inactive;
                         call.media.coupled_transmit_endpoint = None;
                         let call = call.clone();
                         send_message(
@@ -7669,6 +7890,20 @@ async fn handle_session_command(
                 }
                 CommandAction::CloseCall { call_id, .. } => {
                     if let Some(call) = state.calls_by_id.get(&call_id).cloned() {
+                        let order = *context
+                            .call_answer_order
+                            .read()
+                            .expect("SCCP call-answer-order lock poisoned");
+                        let successor = incoming_successor(state, call_id, order);
+                        let successor_has_ringer = successor.is_some_and(|(call_id, _)| {
+                            state
+                                .calls_by_id
+                                .get(&call_id)
+                                .and_then(|call| incoming_ringer(call.ringer, CallState::RingIn))
+                                .is_some_and(ringer_is_audible)
+                        });
+                        let stop_ringer = !successor_has_ringer
+                            && state.ringer_owner.is_none_or(|owner| owner == call_id);
                         state.active_key_mode = KeyMode::OnHook;
                         stop_call_multicast(stream, state, call_id, protocol).await?;
                         if call.state != CallState::OnHook {
@@ -7679,11 +7914,18 @@ async fn handle_session_command(
                                 &state.device.soft_keys,
                                 protocol,
                                 context.config.timezone_offset_minutes,
+                                stop_ringer,
                             )
                             .await?;
                             request_connection_statistics(stream, state, &call, context).await?;
                         }
                         remove_call(state, call_id);
+                        if state.ringer_owner == Some(call_id) {
+                            state.ringer_owner = None;
+                        }
+                        if let Some((call_id, promote)) = successor {
+                            present_incoming_successor(stream, state, call_id, promote).await?;
+                        }
                         refresh_mwi_lamps(stream, state, protocol).await?;
                     } else {
                         state.cancelled_calls.insert(call_id);
@@ -7761,6 +8003,112 @@ fn incoming_ringer(
         }
         ringer
     })
+}
+
+const fn ringer_is_audible(ringer: IncomingRing) -> bool {
+    !matches!(ringer.mode, RingerMode::Off | RingerMode::Silent)
+}
+
+fn incoming_successor(
+    state: &SessionState,
+    removed_call_id: CallId,
+    order: CallSelectionOrder,
+) -> Option<(CallId, bool)> {
+    let select = |call_state| {
+        let candidates = state
+            .calls_by_id
+            .values()
+            .filter(|call| call.call_id != removed_call_id && call.state == call_state);
+        match order {
+            CallSelectionOrder::OldestFirst => candidates.min_by_key(|call| call.call_id.0),
+            CallSelectionOrder::LastFirst => candidates.max_by_key(|call| call.call_id.0),
+        }
+    };
+    if let Some(call) = select(CallState::RingIn) {
+        return Some((call.call_id, false));
+    }
+    let has_active_call = state.calls_by_id.values().any(|call| {
+        call.call_id != removed_call_id
+            && matches!(
+                call.state,
+                CallState::Connected | CallState::Hold | CallState::HoldYellow | CallState::HoldRed
+            )
+    });
+    (!has_active_call)
+        .then(|| select(CallState::CallWaiting))
+        .flatten()
+        .map(|call| (call.call_id, true))
+}
+
+async fn present_incoming_successor(
+    stream: &mut dyn StationIo,
+    state: &mut SessionState,
+    call_id: CallId,
+    promote: bool,
+) -> Result<(), ServerError> {
+    if promote && let Some(call) = state.calls_by_id.get_mut(&call_id) {
+        call.state = CallState::RingIn;
+    }
+    let call = state
+        .calls_by_id
+        .get(&call_id)
+        .expect("incoming successor came from session state")
+        .clone();
+    state.active_call_id = Some(call_id);
+    state.active_key_mode = KeyMode::RingIn;
+    if promote {
+        send_message(
+            stream,
+            &ServerMessage::CallState {
+                state: CallState::RingIn,
+                line_instance: call.line_instance,
+                call_reference: call.wire_reference,
+            },
+            state.registration.protocol,
+        )
+        .await?;
+    }
+    send_message(
+        stream,
+        &ServerMessage::SetLamp {
+            stimulus: ButtonType::Line,
+            instance: call.line_instance,
+            mode: LampMode::Blink,
+        },
+        state.registration.protocol,
+    )
+    .await?;
+    if let Some(ringer) = incoming_ringer(call.ringer, CallState::RingIn) {
+        let audible = ringer_is_audible(ringer);
+        if audible || state.ringer_owner.is_none() {
+            send_message(
+                stream,
+                &ServerMessage::SetRinger {
+                    mode: ringer.mode,
+                    duration: ringer.duration,
+                    line_instance: call.line_instance,
+                    call_reference: call.wire_reference,
+                },
+                state.registration.protocol,
+            )
+            .await?;
+        }
+        if audible {
+            state.ringer_owner = Some(call_id);
+        }
+    }
+    send_message(
+        stream,
+        &ServerMessage::SelectSoftKeys {
+            line_instance: call.line_instance,
+            call_reference: call.wire_reference,
+            set: KeyMode::RingIn,
+            valid_mask: state.device.soft_keys.valid_mask(KeyMode::RingIn),
+        },
+        state.registration.protocol,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn request_connection_statistics(
@@ -8419,6 +8767,7 @@ fn insert_call(
         video_receive: VideoReceive::default(),
         video_transmit: VideoTransmit::default(),
         state: call_state,
+        ringer: None,
         history_disposition: if matches!(call_state, CallState::RingIn | CallState::CallWaiting) {
             CallHistoryDisposition::Missed
         } else {
@@ -9240,6 +9589,9 @@ fn remove_call(state: &mut SessionState, call_id: CallId) {
         if state.active_call_id == Some(call_id) {
             state.active_call_id = None;
         }
+        if state.ringer_owner == Some(call_id) {
+            state.ringer_owner = None;
+        }
     }
 }
 
@@ -9376,6 +9728,7 @@ async fn close_call_messages(
     soft_keys: &SoftKeyProfile,
     protocol: ProtocolVersion,
     timezone_offset_minutes: i16,
+    stop_ringer: bool,
 ) -> Result<(), ServerError> {
     send_message(
         stream,
@@ -9438,18 +9791,19 @@ async fn close_call_messages(
         protocol,
     )
     .await?;
-    // Publish the matching OnHook state before stopping alerting.
-    send_message(
-        stream,
-        &ServerMessage::SetRinger {
-            mode: RingerMode::Off,
-            duration: RingDuration::Normal,
-            line_instance: call.line_instance,
-            call_reference: call.wire_reference,
-        },
-        protocol,
-    )
-    .await?;
+    if stop_ringer {
+        send_message(
+            stream,
+            &ServerMessage::SetRinger {
+                mode: RingerMode::Off,
+                duration: RingDuration::Normal,
+                line_instance: call.line_instance,
+                call_reference: call.wire_reference,
+            },
+            protocol,
+        )
+        .await?;
+    }
     Ok(())
 }
 

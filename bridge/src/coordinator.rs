@@ -10,7 +10,7 @@ use sccp_protocol::{
     CommandAction as SccpCommandAction, DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET,
     DEFAULT_AUDIO_PACKET_MS, DeviceEvent, DeviceEventKind, DeviceId, DeviceRegistration, Digit,
     DtmfMode, Event as SccpEvent, LineInstance, MediaEndpoint, MediaStatus, MediaTrafficClass,
-    ServerHandle, SessionGeneration, SoftKey, StationMediaCapabilities,
+    ServerHandle, SessionGeneration, SoftKey, StationMediaCapabilities, TransmitOpenOutcome,
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -377,8 +377,15 @@ impl Coordinator {
                         .await;
                 }
             }
-            DeviceEventKind::TransmitChannelImplied { .. }
-            | DeviceEventKind::TransmitChannelStarted { .. }
+            DeviceEventKind::TransmitChannelOpen {
+                call_id,
+                outcome: TransmitOpenOutcome::Rejected(_),
+                ..
+            } => {
+                self.fail_call(call_id, "Phone rejected media transmission")
+                    .await;
+            }
+            DeviceEventKind::TransmitChannelOpen { .. }
             | DeviceEventKind::MultimediaReceiveChannelOpened { .. }
             | DeviceEventKind::MultimediaReceiveChannelFailed { .. }
             | DeviceEventKind::MultimediaReceiveChannelTimedOut { .. }

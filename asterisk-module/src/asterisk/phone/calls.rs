@@ -114,8 +114,7 @@ fn phone_event_family(event: &PhoneDeviceEventKind) -> PhoneEventFamily {
         | PhoneDeviceEventKind::MultimediaTransmitStarted { .. }
         | PhoneDeviceEventKind::MultimediaTransmitFailed { .. }
         | PhoneDeviceEventKind::MultimediaTransmitTimedOut { .. }
-        | PhoneDeviceEventKind::TransmitChannelImplied { .. }
-        | PhoneDeviceEventKind::TransmitChannelStarted { .. }
+        | PhoneDeviceEventKind::TransmitChannelOpen { .. }
         | PhoneDeviceEventKind::HandsetAcknowledgementTimedOut { .. }
         | PhoneDeviceEventKind::MediaTransmissionFailed { .. }
         | PhoneDeviceEventKind::MulticastReceptionStarted { .. }

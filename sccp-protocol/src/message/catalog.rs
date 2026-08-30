@@ -127,6 +127,7 @@ pub enum FieldFidelity {
 pub enum ResponseExpectation {
     None,
     Message(MessageId),
+    OptionalMessage(MessageId),
     /// The negotiated protocol selects the response identifier.
     VersionSelected {
         /// Response used before `minimum_protocol`.
@@ -353,7 +354,7 @@ message_catalog! {
     (Register => REGISTER, 0x0001, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: Some(PayloadSizeBounds { minimum: 32, maximum: 172 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("device and firmware text are normalized while the exact length-selected layout is retained"), response: ResponseExpectation::Message(MessageId::RegisterAck), verification: ContractVerification::StructuralAndValidated }),
     (IpPort => IP_PORT, 0x0002, StationToControl, ContractMetadata { scope: ContractScope::Supplemental, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (KeypadButton => KEYPAD_BUTTON, 0x0003, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
-    (EnblocCall => ENBLOC_CALL, 0x0004, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
+    (EnblocCall => ENBLOC_CALL, 0x0004, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: Some(PayloadSizeBounds { minimum: 24, maximum: 32 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
     (Stimulus => STIMULUS, 0x0005, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (OffHook => OFF_HOOK, 0x0006, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
     (OnHook => ON_HOOK, 0x0007, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
@@ -365,13 +366,13 @@ message_catalog! {
     (TimeDateRequest => TIME_DATE_REQ, 0x000d, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Empty, fixed_payload_bytes: Some(0), payload_size_bounds: Some(PayloadSizeBounds { minimum: 0, maximum: MAX_FRAME_SIZE - HEADER_SIZE }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("nominally empty request; bounded extension bytes are accepted but not modeled"), response: ResponseExpectation::Message(MessageId::DefineTimeDate), verification: ContractVerification::Structural }),
     (ButtonTemplateRequest => BUTTON_TEMPLATE_REQ, 0x000e, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Empty, fixed_payload_bytes: Some(0), payload_size_bounds: Some(PayloadSizeBounds { minimum: 0, maximum: MAX_FRAME_SIZE - HEADER_SIZE }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("the optional total-button-count request word is accepted but not modeled"), response: ResponseExpectation::Message(MessageId::ButtonTemplate), verification: ContractVerification::Structural }),
     (VersionRequest => VERSION_REQ, 0x000f, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Empty, fixed_payload_bytes: Some(0), payload_size_bounds: Some(PayloadSizeBounds { minimum: 0, maximum: MAX_FRAME_SIZE - HEADER_SIZE }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("nominally empty request; bounded extension bytes are accepted but not modeled"), response: ResponseExpectation::Message(MessageId::Version), verification: ContractVerification::Structural }),
-    (CapabilitiesResponse => CAPABILITIES_RES, 0x0010, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(292), payload_size_bounds: Some(PayloadSizeBounds { minimum: 292, maximum: 292 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("advertised capability count; inactive fixed-array entries are not modeled"), response: ResponseExpectation::None, verification: ContractVerification::Structural }),
+    (CapabilitiesResponse => CAPABILITIES_RES, 0x0010, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: Some(PayloadSizeBounds { minimum: 4, maximum: 388 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("advertised capability count; inactive fixed-reservoir entries are not modeled"), response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
     (MediaPortList => MEDIA_PORT_LIST, 0x0011, StationToControl, ContractMetadata { scope: ContractScope::Supplemental, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(68), payload_size_bounds: Some(PayloadSizeBounds { minimum: 68, maximum: 68 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("inactive fixed-array entries are not modeled"), response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
     (ServerRequest => SERVER_REQ, 0x0012, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Empty, fixed_payload_bytes: Some(0), payload_size_bounds: Some(PayloadSizeBounds { minimum: 0, maximum: MAX_FRAME_SIZE - HEADER_SIZE }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("nominally empty request; bounded extension bytes are accepted but not modeled"), response: ResponseExpectation::Message(MessageId::ServerResponse), verification: ContractVerification::Structural }),
     (Alarm => ALARM, 0x0020, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (MulticastMediaReceptionAck => MULTICAST_MEDIA_RECEPTION_ACK, 0x0021, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(12), payload_size_bounds: Some(PayloadSizeBounds { minimum: 12, maximum: 12 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (OpenReceiveChannelAck => OPEN_RECEIVE_CHANNEL_ACK, 0x0022, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionSelected, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
-    (ConnectionStatisticsResponse => CONNECTION_STATISTICS_RES, 0x0023, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionSelected, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
+    (ConnectionStatisticsResponse => CONNECTION_STATISTICS_RES, 0x0023, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: Some(PayloadSizeBounds { minimum: 61, maximum: 668 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("inactive fixed quality-reservoir bytes are not modeled"), response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
     (OffHookWithCallingParty => OFF_HOOK_WITH_CALLING_PARTY, 0x0024, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (SoftKeySetRequest => SOFT_KEY_SET_REQ, 0x0025, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Empty, fixed_payload_bytes: Some(0), payload_size_bounds: Some(PayloadSizeBounds { minimum: 0, maximum: MAX_FRAME_SIZE - HEADER_SIZE }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("nominally empty request; bounded extension bytes are accepted but not modeled"), response: ResponseExpectation::Message(MessageId::SoftKeySetResponse), verification: ContractVerification::Structural }),
     (SoftKeyEvent => SOFT_KEY_EVENT, 0x0026, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
@@ -414,7 +415,7 @@ message_catalog! {
     (SetHookFlashDetect => SET_HOOK_FLASH_DETECT, 0x0087, ControlToStation, ContractMetadata { scope: ContractScope::Supplemental, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(0), payload_size_bounds: Some(PayloadSizeBounds { minimum: 0, maximum: 0 }), runtime_use: RuntimeUse::TypedButNotEmitted, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (SetSpeakerMode => SET_SPEAKER_MODE, 0x0088, ControlToStation, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::ConditionalServerOutput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (SetMicrophoneMode => SET_MICROPHONE_MODE, 0x0089, ControlToStation, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::ConditionalServerOutput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
-    (StartMediaTransmission => START_MEDIA_TRANSMISSION, 0x008a, ControlToStation, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionSelected, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::ConditionalServerOutput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::Message(MessageId::StartMediaTransmissionAck), verification: ContractVerification::StructuralAndValidated }),
+    (StartMediaTransmission => START_MEDIA_TRANSMISSION, 0x008a, ControlToStation, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionSelected, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::ConditionalServerOutput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::OptionalMessage(MessageId::StartMediaTransmissionAck), verification: ContractVerification::StructuralAndValidated }),
     (StopMediaTransmission => STOP_MEDIA_TRANSMISSION, 0x008b, ControlToStation, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(16), payload_size_bounds: Some(PayloadSizeBounds { minimum: 16, maximum: 16 }), runtime_use: RuntimeUse::ConditionalServerOutput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (StartMediaReception => START_MEDIA_RECEPTION, 0x008c, ControlToStation, ContractMetadata { scope: ContractScope::Supplemental, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(0), payload_size_bounds: Some(PayloadSizeBounds { minimum: 0, maximum: 0 }), runtime_use: RuntimeUse::TypedButNotEmitted, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (StopMediaReception => STOP_MEDIA_RECEPTION, 0x008d, ControlToStation, ContractMetadata { scope: ContractScope::Supplemental, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(8), payload_size_bounds: Some(PayloadSizeBounds { minimum: 8, maximum: 8 }), runtime_use: RuntimeUse::TypedButNotEmitted, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
@@ -603,7 +604,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "c90f9e1a9d000e75b5db873d5ea9b86e29d1f9c78c43be52f200a77f38a60cb6"
+            "3cdd3d739a3410bf32ab91e1effc09762b6a696a0304f51e8735e51439a83eb3"
         );
     }
 
@@ -762,15 +763,29 @@ mod tests {
         }
 
         let capabilities = MessageId::CapabilitiesResponse.contract().unwrap();
-        assert_eq!(capabilities.payload_layout, PayloadLayout::Fixed);
-        assert_eq!(capabilities.fixed_payload_bytes, Some(292));
+        assert_eq!(
+            capabilities.payload_layout,
+            PayloadLayout::VersionAndLengthSelected
+        );
+        assert_eq!(capabilities.fixed_payload_bytes, None);
         assert_eq!(
             capabilities.payload_size_bounds,
             Some(PayloadSizeBounds {
-                minimum: 292,
-                maximum: 292,
+                minimum: 4,
+                maximum: 388,
             })
         );
+
+        for (id, minimum, maximum) in [
+            (MessageId::EnblocCall, 24, 32),
+            (MessageId::ConnectionStatisticsResponse, 61, 668),
+        ] {
+            assert_eq!(
+                id.contract().unwrap().payload_size_bounds,
+                Some(PayloadSizeBounds { minimum, maximum }),
+                "{id}"
+            );
+        }
 
         let call_count = MessageId::CallCountRequest.contract().unwrap();
         assert_eq!(
@@ -969,6 +984,14 @@ mod tests {
         assert_eq!(
             open.response,
             ResponseExpectation::Message(MessageId::OpenReceiveChannelAck)
+        );
+
+        assert_eq!(
+            MessageId::StartMediaTransmission
+                .contract()
+                .unwrap()
+                .response,
+            ResponseExpectation::OptionalMessage(MessageId::StartMediaTransmissionAck)
         );
 
         for id in [

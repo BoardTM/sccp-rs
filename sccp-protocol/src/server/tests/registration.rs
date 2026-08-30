@@ -39,11 +39,7 @@ async fn short_registration_prefixes_negotiate_from_field_presence() {
     for (payload_bytes, advertised_protocol, expected_protocol) in [
         (36, None, ProtocolVersion::V3),
         (44, Some(0), ProtocolVersion::V3),
-        (
-            64,
-            Some(ProtocolVersion::V11.wire()),
-            ProtocolVersion::V11,
-        ),
+        (64, Some(ProtocolVersion::V11.wire()), ProtocolVersion::V11),
     ] {
         let config = ServerConfig {
             bind: "127.0.0.1:0".parse().unwrap(),

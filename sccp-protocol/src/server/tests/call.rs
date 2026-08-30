@@ -1,5 +1,68 @@
 use super::support::*;
 
+struct FinalPromptGate {
+    inner: tokio::io::DuplexStream,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+    waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+}
+
+impl tokio::io::AsyncRead for FinalPromptGate {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl tokio::io::AsyncWrite for FinalPromptGate {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let message_id = bytes
+            .get(8..12)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_le_bytes);
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst)
+            && message_id == Some(wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS)
+        {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "injected final-prompt write failure",
+                )));
+            }
+            if self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::pin::Pin::new(&mut self.inner).poll_write(context, bytes);
+            }
+            self.blocked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            *self.waker.lock().unwrap() = Some(context.waker().clone());
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(context, bytes)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
 #[test]
 fn last_number_uses_the_configured_terminator_recording_policy() {
     let without_terminator = ServerConfig {
@@ -1850,6 +1913,61 @@ fn distinct_and_urgent_ring_modes_preserve_exact_waiting_semantics() {
         })
     );
     assert_eq!(incoming_ringer(None, CallState::CallWaiting), None);
+    assert!(ringer_is_audible(IncomingRing::default()));
+    assert!(!ringer_is_audible(IncomingRing {
+        mode: RingerMode::Silent,
+        duration: RingDuration::Single,
+    }));
+}
+
+#[test]
+fn call_waiting_never_owns_an_audible_ring_and_promotes_after_active_cleanup() {
+    let device = definition();
+    let registration = DeviceRegistration {
+        id: device.id.clone(),
+        peer: "127.0.0.1:2000".parse().unwrap(),
+        transport: StationTransport::Clear,
+        reported_address: Some(Ipv4Addr::LOCALHOST),
+        reported_ipv6_address: None,
+        device_type: DeviceType::Cisco7962,
+        protocol: ProtocolVersion::V22,
+        firmware: "test".into(),
+    };
+    let mut state = SessionState::new(
+        device,
+        registration,
+        PhoneFeatures::default(),
+        SessionGeneration::new(1).unwrap(),
+    );
+    let active = insert_call(&mut state, CallId(1), 1, Codec::Pcmu, CallState::Connected);
+    let waiting = insert_call(
+        &mut state,
+        CallId(2),
+        1,
+        Codec::Pcmu,
+        CallState::CallWaiting,
+    );
+    state.calls_by_id.get_mut(&waiting.call_id).unwrap().ringer = Some(IncomingRing::default());
+    state.ringer_owner = Some(CallId(9));
+
+    let waiting_projection = incoming_ringer(
+        state.calls_by_id[&waiting.call_id].ringer,
+        CallState::CallWaiting,
+    )
+    .unwrap();
+    assert!(!ringer_is_audible(waiting_projection));
+    assert_eq!(state.ringer_owner, Some(CallId(9)));
+    assert_eq!(
+        incoming_successor(&state, active.call_id, CallSelectionOrder::OldestFirst),
+        Some((waiting.call_id, true))
+    );
+    assert!(ringer_is_audible(
+        incoming_ringer(
+            state.calls_by_id[&waiting.call_id].ringer,
+            CallState::RingIn,
+        )
+        .unwrap()
+    ));
 }
 
 #[test]
@@ -1995,6 +2113,208 @@ fn synchronous_offer_and_hangup_commands_cannot_overtake_each_other() {
                 call_id: closed_call,
             } } if closed_device == &device_id && *closed_call == call_id)
     ));
+}
+
+#[tokio::test]
+async fn exact_session_offer_receipts_distinguish_stale_and_missing_sessions() {
+    let config = ServerConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        advertised_address: Ipv4Addr::LOCALHOST,
+        ..ServerConfig::default()
+    };
+    let device = definition();
+    let device_id = device.id.clone();
+    let (server, handle, _events) = Server::bind(config, [device]).await.unwrap();
+    let (session_tx, _session_rx) = mpsc::channel(4);
+    server.sessions.lock().await.insert(
+        device_id.clone(),
+        SessionSender {
+            generation: SessionGeneration::new(2).unwrap(),
+            anonymous_hotline: false,
+            tx: session_tx,
+        },
+    );
+    let task = tokio::spawn(server.run());
+    let info = CallInfo {
+        direction: crate::types::CallDirection::Inbound,
+        calling_name: "Caller".into(),
+        calling_number: "1002".into(),
+        called_name: "Desk".into(),
+        called_number: "1001".into(),
+        ..CallInfo::default()
+    };
+
+    let stale = handle
+        .try_offer_incoming_call_for_session(
+            StationSessionTarget::new(device_id.clone(), SessionGeneration::new(1).unwrap()),
+            LineInstance::new(1),
+            CallId(40),
+            info.clone(),
+            IncomingPresentation::RingIn,
+            Some(IncomingRing::default()),
+        )
+        .unwrap();
+    assert_eq!(
+        stale.wait().await.unwrap(),
+        IncomingOfferDelivery::SessionStale {
+            actual_generation: SessionGeneration::new(2).unwrap(),
+        }
+    );
+
+    let missing = handle
+        .try_offer_incoming_call_for_session(
+            StationSessionTarget::new(
+                DeviceId::new("SEPAABBCCDDEEFF").unwrap(),
+                SessionGeneration::new(1).unwrap(),
+            ),
+            LineInstance::new(1),
+            CallId(41),
+            info,
+            IncomingPresentation::CallWaiting,
+            Some(IncomingRing::default()),
+        )
+        .unwrap();
+    assert_eq!(
+        missing.wait().await.unwrap(),
+        IncomingOfferDelivery::SessionMissing
+    );
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn incoming_offer_receipt_waits_for_final_prompt_and_reports_tombstones() {
+    let config = ServerConfig {
+        advertised_address: Ipv4Addr::LOCALHOST,
+        ..ServerConfig::default()
+    };
+    let (server, handle, mut events, ingress) =
+        Server::with_ingress(config, [definition()]).unwrap();
+    let task = tokio::spawn(server.run());
+    let (inner, mut phone) = tokio::io::duplex(8_192);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waker = Arc::new(std::sync::Mutex::new(None));
+    ingress
+        .accept(
+            FinalPromptGate {
+                inner,
+                armed: Arc::clone(&armed),
+                blocked: Arc::clone(&blocked),
+                released: Arc::clone(&released),
+                fail: Arc::clone(&fail),
+                waker: Arc::clone(&waker),
+            },
+            SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    let protocol = ProtocolVersion::V22;
+    phone.write_all(&register_bytes(protocol)).await.unwrap();
+    let mut decoder = FrameDecoder::new();
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+    let generation = match events.recv().await {
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::Registered(_),
+            ..
+        })) => session_generation,
+        event => panic!("expected registration, got {event:?}"),
+    };
+    let info = CallInfo {
+        direction: crate::types::CallDirection::Inbound,
+        calling_name: "Caller".into(),
+        calling_number: "1002".into(),
+        called_name: "Desk".into(),
+        called_number: "1001".into(),
+        ..CallInfo::default()
+    };
+    let device_id = definition().id;
+
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut receipt = handle
+        .try_offer_incoming_call_for_session(
+            StationSessionTarget::new(device_id.clone(), generation),
+            LineInstance::new(1),
+            CallId(50),
+            info.clone(),
+            IncomingPresentation::RingIn,
+            Some(IncomingRing::default()),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !blocked.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(receipt.try_recv().unwrap(), None);
+    released.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(waker) = waker.lock().unwrap().take() {
+        waker.wake();
+    }
+    assert_eq!(
+        receipt.wait().await.unwrap(),
+        IncomingOfferDelivery::Presented
+    );
+    read_until_message(
+        &mut phone,
+        &mut decoder,
+        wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS,
+    )
+    .await;
+
+    handle
+        .send_confirmed(Command::new(
+            device_id.clone(),
+            CommandAction::CloseCall {
+                call_id: CallId(51),
+            },
+        ))
+        .await
+        .unwrap();
+    let cancelled = handle
+        .try_offer_incoming_call_for_session(
+            StationSessionTarget::new(device_id.clone(), generation),
+            LineInstance::new(1),
+            CallId(51),
+            info,
+            IncomingPresentation::CallWaiting,
+            Some(IncomingRing::default()),
+        )
+        .unwrap();
+    assert_eq!(
+        cancelled.wait().await.unwrap(),
+        IncomingOfferDelivery::CancelledBeforePresentation
+    );
+
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed = handle
+        .try_offer_incoming_call_for_session(
+            StationSessionTarget::new(device_id, generation),
+            LineInstance::new(1),
+            CallId(52),
+            CallInfo {
+                direction: crate::types::CallDirection::Inbound,
+                ..CallInfo::default()
+            },
+            IncomingPresentation::RingIn,
+            Some(IncomingRing::default()),
+        )
+        .unwrap();
+    assert_eq!(
+        failed.wait().await.unwrap(),
+        IncomingOfferDelivery::WriteFailed
+    );
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[test]

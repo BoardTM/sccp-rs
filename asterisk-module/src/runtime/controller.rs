@@ -1066,7 +1066,7 @@ pub enum CodecPreferenceRejection {
 pub struct RegisteredDevice {
     pub registration: DeviceRegistration,
     pub session_generation: SessionGeneration,
-    pub capabilities: StationMediaCapabilities,
+    pub capabilities: Option<StationMediaCapabilities>,
     pub audio_encryption: StationEncryptionCapabilities,
     pub selected_line: Option<u32>,
     active_call: Option<CallId>,
@@ -1207,7 +1207,7 @@ impl Controller {
         else {
             return false;
         };
-        state.capabilities = capabilities;
+        state.capabilities = Some(capabilities);
         true
     }
 

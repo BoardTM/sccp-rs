@@ -36,6 +36,25 @@ pub struct CliCapability {
     pub max_frames_per_packet: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CliCapabilityStatus {
+    Unavailable,
+    Pending,
+    ReportedEmpty,
+    Ready,
+}
+
+impl CliCapabilityStatus {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Pending => "pending",
+            Self::ReportedEmpty => "reported empty",
+            Self::Ready => "ready",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliFeature {
     pub name: String,
@@ -45,6 +64,7 @@ pub struct CliFeature {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliDeviceRuntime {
     pub device_id: DeviceId,
+    pub capability_status: CliCapabilityStatus,
     pub capabilities: Vec<CliCapability>,
     pub features: Vec<CliFeature>,
 }
@@ -247,10 +267,14 @@ impl CliInventoryRequest {
             }
             Self::DeviceCapabilities(device, index) => {
                 find_device(snapshot, &device)?;
-                let capabilities = find_device_runtime(snapshot, &device)
+                let runtime = find_device_runtime(snapshot, &device);
+                let status = runtime.map_or(CliCapabilityStatus::Unavailable, |runtime| {
+                    runtime.capability_status
+                });
+                let capabilities = runtime
                     .map(|runtime| runtime.capabilities.as_slice())
                     .unwrap_or_default();
-                render_selected_capabilities(&mut output, capabilities, index)?;
+                render_selected_capabilities(&mut output, status, capabilities, index)?;
             }
             Self::DeviceFeatures(device, name) => {
                 find_device(snapshot, &device)?;
@@ -621,6 +645,10 @@ fn render_device(
         runtime.map_or(0, |runtime| runtime.capabilities.len()),
     )?;
     output.field(
+        "Capability status",
+        runtime.map_or("unavailable", |runtime| runtime.capability_status.label()),
+    )?;
+    output.field(
         "Features",
         runtime.map_or(0, |runtime| runtime.features.len()),
     )?;
@@ -759,9 +787,11 @@ fn render_button(output: &mut CliOutput, item: &InventoryButton) -> Result<(), C
 
 fn render_selected_capabilities(
     output: &mut CliOutput,
+    status: CliCapabilityStatus,
     capabilities: &[CliCapability],
     index: Option<usize>,
 ) -> Result<(), CliInventoryError> {
+    output.field("Status", status.label())?;
     if let Some(index) = index {
         let item = capabilities
             .get(index - 1)
@@ -969,6 +999,7 @@ mod tests {
             },
             device_runtime: vec![CliDeviceRuntime {
                 device_id: first,
+                capability_status: CliCapabilityStatus::Ready,
                 capabilities: vec![
                     CliCapability {
                         codec: Codec::G729,
@@ -1023,6 +1054,7 @@ mod tests {
             1
         );
         assert_eq!(device_detail.matches("Description: First\n").count(), 1);
+        assert!(device_detail.contains("Capability status: ready"));
 
         let button = render_cli_inventory(
             CliInventoryCommand::Devices,
@@ -1056,6 +1088,7 @@ mod tests {
             &snapshot,
         )
         .unwrap();
+        assert!(capabilities.contains("Status: ready"));
         assert!(capabilities.contains("1\tPcmu"));
         assert!(capabilities.contains("2\tG729"));
 
@@ -1074,6 +1107,30 @@ mod tests {
         )
         .unwrap();
         assert!(feature.contains("Value: <redacted>"));
+    }
+
+    #[test]
+    fn capability_views_distinguish_unavailable_pending_empty_and_ready_states() {
+        for (status, expected) in [
+            (CliCapabilityStatus::Unavailable, "unavailable"),
+            (CliCapabilityStatus::Pending, "pending"),
+            (CliCapabilityStatus::ReportedEmpty, "reported empty"),
+            (CliCapabilityStatus::Ready, "ready"),
+        ] {
+            let mut snapshot = snapshot();
+            let runtime = snapshot.device_runtime.first_mut().unwrap();
+            runtime.capability_status = status;
+            if status != CliCapabilityStatus::Ready {
+                runtime.capabilities.clear();
+            }
+            let capabilities = render_cli_inventory(
+                CliInventoryCommand::Devices,
+                &["SEP001122334455", "capabilities"],
+                &snapshot,
+            )
+            .unwrap();
+            assert!(capabilities.contains(&format!("Status: {expected}")));
+        }
     }
 
     #[test]

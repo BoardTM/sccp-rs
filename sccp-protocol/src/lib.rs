@@ -176,13 +176,14 @@ pub use qos::{
 pub use server::{
     AnonymousHotlineDefinition, CallSelectionOrder, Command, CommandAction, DeviceEvent,
     DeviceEventKind, DoNotDisturbButtonMode, DoNotDisturbMode, Event, HandsetAcknowledgement,
-    HandsetStatusMessage, IncomingRing, MAX_REGISTRATION_BACKOFF, MIN_REGISTRATION_BACKOFF,
-    MediaStatisticsSnapshot, MulticastMediaRoute, MultimediaReceiveDescriptor,
-    MultimediaTransmitControl, MultimediaTransmitDescriptor, PARKING_MENU_MAX_ITEMS,
-    ParkingMenuEntry, ReconfigureResult, RegistrationFallback, RegistrationTokenPolicy, Server,
-    ServerConfig, ServerError, ServerHandle, ServerIngress, SignalingServerRoute, SignalingSocket,
-    SocketQosFailure, SocketQosMark, SocketQosPolicy, SocketQosReport, StationIo, StationSocketQos,
-    VideoPictureReference, VideoPictureReferences, apply_socket_qos,
+    HandsetStatusMessage, IncomingOfferDelivery, IncomingOfferReceipt, IncomingPresentation,
+    IncomingRing, MAX_REGISTRATION_BACKOFF, MIN_REGISTRATION_BACKOFF, MediaStatisticsSnapshot,
+    MulticastMediaRoute, MultimediaReceiveDescriptor, MultimediaTransmitControl,
+    MultimediaTransmitDescriptor, PARKING_MENU_MAX_ITEMS, ParkingMenuEntry, ReconfigureResult,
+    RegistrationFallback, RegistrationTokenPolicy, Server, ServerConfig, ServerError, ServerHandle,
+    ServerIngress, SignalingServerRoute, SignalingSocket, SocketQosFailure, SocketQosMark,
+    SocketQosPolicy, SocketQosReport, StationIo, StationSessionTarget, StationSocketQos,
+    TransmitOpenOutcome, VideoPictureReference, VideoPictureReferences, apply_socket_qos,
 };
 pub use types::{
     AddonModuleDefinition, AppearanceId, AppearanceRingMode, ApplicationId, AudioProcessingPolicy,

@@ -865,6 +865,7 @@ async fn coupled_media_configuration_never_sends_a_second_transmit_request() {
         vec![
             PbxEffect::ConfigureMediaOnly {
                 call_id: PbxCallId(1),
+                device_id: binding().device_id,
                 codec: Codec::Pcmu,
                 remote: endpoint,
             }

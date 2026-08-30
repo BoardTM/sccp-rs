@@ -148,6 +148,7 @@ impl Controller {
         let configure = if outbound_hole_punch {
             PbxEffect::ConfigureMediaOnly {
                 call_id: pbx_id,
+                device_id,
                 codec,
                 remote: endpoint,
             }
@@ -468,7 +469,7 @@ impl Controller {
     }
 
     pub fn refresh_video_for_pbx(&self, pbx_id: PbxCallId) -> Vec<DriverEffect> {
-        let Some(call) = self.call_by_pbx(pbx_id) else {
+        let Some(call) = self.active_call_by_pbx(pbx_id) else {
             return Vec::new();
         };
         let Some(appearance) = self.appearance_for_call(call.sccp_id) else {
@@ -817,11 +818,12 @@ impl Controller {
     ) -> bool {
         codec.kind() == CodecKind::Audio
             && self.devices.get(device).is_some_and(|state| {
-                state
-                    .capabilities
-                    .audio()
-                    .iter()
-                    .any(|capability| capability.codec == codec)
+                state.capabilities.as_ref().is_some_and(|capabilities| {
+                    capabilities
+                        .audio()
+                        .iter()
+                        .any(|capability| capability.codec == codec)
+                })
             })
     }
 }

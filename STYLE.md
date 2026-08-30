@@ -11,6 +11,7 @@ guide:
 - Prefer idiomatic Rust representations of protocol variation over parallel,
   version-specific structs.
 - Do not add comments that merely restate obvious code.
+- Do not keep around old structs / enums when refactoring, we don't want "BlaLegacy" for "compatibility purposes"
 
 ## Design priorities
 

@@ -2,34 +2,25 @@
 
 use super::*;
 
-fn decode_connection_statistics_v22_quality(
+const PRE_19_CONNECTION_STATISTICS_PREFIX_BYTES: usize = 64;
+const ALIGNED_CONNECTION_STATISTICS_PREFIX_BYTES: usize = 68;
+const PACKED_CONNECTION_STATISTICS_BASE_BYTES: usize = 61;
+const PACKED_CONNECTION_STATISTICS_PREFIX_BYTES: usize = 65;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionStatisticsWireLayout {
+    Pre19,
+    Aligned,
+    Packed,
+}
+
+fn decode_connection_statistics_quality(
     payload: &[u8],
+    prefix_bytes: usize,
+    quality_size: u32,
     message_id: u32,
 ) -> Result<Vec<u8>, CodecError> {
-    const PREFIX_BYTES: usize = 61;
-    if payload.len() < PREFIX_BYTES {
-        return Err(CodecError::Truncated {
-            message_id,
-            needed: PREFIX_BYTES,
-            actual: payload.len(),
-        });
-    }
-    let suffix = &payload[PREFIX_BYTES..];
-    if suffix.len() < 4 {
-        if suffix.iter().any(|byte| *byte != 0) {
-            return Err(CodecError::Truncated {
-                message_id,
-                needed: PREFIX_BYTES + 4,
-                actual: payload.len(),
-            });
-        }
-        return Ok(Vec::new());
-    }
-    let quality_size = usize_from_wire(
-        message_id,
-        "quality statistics",
-        u32::from_le_bytes(suffix[..4].try_into().expect("validated quality-size word")),
-    )?;
+    let quality_size = usize_from_wire(message_id, "quality statistics", quality_size)?;
     if quality_size > CONNECTION_QUALITY_MAX_BYTES {
         return Err(CodecError::CountTooLarge {
             message_id,
@@ -38,22 +29,34 @@ fn decode_connection_statistics_v22_quality(
             maximum: CONNECTION_QUALITY_MAX_BYTES,
         });
     }
-    let needed = PREFIX_BYTES + 4 + quality_size;
-    if payload.len() < needed {
+    let meaningful_end = prefix_bytes
+        .checked_add(quality_size)
+        .ok_or(CodecError::InvalidLength(message_id))?;
+    if payload.len() < meaningful_end {
         return Err(CodecError::Truncated {
             message_id,
-            needed,
+            needed: meaningful_end,
             actual: payload.len(),
         });
     }
-    let padding = &payload[needed..];
-    if padding.len() > 3 || padding.iter().any(|byte| *byte != 0) {
+    let reservoir_end = prefix_bytes + CONNECTION_QUALITY_MAX_BYTES;
+    let suffix = &payload[meaningful_end..];
+    let fixed_reservoir_padding = (4 - reservoir_end % 4) % 4;
+    if payload.len() >= reservoir_end && payload.len() <= reservoir_end + fixed_reservoir_padding {
+        validate_zero_payload(
+            &payload[reservoir_end..],
+            message_id,
+            payload.len() - reservoir_end,
+        )?;
+    } else if suffix.len() <= 3 {
+        validate_zero_payload(suffix, message_id, suffix.len())?;
+    } else {
         return Err(CodecError::TrailingBytes {
             message_id,
-            count: padding.len(),
+            count: suffix.len(),
         });
     }
-    Ok(payload[PREFIX_BYTES + 4..needed].to_vec())
+    Ok(payload[prefix_bytes..meaningful_end].to_vec())
 }
 
 fn connection_statistics_from_wire<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
@@ -85,41 +88,117 @@ pub(super) fn decode_connection_statistics(
     protocol: u32,
     message_id: u32,
 ) -> Result<ConnectionStatistics, CodecError> {
+    fn select_layout(
+        first: Result<ConnectionStatistics, CodecError>,
+        second: Result<ConnectionStatistics, CodecError>,
+        prefer_first_error: bool,
+        payload_bytes: usize,
+        message_id: u32,
+    ) -> Result<ConnectionStatistics, CodecError> {
+        match (first, second) {
+            (Ok(first), Ok(second)) if first == second => Ok(first),
+            (Ok(_), Ok(_)) => Err(CodecError::InvalidValue {
+                message_id,
+                field: "ambiguous connection-statistics layout",
+                value: payload_bytes as u64,
+            }),
+            (Ok(statistics), Err(_)) | (Err(_), Ok(statistics)) => Ok(statistics),
+            (Err(error), Err(_)) if prefer_first_error => Err(error),
+            (Err(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn decode_layout(
+        layout: ConnectionStatisticsWireLayout,
+        payload: &[u8],
+        message_id: u32,
+    ) -> Result<ConnectionStatistics, CodecError> {
+        match layout {
+            ConnectionStatisticsWireLayout::Pre19 => {
+                let value: WireConnectionStatisticsV3Prefix = decode_prefix(message_id, payload)?;
+                let quality = decode_connection_statistics_quality(
+                    payload,
+                    PRE_19_CONNECTION_STATISTICS_PREFIX_BYTES,
+                    value.statistics.quality_size,
+                    message_id,
+                )?;
+                connection_statistics_from_wire(
+                    value.directory_number,
+                    value.call_reference,
+                    value.processing.to_wire(),
+                    value.statistics.counters,
+                    quality,
+                    message_id,
+                )
+            }
+            ConnectionStatisticsWireLayout::Aligned => {
+                let value: WireConnectionStatisticsV19Prefix = decode_prefix(message_id, payload)?;
+                let quality = decode_connection_statistics_quality(
+                    payload,
+                    ALIGNED_CONNECTION_STATISTICS_PREFIX_BYTES,
+                    value.statistics.quality_size,
+                    message_id,
+                )?;
+                connection_statistics_from_wire(
+                    value.directory_number,
+                    value.call_reference,
+                    value.processing.to_wire(),
+                    value.statistics.counters,
+                    quality,
+                    message_id,
+                )
+            }
+            ConnectionStatisticsWireLayout::Packed => {
+                let base: WireConnectionStatisticsPackedBase = decode_prefix(message_id, payload)?;
+                let quality = match payload.len() {
+                    PACKED_CONNECTION_STATISTICS_BASE_BYTES..=64 => {
+                        validate_zero_payload(
+                            &payload[PACKED_CONNECTION_STATISTICS_BASE_BYTES..],
+                            message_id,
+                            payload.len() - PACKED_CONNECTION_STATISTICS_BASE_BYTES,
+                        )?;
+                        Vec::new()
+                    }
+                    _ => {
+                        let value: WireConnectionStatisticsPackedPrefix =
+                            decode_prefix(message_id, payload)?;
+                        decode_connection_statistics_quality(
+                            payload,
+                            PACKED_CONNECTION_STATISTICS_PREFIX_BYTES,
+                            value.quality_size,
+                            message_id,
+                        )?
+                    }
+                };
+                connection_statistics_from_wire(
+                    base.directory_number,
+                    base.call_reference,
+                    base.processing.to_wire(),
+                    base.counters,
+                    quality,
+                    message_id,
+                )
+            }
+        }
+    }
+
     match protocol {
-        22.. => {
-            let value: WireConnectionStatisticsV22Prefix = decode_prefix(message_id, payload)?;
-            let quality = decode_connection_statistics_v22_quality(payload, message_id)?;
-            connection_statistics_from_wire(
-                value.directory_number,
-                value.call_reference,
-                value.processing.to_wire(),
-                value.counters,
-                quality,
-                message_id,
-            )
-        }
-        19..=21 => {
-            let value: WireConnectionStatisticsV19 = decode_zero_padded(message_id, payload)?;
-            connection_statistics_from_wire(
-                value.directory_number,
-                value.call_reference,
-                value.processing.to_wire(),
-                value.statistics.counters,
-                value.quality,
-                message_id,
-            )
-        }
-        _ => {
-            let value: WireConnectionStatisticsV3 = decode_zero_padded(message_id, payload)?;
-            connection_statistics_from_wire(
-                value.directory_number,
-                value.call_reference,
-                value.processing.to_wire(),
-                value.statistics.counters,
-                value.quality,
-                message_id,
-            )
-        }
+        ..=18 => decode_layout(ConnectionStatisticsWireLayout::Pre19, payload, message_id),
+        19 => select_layout(
+            decode_layout(ConnectionStatisticsWireLayout::Pre19, payload, message_id),
+            decode_layout(ConnectionStatisticsWireLayout::Aligned, payload, message_id),
+            payload.len() < ALIGNED_CONNECTION_STATISTICS_PREFIX_BYTES,
+            payload.len(),
+            message_id,
+        ),
+        20..=21 => decode_layout(ConnectionStatisticsWireLayout::Aligned, payload, message_id),
+        22.. => select_layout(
+            decode_layout(ConnectionStatisticsWireLayout::Aligned, payload, message_id),
+            decode_layout(ConnectionStatisticsWireLayout::Packed, payload, message_id),
+            payload.len().is_multiple_of(4),
+            payload.len(),
+            message_id,
+        ),
     }
 }
 

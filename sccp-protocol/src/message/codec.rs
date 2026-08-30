@@ -1235,11 +1235,7 @@ fn validate_registration_fields(
             "active conferences",
         ),
         (
-            omits(64)
-                && wire
-                    .mac_address_and_padding
-                    .iter()
-                    .any(|byte| *byte != 0),
+            omits(64) && wire.mac_address_and_padding.iter().any(|byte| *byte != 0),
             "MAC address and padding",
         ),
         (
@@ -1255,10 +1251,7 @@ fn validate_registration_fields(
             omits(92) && wire.ipv6_address_scope != 0,
             "IPv6 address scope",
         ),
-        (
-            omits(124) && !registration.firmware.is_empty(),
-            "firmware",
-        ),
+        (omits(124) && !registration.firmware.is_empty(), "firmware"),
         (
             omits(124) && !registration.configuration_version_stamp.is_empty(),
             "configuration version stamp",
@@ -1313,9 +1306,43 @@ struct WireKeypadButton {
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireEnbloc<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize> {
+struct WireEnblocWithoutLine {
+    called_party: WireFixedText<24>,
+}
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireEnblocWithLine<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize> {
     called_party: WireAlignedText<TEXT_BYTES, ALIGNMENT_BYTES>,
     line_instance: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnblocWireLayout {
+    WithoutLine,
+    Line24,
+    Line25Packed,
+    Line25Candidates,
+}
+
+impl EnblocWireLayout {
+    fn select(protocol: u32, payload_bytes: usize, message_id: u32) -> Result<Self, CodecError> {
+        match (protocol, payload_bytes) {
+            (..=16, 24) => Ok(Self::WithoutLine),
+            (17.., 28) => Ok(Self::Line24),
+            (19.., 29..=31) => Ok(Self::Line25Packed),
+            (19.., 32) => Ok(Self::Line25Candidates),
+            _ => Err(CodecError::InvalidLength(message_id)),
+        }
+    }
+
+    const fn canonical(protocol: u32) -> Self {
+        match protocol {
+            ..=16 => Self::WithoutLine,
+            17..=18 => Self::Line24,
+            19.. => Self::Line25Packed,
+        }
+    }
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
@@ -1334,7 +1361,9 @@ words!(WireStimulus {
     status
 });
 
-const CAPABILITIES_RESPONSE_MAX_ENTRIES: usize = 18;
+const CAPABILITIES_RESPONSE_STANDARD_ENTRIES: usize = 18;
+const CAPABILITIES_RESPONSE_EXTENDED_ENTRIES: usize = 24;
+const CAPABILITIES_RESPONSE_MAX_ENTRIES: usize = CAPABILITIES_RESPONSE_EXTENDED_ENTRIES;
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[brw(little)]
@@ -1344,11 +1373,23 @@ struct WireMediaCapability {
     codec_parameters: [u8; 8],
 }
 
-#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
-#[brw(little)]
-struct WireCapabilitiesResponse {
-    count: u32,
-    capabilities: [WireMediaCapability; CAPABILITIES_RESPONSE_MAX_ENTRIES],
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapabilitiesResponseWireLayout {
+    Standard,
+    Extended,
+}
+
+impl CapabilitiesResponseWireLayout {
+    const fn entries(self) -> usize {
+        match self {
+            Self::Standard => CAPABILITIES_RESPONSE_STANDARD_ENTRIES,
+            Self::Extended => CAPABILITIES_RESPONSE_EXTENDED_ENTRIES,
+        }
+    }
+
+    const fn payload_bytes(self) -> usize {
+        4 + self.entries() * 16
+    }
 }
 
 #[derive(BinRead, BinWrite, Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1699,29 +1740,16 @@ trait WireStatisticsProcessing:
     + PartialEq
     + 'static
 {
-    fn from_wire(value: u32, message_id: u32) -> Result<Self, CodecError>;
     fn to_wire(self) -> u32;
 }
 
 impl WireStatisticsProcessing for u32 {
-    fn from_wire(value: u32, _message_id: u32) -> Result<Self, CodecError> {
-        Ok(value)
-    }
-
     fn to_wire(self) -> u32 {
         self
     }
 }
 
 impl WireStatisticsProcessing for u8 {
-    fn from_wire(value: u32, message_id: u32) -> Result<Self, CodecError> {
-        u8::try_from(value).map_err(|_| CodecError::InvalidValue {
-            message_id,
-            field: "processing",
-            value: u64::from(value),
-        })
-    }
-
     fn to_wire(self) -> u32 {
         u32::from(self)
     }
@@ -1744,22 +1772,44 @@ struct WireConnectionStatistics<
 
 type WireConnectionStatisticsV3 = WireConnectionStatistics<24, 0, u32>;
 type WireConnectionStatisticsV19 = WireConnectionStatistics<25, 3, u32>;
-type WireConnectionStatisticsV22 = WireConnectionStatistics<28, 0, u8>;
 
-#[derive(BinRead, BinWrite, Clone, Debug, Eq, PartialEq)]
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
 #[brw(little)]
-struct WireConnectionStatisticsV22Prefix {
+struct WireConnectionStatisticsPrefix<
+    const TEXT_BYTES: usize,
+    const ALIGNMENT_BYTES: usize,
+    Processing: WireStatisticsProcessing,
+> {
+    directory_number: WireAlignedText<TEXT_BYTES, ALIGNMENT_BYTES>,
+    call_reference: u32,
+    processing: Processing,
+    statistics: WireConnectionStatisticsTail,
+}
+
+type WireConnectionStatisticsV3Prefix = WireConnectionStatisticsPrefix<24, 0, u32>;
+type WireConnectionStatisticsV19Prefix = WireConnectionStatisticsPrefix<25, 3, u32>;
+
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsPackedBase {
     directory_number: WireAlignedText<28, 0>,
     call_reference: u32,
     processing: u8,
     counters: WireConnectionStatisticsCounters,
 }
 
-fn decode_enbloc<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+#[derive(BinRead, BinWrite, Clone, Copy, Debug, Eq, PartialEq)]
+#[brw(little)]
+struct WireConnectionStatisticsPackedPrefix {
+    base: WireConnectionStatisticsPackedBase,
+    quality_size: u32,
+}
+
+fn enbloc_from_wire<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
     payload: &[u8],
     message_id: u32,
 ) -> Result<ClientMessage, CodecError> {
-    let value: WireEnbloc<TEXT_BYTES, ALIGNMENT_BYTES> = decode(message_id, payload)?;
+    let value: WireEnblocWithLine<TEXT_BYTES, ALIGNMENT_BYTES> = decode(message_id, payload)?;
     value.called_party.validate(message_id)?;
     Ok(ClientMessage::EnblocCall {
         called_party: value.called_party.text()?,
@@ -1767,17 +1817,207 @@ fn decode_enbloc<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
     })
 }
 
-fn encode_enbloc<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
+fn enbloc_from_packed_wire(payload: &[u8], message_id: u32) -> Result<ClientMessage, CodecError> {
+    let value: WireEnblocWithLine<25, 0> = decode_prefix(message_id, payload)?;
+    value.called_party.validate(message_id)?;
+    validate_zero_payload(&payload[29..], message_id, payload.len() - 29)?;
+    Ok(ClientMessage::EnblocCall {
+        called_party: value.called_party.text()?,
+        line_instance: value.line_instance,
+    })
+}
+
+fn select_enbloc_candidate(
+    packed: Result<ClientMessage, CodecError>,
+    aligned: Result<ClientMessage, CodecError>,
+    payload_bytes: usize,
+    message_id: u32,
+) -> Result<ClientMessage, CodecError> {
+    match (packed, aligned) {
+        (Ok(packed), Ok(aligned)) if packed == aligned => Ok(packed),
+        (Ok(_), Ok(_)) => Err(CodecError::InvalidValue {
+            message_id,
+            field: "ambiguous Enbloc layout",
+            value: payload_bytes as u64,
+        }),
+        (Ok(message), Err(_)) | (Err(_), Ok(message)) => Ok(message),
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+
+fn decode_enbloc(
+    payload: &[u8],
+    protocol: u32,
+    message_id: u32,
+) -> Result<ClientMessage, CodecError> {
+    match EnblocWireLayout::select(protocol, payload.len(), message_id)? {
+        EnblocWireLayout::WithoutLine => {
+            let value: WireEnblocWithoutLine = decode(message_id, payload)?;
+            Ok(ClientMessage::EnblocCall {
+                called_party: value.called_party.text()?,
+                line_instance: 0,
+            })
+        }
+        EnblocWireLayout::Line24 => enbloc_from_wire::<24, 0>(payload, message_id),
+        EnblocWireLayout::Line25Packed => enbloc_from_packed_wire(payload, message_id),
+        EnblocWireLayout::Line25Candidates => select_enbloc_candidate(
+            enbloc_from_packed_wire(payload, message_id),
+            enbloc_from_wire::<25, 3>(payload, message_id),
+            payload.len(),
+            message_id,
+        ),
+    }
+}
+
+fn enbloc_to_wire<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
     called_party: &str,
     line_instance: u32,
 ) -> Result<Vec<u8>, CodecError> {
     encode(
         wire_id::ENBLOC_CALL,
-        &WireEnbloc::<TEXT_BYTES, ALIGNMENT_BYTES> {
+        &WireEnblocWithLine::<TEXT_BYTES, ALIGNMENT_BYTES> {
             called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", called_party)?,
             line_instance,
         },
     )
+}
+
+fn encode_enbloc(
+    called_party: &str,
+    line_instance: u32,
+    protocol: u32,
+) -> Result<Vec<u8>, CodecError> {
+    match EnblocWireLayout::canonical(protocol) {
+        EnblocWireLayout::WithoutLine if line_instance == 0 => encode(
+            wire_id::ENBLOC_CALL,
+            &WireEnblocWithoutLine {
+                called_party: WireFixedText::new(
+                    wire_id::ENBLOC_CALL,
+                    "called party",
+                    called_party,
+                )?,
+            },
+        ),
+        EnblocWireLayout::WithoutLine => Err(CodecError::InvalidValue {
+            message_id: wire_id::ENBLOC_CALL,
+            field: "line instance is unavailable before protocol 17",
+            value: u64::from(line_instance),
+        }),
+        EnblocWireLayout::Line24 => enbloc_to_wire::<24, 0>(called_party, line_instance),
+        EnblocWireLayout::Line25Packed => enbloc_to_wire::<25, 0>(called_party, line_instance),
+        EnblocWireLayout::Line25Candidates => unreachable!("candidate selection is decode-only"),
+    }
+}
+
+fn decode_capabilities_response(
+    payload: &[u8],
+    message_id: u32,
+) -> Result<ClientMessage, CodecError> {
+    if payload.len() < 4 {
+        return Err(CodecError::Truncated {
+            message_id,
+            needed: 4,
+            actual: payload.len(),
+        });
+    }
+    let count = usize_from_wire(
+        message_id,
+        "audio capabilities",
+        decode_prefix::<WireOneWord>(message_id, payload)?.value,
+    )?;
+    if count > CAPABILITIES_RESPONSE_MAX_ENTRIES {
+        return Err(CodecError::CountTooLarge {
+            message_id,
+            field: "audio capabilities",
+            count,
+            maximum: CAPABILITIES_RESPONSE_MAX_ENTRIES,
+        });
+    }
+    let counted_bytes = 4 + count * 16;
+    let reservoir_entries = match payload.len() {
+        bytes if bytes == counted_bytes => None,
+        bytes if bytes == CapabilitiesResponseWireLayout::Standard.payload_bytes() => {
+            Some(CapabilitiesResponseWireLayout::Standard.entries())
+        }
+        bytes if bytes == CapabilitiesResponseWireLayout::Extended.payload_bytes() => {
+            Some(CapabilitiesResponseWireLayout::Extended.entries())
+        }
+        actual if actual < counted_bytes => {
+            return Err(CodecError::Truncated {
+                message_id,
+                needed: counted_bytes,
+                actual,
+            });
+        }
+        actual => {
+            return Err(CodecError::TrailingBytes {
+                message_id,
+                count: actual - counted_bytes,
+            });
+        }
+    };
+    if let Some(entries) = reservoir_entries
+        && count > entries
+    {
+        return Err(CodecError::CountTooLarge {
+            message_id,
+            field: "audio capabilities",
+            count,
+            maximum: entries,
+        });
+    }
+
+    let (entries, remainder) = payload[4..].as_chunks::<16>();
+    if !remainder.is_empty() {
+        return Err(CodecError::InvalidLength(message_id));
+    }
+    let mut capabilities = Vec::with_capacity(count);
+    for entry in entries.iter().take(count) {
+        let capability: WireMediaCapability = decode(message_id, entry)?;
+        capabilities.push(MediaCapability {
+            codec: Codec::from(capability.codec),
+            max_frames_per_packet: capability.max_frames_per_packet,
+            codec_parameters: capability.codec_parameters,
+        });
+    }
+    Ok(ClientMessage::CapabilitiesResponse(capabilities))
+}
+
+fn encode_capabilities_response(capabilities: &[MediaCapability]) -> Result<Vec<u8>, CodecError> {
+    let layout = match capabilities.len() {
+        0..=CAPABILITIES_RESPONSE_STANDARD_ENTRIES => CapabilitiesResponseWireLayout::Standard,
+        19..=CAPABILITIES_RESPONSE_EXTENDED_ENTRIES => CapabilitiesResponseWireLayout::Extended,
+        count => {
+            return Err(CodecError::CountTooLarge {
+                message_id: wire_id::CAPABILITIES_RES,
+                field: "audio capabilities",
+                count,
+                maximum: CAPABILITIES_RESPONSE_MAX_ENTRIES,
+            });
+        }
+    };
+    let mut payload = encode(
+        wire_id::CAPABILITIES_RES,
+        &WireOneWord {
+            value: wire_count(
+                wire_id::CAPABILITIES_RES,
+                "audio capabilities",
+                capabilities.len(),
+            )?,
+        },
+    )?;
+    for capability in capabilities {
+        payload.extend_from_slice(&encode(
+            wire_id::CAPABILITIES_RES,
+            &WireMediaCapability {
+                codec: capability.codec.wire_value(),
+                max_frames_per_packet: capability.max_frames_per_packet,
+                codec_parameters: capability.codec_parameters,
+            },
+        )?);
+    }
+    payload.resize(layout.payload_bytes(), 0);
+    Ok(payload)
 }
 
 fn decode_off_hook_with_calling_party<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
@@ -1976,21 +2216,19 @@ impl ClientMessage {
                 let reported_address = (!alternate)
                     .then(|| Ipv4Addr::from(value.reported_address))
                     .filter(|address| !address.is_unspecified());
-                let reported_ipv6_address =
-                    if !alternate
-                        && prefix_bytes >= 88
-                        && value.ipv6_address.iter().any(|byte| *byte != 0)
-                    {
-                        Some(Ipv6Addr::from(value.ipv6_address))
-                    } else {
-                        None
-                    };
+                let reported_ipv6_address = if !alternate
+                    && prefix_bytes >= 88
+                    && value.ipv6_address.iter().any(|byte| *byte != 0)
+                {
+                    Some(Ipv6Addr::from(value.ipv6_address))
+                } else {
+                    None
+                };
                 let advertised_protocol = if alternate {
                     Some(u32::from(value.reported_address[0])).filter(|version| *version != 0)
                 } else if prefix_bytes >= 44 {
-                    Some(u32::from(value.protocol_features[0])).filter(|version| {
-                        *version != 0 || !matches!(prefix_bytes, 44 | 48)
-                    })
+                    Some(u32::from(value.protocol_features[0]))
+                        .filter(|version| *version != 0 || !matches!(prefix_bytes, 44 | 48))
                 } else {
                     None
                 };
@@ -2082,10 +2320,7 @@ impl ClientMessage {
                     wire_layout,
                 })
             }
-            wire_id::ENBLOC_CALL => match protocol_version {
-                19.. => decode_enbloc::<25, 3>(p, frame.message_id),
-                _ => decode_enbloc::<24, 0>(p, frame.message_id),
-            },
+            wire_id::ENBLOC_CALL => decode_enbloc(p, protocol_version, frame.message_id),
             wire_id::STIMULUS => {
                 let value: WireStimulus = decode(frame.message_id, p)?;
                 Ok(Self::Stimulus {
@@ -2123,33 +2358,7 @@ impl ClientMessage {
             wire_id::TIME_DATE_REQ => Ok(Self::TimeDateRequest),
             wire_id::BUTTON_TEMPLATE_REQ => Ok(Self::ButtonTemplateRequest),
             wire_id::VERSION_REQ => Ok(Self::VersionRequest),
-            wire_id::CAPABILITIES_RES => {
-                let count = usize_from_wire(
-                    frame.message_id,
-                    "audio capabilities",
-                    decode_prefix::<WireOneWord>(frame.message_id, p)?.value,
-                )?;
-                if count > CAPABILITIES_RESPONSE_MAX_ENTRIES {
-                    return Err(CodecError::CountTooLarge {
-                        message_id: frame.message_id,
-                        field: "audio capabilities",
-                        count,
-                        maximum: CAPABILITIES_RESPONSE_MAX_ENTRIES,
-                    });
-                }
-                let value: WireCapabilitiesResponse = decode(frame.message_id, p)?;
-                let caps = value
-                    .capabilities
-                    .into_iter()
-                    .take(count)
-                    .map(|capability| MediaCapability {
-                        codec: Codec::from(capability.codec),
-                        max_frames_per_packet: capability.max_frames_per_packet,
-                        codec_parameters: capability.codec_parameters,
-                    })
-                    .collect();
-                Ok(Self::CapabilitiesResponse(caps))
-            }
+            wire_id::CAPABILITIES_RES => decode_capabilities_response(p, frame.message_id),
             wire_id::MEDIA_PORT_LIST => {
                 let value: WireMediaPortList = decode(frame.message_id, p)?;
                 let count = usize_from_wire(frame.message_id, "RTP ports", value.count)?;
@@ -2674,12 +2883,7 @@ impl ClientMessage {
                     ]
                 };
                 let reported_address = if alternate {
-                    [
-                        advertised_protocol.min(u32::from(u8::MAX)) as u8,
-                        0,
-                        0,
-                        0,
-                    ]
+                    [advertised_protocol.min(u32::from(u8::MAX)) as u8, 0, 0, 0]
                 } else {
                     registration
                         .reported_address
@@ -2773,10 +2977,7 @@ impl ClientMessage {
                 called_party,
                 line_instance,
             } => {
-                payload = match protocol.wire() {
-                    19.. => encode_enbloc::<25, 3>(called_party, *line_instance),
-                    _ => encode_enbloc::<24, 0>(called_party, *line_instance),
-                }?;
+                payload = encode_enbloc(called_party, *line_instance, protocol.wire())?;
                 wire_id::ENBLOC_CALL
             }
             Self::Stimulus {
@@ -2888,34 +3089,7 @@ impl ClientMessage {
             Self::ButtonTemplateRequest => wire_id::BUTTON_TEMPLATE_REQ,
             Self::VersionRequest => wire_id::VERSION_REQ,
             Self::CapabilitiesResponse(capabilities) => {
-                if capabilities.len() > CAPABILITIES_RESPONSE_MAX_ENTRIES {
-                    return Err(CodecError::CountTooLarge {
-                        message_id: wire_id::CAPABILITIES_RES,
-                        field: "audio capabilities",
-                        count: capabilities.len(),
-                        maximum: CAPABILITIES_RESPONSE_MAX_ENTRIES,
-                    });
-                }
-                let mut wire_capabilities =
-                    [WireMediaCapability::default(); CAPABILITIES_RESPONSE_MAX_ENTRIES];
-                for (slot, capability) in wire_capabilities.iter_mut().zip(capabilities) {
-                    *slot = WireMediaCapability {
-                        codec: capability.codec.wire_value(),
-                        max_frames_per_packet: capability.max_frames_per_packet,
-                        codec_parameters: capability.codec_parameters,
-                    };
-                }
-                payload = encode(
-                    wire_id::CAPABILITIES_RES,
-                    &WireCapabilitiesResponse {
-                        count: wire_count(
-                            wire_id::CAPABILITIES_RES,
-                            "audio capabilities",
-                            capabilities.len(),
-                        )?,
-                        capabilities: wire_capabilities,
-                    },
-                )?;
+                payload = encode_capabilities_response(capabilities)?;
                 wire_id::CAPABILITIES_RES
             }
             Self::MediaPortList(message) => {
@@ -3456,27 +3630,7 @@ fn encode_connection_statistics(
         })?,
     };
     match protocol.wire() {
-        22.. => {
-            let processing = u8::from_wire(
-                statistics.processing.wire_value(),
-                wire_id::CONNECTION_STATISTICS_RES,
-            )?;
-            encode(
-                wire_id::CONNECTION_STATISTICS_RES,
-                &WireConnectionStatisticsV22 {
-                    directory_number: WireAlignedText::new(
-                        wire_id::CONNECTION_STATISTICS_RES,
-                        "directory number",
-                        &statistics.directory_number,
-                    )?,
-                    call_reference: statistics.call_reference,
-                    processing,
-                    statistics: tail,
-                    quality: statistics.quality.as_bytes().to_vec(),
-                },
-            )
-        }
-        19..=21 => encode(
+        19.. => encode(
             wire_id::CONNECTION_STATISTICS_RES,
             &WireConnectionStatisticsV19 {
                 directory_number: WireAlignedText::new(
@@ -7713,8 +7867,7 @@ mod tests {
         payload[40..44].copy_from_slice(&ProtocolVersion::V11.wire().to_le_bytes());
         payload[44..48].copy_from_slice(&3_u32.to_le_bytes());
         payload[48..52].copy_from_slice(&1_u32.to_le_bytes());
-        payload[52..64]
-            .copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 1, 2, 3, 4, 5, 6]);
+        payload[52..64].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 1, 2, 3, 4, 5, 6]);
         payload[64..68].copy_from_slice(&3_u32.to_le_bytes());
         payload[68..72].copy_from_slice(&6_u32.to_le_bytes());
         payload[72..88].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
@@ -7804,8 +7957,7 @@ mod tests {
             let mut payload = vec![0_u8; payload_bytes];
             let device_id = b"SEP001122334455";
             payload[..device_id.len()].copy_from_slice(device_id);
-            payload[28..32]
-                .copy_from_slice(&DeviceType::Cisco7925.wire_value().to_le_bytes());
+            payload[28..32].copy_from_slice(&DeviceType::Cisco7925.wire_value().to_le_bytes());
 
             let message = ClientMessage::decode_with_version(
                 Frame::new(0, wire_id::REGISTER, payload.clone()),
@@ -7974,6 +8126,220 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_response_selects_the_extended_fixed_reservoir() {
+        let capabilities = (0_u32..20)
+            .map(|index| MediaCapability {
+                codec: Codec::Unknown(0x1000 + index),
+                max_frames_per_packet: index + 1,
+                codec_parameters: [index as u8; 8],
+            })
+            .collect::<Vec<_>>();
+        let message = ClientMessage::CapabilitiesResponse(capabilities);
+
+        let bytes = message.encode(ProtocolVersion::V22).unwrap();
+        let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+
+        assert_eq!(frame.payload.len(), 4 + 24 * 16);
+        assert_eq!(ClientMessage::decode(frame).unwrap(), message);
+    }
+
+    #[test]
+    fn capabilities_response_accepts_exact_counted_prefixes() {
+        let capabilities = vec![
+            MediaCapability {
+                codec: Codec::Pcmu,
+                max_frames_per_packet: 2,
+                codec_parameters: [1; 8],
+            },
+            MediaCapability {
+                codec: Codec::Pcma,
+                max_frames_per_packet: 3,
+                codec_parameters: [2; 8],
+            },
+        ];
+        let mut payload = 2_u32.to_le_bytes().to_vec();
+        for capability in &capabilities {
+            payload.extend_from_slice(
+                &encode(
+                    wire_id::CAPABILITIES_RES,
+                    &WireMediaCapability {
+                        codec: capability.codec.wire_value(),
+                        max_frames_per_packet: capability.max_frames_per_packet,
+                        codec_parameters: capability.codec_parameters,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(payload.len(), 4 + 2 * 16);
+        assert_eq!(
+            ClientMessage::decode(Frame::new(
+                ProtocolVersion::V22.wire(),
+                wire_id::CAPABILITIES_RES,
+                payload,
+            ))
+            .unwrap(),
+            ClientMessage::CapabilitiesResponse(capabilities)
+        );
+    }
+
+    #[test]
+    fn capabilities_response_rejects_incomplete_or_mismatched_counted_storage() {
+        let mut partial = vec![0; 4 + 19 * 16];
+        partial[..4].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(
+            ClientMessage::decode(Frame::new(
+                ProtocolVersion::V22.wire(),
+                wire_id::CAPABILITIES_RES,
+                partial,
+            )),
+            Err(CodecError::TrailingBytes { count: 288, .. })
+        ));
+
+        let mut too_many = vec![0; 4 + 18 * 16];
+        too_many[..4].copy_from_slice(&19_u32.to_le_bytes());
+        assert!(matches!(
+            ClientMessage::decode(Frame::new(
+                ProtocolVersion::V22.wire(),
+                wire_id::CAPABILITIES_RES,
+                too_many,
+            )),
+            Err(CodecError::CountTooLarge {
+                field: "audio capabilities",
+                maximum: 18,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn capabilities_response_discards_nonzero_inactive_reservoir_storage() {
+        let mut payload = vec![0xa5; 4 + 24 * 16];
+        payload[..4].copy_from_slice(&1_u32.to_le_bytes());
+        payload[4..20].copy_from_slice(
+            &encode(
+                wire_id::CAPABILITIES_RES,
+                &WireMediaCapability {
+                    codec: Codec::Pcmu.wire_value(),
+                    max_frames_per_packet: 2,
+                    codec_parameters: [1; 8],
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            ClientMessage::decode(Frame::new(
+                ProtocolVersion::V22.wire(),
+                wire_id::CAPABILITIES_RES,
+                payload,
+            ))
+            .unwrap(),
+            ClientMessage::CapabilitiesResponse(vec![MediaCapability {
+                codec: Codec::Pcmu,
+                max_frames_per_packet: 2,
+                codec_parameters: [1; 8],
+            }])
+        );
+    }
+
+    #[test]
+    fn enbloc_call_selects_exact_version_and_length_layouts() {
+        for (version, line_instance, payload_bytes) in [
+            (ProtocolVersion::V3, 0, 24),
+            (ProtocolVersion::V17, 2, 28),
+            (ProtocolVersion::V22, 2, 29),
+        ] {
+            let message = ClientMessage::EnblocCall {
+                called_party: "2001".into(),
+                line_instance,
+            };
+            let bytes = message.encode(version).unwrap();
+            let frame = FrameDecoder::new().push(&bytes).unwrap().remove(0);
+            assert_eq!(frame.payload.len(), payload_bytes);
+            assert_eq!(
+                ClientMessage::decode_with_version(frame, version).unwrap(),
+                message
+            );
+        }
+
+        let packed = encode(
+            wire_id::ENBLOC_CALL,
+            &WireEnblocWithLine::<25, 0> {
+                called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", "2001")
+                    .unwrap(),
+                line_instance: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(packed.len(), 29);
+        assert_eq!(
+            ClientMessage::decode_with_version(
+                Frame::new(
+                    ProtocolVersion::V22.wire(),
+                    wire_id::ENBLOC_CALL,
+                    packed.clone(),
+                ),
+                ProtocolVersion::V22,
+            )
+            .unwrap(),
+            ClientMessage::EnblocCall {
+                called_party: "2001".into(),
+                line_instance: 2,
+            }
+        );
+
+        let mut padded = encode(
+            wire_id::ENBLOC_CALL,
+            &WireEnblocWithLine::<25, 0> {
+                called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", "2001")
+                    .unwrap(),
+                line_instance: 1,
+            },
+        )
+        .unwrap();
+        padded.extend_from_slice(&[0; 3]);
+        assert_eq!(padded.len(), 32);
+        assert_eq!(
+            ClientMessage::decode_with_version(
+                Frame::new(ProtocolVersion::V22.wire(), wire_id::ENBLOC_CALL, padded,),
+                ProtocolVersion::V22,
+            )
+            .unwrap(),
+            ClientMessage::EnblocCall {
+                called_party: "2001".into(),
+                line_instance: 1,
+            }
+        );
+
+        let aligned = encode(
+            wire_id::ENBLOC_CALL,
+            &WireEnblocWithLine::<25, 3> {
+                called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", "2001")
+                    .unwrap(),
+                line_instance: 1,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            ClientMessage::decode_with_version(
+                Frame::new(ProtocolVersion::V22.wire(), wire_id::ENBLOC_CALL, aligned,),
+                ProtocolVersion::V22,
+            ),
+            Err(CodecError::InvalidValue {
+                field: "ambiguous Enbloc layout",
+                ..
+            })
+        ));
+        assert!(matches!(
+            ClientMessage::decode_with_version(
+                Frame::new(ProtocolVersion::V18.wire(), wire_id::ENBLOC_CALL, packed,),
+                ProtocolVersion::V18,
+            ),
+            Err(CodecError::InvalidLength(wire_id::ENBLOC_CALL))
+        ));
+    }
+
+    #[test]
     fn call_count_request_preserves_known_length_selected_dialects() {
         for (message, expected_payload_len) in [
             (
@@ -8046,7 +8412,7 @@ mod tests {
 
     #[test]
     fn connection_statistics_reject_oversized_quality_payloads() {
-        let payload = WireConnectionStatisticsV22 {
+        let payload = WireConnectionStatisticsV19 {
             directory_number: WireAlignedText::new(
                 wire_id::CONNECTION_STATISTICS_RES,
                 "directory number",
@@ -8054,7 +8420,7 @@ mod tests {
             )
             .unwrap(),
             call_reference: 42,
-            processing: StatisticsProcessing::Clear.wire_value() as u8,
+            processing: StatisticsProcessing::Clear.wire_value(),
             statistics: WireConnectionStatisticsTail {
                 counters: WireConnectionStatisticsCounters {
                     packets_sent: 1,
@@ -8087,10 +8453,10 @@ mod tests {
     }
 
     #[test]
-    fn connection_statistics_v22_decodes_7961_payload_without_quality_size() {
+    fn packed_connection_statistics_accept_zero_padding_without_a_quality_size() {
         let mut payload = encode(
             wire_id::CONNECTION_STATISTICS_RES,
-            &WireConnectionStatisticsV22Prefix {
+            &WireConnectionStatisticsPackedBase {
                 directory_number: WireAlignedText::new(
                     wire_id::CONNECTION_STATISTICS_RES,
                     "directory number",
@@ -8142,7 +8508,183 @@ mod tests {
     }
 
     #[test]
-    fn connection_statistics_v22_uses_packed_handset_offsets() {
+    fn packed_connection_statistics_accepts_a_non_word_aligned_declared_tail() {
+        let quality = (0_u8..110).collect::<Vec<_>>();
+        let mut payload = encode(
+            wire_id::CONNECTION_STATISTICS_RES,
+            &WireConnectionStatisticsPackedPrefix {
+                base: WireConnectionStatisticsPackedBase {
+                    directory_number: WireAlignedText::new(
+                        wire_id::CONNECTION_STATISTICS_RES,
+                        "directory number",
+                        "2002",
+                    )
+                    .unwrap(),
+                    call_reference: 42,
+                    processing: StatisticsProcessing::Clear.wire_value() as u8,
+                    counters: WireConnectionStatisticsCounters {
+                        packets_sent: 1,
+                        octets_sent: 2,
+                        packets_received: 3,
+                        octets_received: 4,
+                        packets_lost: 5,
+                        jitter_millis: 6,
+                        latency_millis: 7,
+                    },
+                },
+                quality_size: quality.len() as u32,
+            },
+        )
+        .unwrap();
+        payload.extend_from_slice(&quality);
+        assert_eq!(payload.len(), 175);
+
+        let decoded = ClientMessage::decode_with_version(
+            Frame::new(
+                ProtocolVersion::V22.wire(),
+                wire_id::CONNECTION_STATISTICS_RES,
+                payload.clone(),
+            ),
+            ProtocolVersion::V22,
+        )
+        .unwrap();
+        let ClientMessage::ConnectionStatisticsResponse(statistics) = decoded else {
+            panic!("expected connection statistics response");
+        };
+        assert_eq!(statistics.directory_number, "2002");
+        assert_eq!(statistics.call_reference, 42);
+        assert_eq!(statistics.quality.as_bytes(), quality);
+
+        payload.extend_from_slice(&[0; 3]);
+        assert!(
+            ClientMessage::decode_with_version(
+                Frame::new(
+                    ProtocolVersion::V22.wire(),
+                    wire_id::CONNECTION_STATISTICS_RES,
+                    payload.clone(),
+                ),
+                ProtocolVersion::V22,
+            )
+            .is_ok()
+        );
+        *payload.last_mut().unwrap() = 1;
+        assert!(
+            ClientMessage::decode_with_version(
+                Frame::new(
+                    ProtocolVersion::V22.wire(),
+                    wire_id::CONNECTION_STATISTICS_RES,
+                    payload,
+                ),
+                ProtocolVersion::V22,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn aligned_connection_statistics_discards_inactive_fixed_reservoir_storage() {
+        let quality = (0_u8..113).collect::<Vec<_>>();
+        let mut payload = encode(
+            wire_id::CONNECTION_STATISTICS_RES,
+            &WireConnectionStatisticsV19Prefix {
+                directory_number: WireAlignedText::new(
+                    wire_id::CONNECTION_STATISTICS_RES,
+                    "directory number",
+                    "2002",
+                )
+                .unwrap(),
+                call_reference: 42,
+                processing: StatisticsProcessing::Clear.wire_value(),
+                statistics: WireConnectionStatisticsTail {
+                    counters: WireConnectionStatisticsCounters {
+                        packets_sent: 1,
+                        octets_sent: 2,
+                        packets_received: 3,
+                        octets_received: 4,
+                        packets_lost: 5,
+                        jitter_millis: 6,
+                        latency_millis: 7,
+                    },
+                    quality_size: quality.len() as u32,
+                },
+            },
+        )
+        .unwrap();
+        payload.extend_from_slice(&quality);
+        payload.extend_from_slice(&[0; CONNECTION_QUALITY_MAX_BYTES - 113]);
+        assert_eq!(payload.len(), 668);
+        assert_eq!(payload.len() - 68 - quality.len(), 487);
+
+        let decoded = ClientMessage::decode_with_version(
+            Frame::new(
+                ProtocolVersion::V22.wire(),
+                wire_id::CONNECTION_STATISTICS_RES,
+                payload.clone(),
+            ),
+            ProtocolVersion::V22,
+        )
+        .unwrap();
+        let ClientMessage::ConnectionStatisticsResponse(statistics) = decoded else {
+            panic!("expected connection statistics response");
+        };
+        assert_eq!(statistics.quality.as_bytes(), quality);
+
+        payload[68 + quality.len()..].fill(0xa5);
+        let decoded = ClientMessage::decode_with_version(
+            Frame::new(
+                ProtocolVersion::V22.wire(),
+                wire_id::CONNECTION_STATISTICS_RES,
+                payload,
+            ),
+            ProtocolVersion::V22,
+        )
+        .unwrap();
+        let ClientMessage::ConnectionStatisticsResponse(statistics) = decoded else {
+            panic!("expected connection statistics response");
+        };
+        assert_eq!(statistics.quality.as_bytes(), quality);
+    }
+
+    #[test]
+    fn protocol_19_connection_statistics_accepts_each_transition_shape() {
+        let message = ClientMessage::ConnectionStatisticsResponse(ConnectionStatistics {
+            directory_number: "2002".into(),
+            call_reference: 42,
+            processing: StatisticsProcessing::Clear,
+            packets_sent: 1,
+            octets_sent: 2,
+            packets_received: 3,
+            octets_received: 4,
+            packets_lost: 5,
+            jitter_millis: 6,
+            latency_millis: 8,
+            quality: ConnectionQualityStatistics::new(vec![0xa1, 0xb2, 0xc3]).unwrap(),
+        });
+
+        for encoded_as in [ProtocolVersion::V18, ProtocolVersion::V19] {
+            let frame = FrameDecoder::new()
+                .push(&message.encode(encoded_as).unwrap())
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                ClientMessage::decode_with_version(
+                    Frame::new(
+                        ProtocolVersion::V19.wire(),
+                        wire_id::CONNECTION_STATISTICS_RES,
+                        frame.payload,
+                    ),
+                    ProtocolVersion::V19,
+                )
+                .unwrap(),
+                message,
+                "encoded with protocol {}",
+                encoded_as.wire(),
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_connection_statistics_from_protocol_19_use_the_aligned_layout() {
         let quality = vec![0xa1, 0xb2, 0xc3];
         let message = ClientMessage::ConnectionStatisticsResponse(ConnectionStatistics {
             directory_number: "2002".into(),
@@ -8161,16 +8703,16 @@ mod tests {
         let frame = FrameDecoder::new().push(&encoded).unwrap().remove(0);
 
         assert_eq!(&frame.payload[28..32], &0x1122_3344_u32.to_le_bytes());
-        assert_eq!(frame.payload[32], 1);
-        assert_eq!(&frame.payload[33..37], &0x0102_0304_u32.to_le_bytes());
-        assert_eq!(&frame.payload[37..41], &0x1112_1314_u32.to_le_bytes());
-        assert_eq!(&frame.payload[41..45], &0x2122_2324_u32.to_le_bytes());
-        assert_eq!(&frame.payload[45..49], &0x3132_3334_u32.to_le_bytes());
-        assert_eq!(&frame.payload[49..53], &0x4142_4344_u32.to_le_bytes());
-        assert_eq!(&frame.payload[53..57], &0x5152_5354_u32.to_le_bytes());
-        assert_eq!(&frame.payload[57..61], &0x6162_6364_u32.to_le_bytes());
-        assert_eq!(&frame.payload[61..65], &3_u32.to_le_bytes());
-        assert_eq!(&frame.payload[65..68], quality.as_slice());
+        assert_eq!(&frame.payload[32..36], &1_u32.to_le_bytes());
+        assert_eq!(&frame.payload[36..40], &0x0102_0304_u32.to_le_bytes());
+        assert_eq!(&frame.payload[40..44], &0x1112_1314_u32.to_le_bytes());
+        assert_eq!(&frame.payload[44..48], &0x2122_2324_u32.to_le_bytes());
+        assert_eq!(&frame.payload[48..52], &0x3132_3334_u32.to_le_bytes());
+        assert_eq!(&frame.payload[52..56], &0x4142_4344_u32.to_le_bytes());
+        assert_eq!(&frame.payload[56..60], &0x5152_5354_u32.to_le_bytes());
+        assert_eq!(&frame.payload[60..64], &0x6162_6364_u32.to_le_bytes());
+        assert_eq!(&frame.payload[64..68], &3_u32.to_le_bytes());
+        assert_eq!(&frame.payload[68..71], quality.as_slice());
         assert_eq!(
             ClientMessage::decode_with_version(frame, ProtocolVersion::V22).unwrap(),
             message
@@ -9674,19 +10216,23 @@ mod tests {
             .is_err()
         );
 
-        let mut enbloc = FrameDecoder::new()
-            .push(
-                &ClientMessage::EnblocCall {
-                    called_party: "2001".into(),
-                    line_instance: 2,
-                }
-                .encode(ProtocolVersion::V19)
-                .unwrap(),
+        let mut enbloc = encode(
+            wire_id::ENBLOC_CALL,
+            &WireEnblocWithLine::<25, 0> {
+                called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", "2001")
+                    .unwrap(),
+                line_instance: 2,
+            },
+        )
+        .unwrap();
+        enbloc.extend_from_slice(&[1, 0, 0]);
+        assert!(
+            ClientMessage::decode_with_version(
+                Frame::new(ProtocolVersion::V19.wire(), wire_id::ENBLOC_CALL, enbloc),
+                ProtocolVersion::V19,
             )
-            .unwrap()
-            .remove(0);
-        enbloc.payload[25] = 1;
-        assert!(ClientMessage::decode_with_version(enbloc, ProtocolVersion::V19).is_err());
+            .is_err()
+        );
 
         let mut off_hook = FrameDecoder::new()
             .push(

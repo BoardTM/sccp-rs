@@ -34,7 +34,7 @@ pub async fn recording_service_operation(
     let recordings = &mut recordings.sessions;
     let (device_id, handset_call_id) = controller_step(&access.shared.controller, |controller| {
         controller
-            .call_by_pbx(call_id)
+            .active_or_primary_call_by_pbx(call_id)
             .map(|call| (call.device_id.clone(), call.sccp_id))
     })
     .ok_or(ServiceProviderError::CallNotFound)?;

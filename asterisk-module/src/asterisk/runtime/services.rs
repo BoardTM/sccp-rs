@@ -146,14 +146,14 @@ pub async fn run_call_signals(
 pub async fn handle_runtime_call_signal(access: &Access, signal: RuntimeCallSignal) {
     let line = controller_step(&access.shared.controller, |controller| {
         controller
-            .call_by_pbx(signal.pbx_id)
+            .active_or_primary_call_by_pbx(signal.pbx_id)
             .map(|call| call.line.clone())
     });
     match signal.kind {
         RuntimeCallSignalKind::StopTone => {
             let effects = controller_step(&access.shared.controller, |controller| {
                 controller
-                    .call_by_pbx(signal.pbx_id)
+                    .active_or_primary_call_by_pbx(signal.pbx_id)
                     .map(|call| {
                         HandsetEffect::StartTone {
                             device_id: call.device_id,
@@ -194,7 +194,7 @@ pub async fn handle_runtime_call_signal(access: &Access, signal: RuntimeCallSign
         }
         RuntimeCallSignalKind::Progress => {
             let Some(call) = controller_step(&access.shared.controller, |controller| {
-                controller.call_by_pbx(signal.pbx_id)
+                controller.active_or_primary_call_by_pbx(signal.pbx_id)
             }) else {
                 return;
             };
@@ -208,7 +208,7 @@ pub async fn handle_runtime_call_signal(access: &Access, signal: RuntimeCallSign
         RuntimeCallSignalKind::Busy | RuntimeCallSignalKind::Congestion => {
             let Some(call) = controller_step(&access.shared.controller, |controller| {
                 controller
-                    .call_by_pbx(signal.pbx_id)
+                    .active_or_primary_call_by_pbx(signal.pbx_id)
                     .filter(|call| call.state == CallState::Calling)
             }) else {
                 return;
@@ -231,7 +231,7 @@ pub async fn handle_runtime_call_signal(access: &Access, signal: RuntimeCallSign
             let Some(call_id) = controller_step(&access.shared.controller, |controller| {
                 controller.active_call_id(signal.pbx_id).or_else(|| {
                     controller
-                        .call_by_pbx(signal.pbx_id)
+                        .primary_call_by_pbx(signal.pbx_id)
                         .map(|call| call.sccp_id)
                 })
             }) else {

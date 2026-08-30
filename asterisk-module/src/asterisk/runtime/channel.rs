@@ -87,8 +87,9 @@ fn codec_policy(
         controller
             .registered_device(device)
             .map(|state| state.capabilities.clone())
-    });
-    let codecs = config
+    })
+    .flatten();
+    let mut codecs = config
         .media_for_binding(&access.line_binding(device, line_instance)?)
         .map(|media| media.codecs)
         .or_else(|| {
@@ -96,7 +97,17 @@ fn codec_policy(
                 .guest_hotline_binding(device, line_instance)
                 .map(|_| config.general.codecs.clone())
         })?;
+    constrain_unreported_audio_codecs(&mut codecs, capabilities.as_ref());
     Some((codecs, capabilities))
+}
+
+fn constrain_unreported_audio_codecs(
+    codecs: &mut Vec<Codec>,
+    capabilities: Option<&StationMediaCapabilities>,
+) {
+    if capabilities.is_none_or(|capabilities| capabilities.audio().is_empty()) {
+        codecs.retain(|codec| matches!(codec, Codec::Pcma | Codec::Pcmu));
+    }
 }
 
 struct SelectedVideo {
@@ -154,6 +165,12 @@ fn preferred_video(
         })
     else {
         return VideoSelection::Disabled;
+    };
+    let Some(capabilities) = capabilities else {
+        return VideoSelection::AudioOnly {
+            session_generation,
+            reason: VideoFallbackReason::NotNegotiated,
+        };
     };
     let representable = pbx_formats
         .iter()
@@ -557,7 +574,7 @@ pub fn allocate_channel(
         VideoSelection::Ready(selected) => {
             let state = video_readiness.unwrap_or(Err(VideoFallbackReason::NativeRtpUnavailable));
             match state {
-                Ok(()) => local_video_endpoint(access, pbx_id)
+                Ok(()) => local_video_endpoint(access, pbx_id, &binding.device_id)
                     .filter(|endpoint| video_endpoint_is_supported(&selected, *endpoint))
                     .map_or_else(
                         || {
@@ -769,6 +786,29 @@ mod allocation_text_tests {
         );
         assert_eq!(codec_upgrade(&configured, Codec::Pcma, Codec::Pcma), None);
     }
+
+    #[test]
+    fn pending_and_empty_capabilities_retain_only_configured_g711_codecs() {
+        let configured = vec![Codec::G729, Codec::Pcma, Codec::Wideband256k, Codec::Pcmu];
+        let empty = StationMediaCapabilities::default();
+        for capabilities in [None, Some(&empty)] {
+            let mut codecs = configured.clone();
+            constrain_unreported_audio_codecs(&mut codecs, capabilities);
+            assert_eq!(codecs, [Codec::Pcma, Codec::Pcmu]);
+        }
+    }
+
+    #[test]
+    fn reported_capabilities_preserve_configured_order_for_negotiation() {
+        let capabilities = StationMediaCapabilities::from(vec![MediaCapability {
+            codec: Codec::G729,
+            max_frames_per_packet: 4,
+            codec_parameters: [0; 8],
+        }]);
+        let mut codecs = vec![Codec::Pcma, Codec::G729, Codec::Pcmu];
+        constrain_unreported_audio_codecs(&mut codecs, Some(&capabilities));
+        assert_eq!(codecs, [Codec::Pcma, Codec::G729, Codec::Pcmu]);
+    }
 }
 
 pub fn remove_channel(access: &Access, pbx_id: PbxCallId) {
@@ -814,6 +854,21 @@ pub fn remove_channel(access: &Access, pbx_id: PbxCallId) {
     let binding = access.shared.channels.lock_unpoisoned().remove(&pbx_id);
     if let Some(binding) = binding {
         drop(binding.close());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ChannelAvailability {
+    Live,
+    Retiring,
+    Missing,
+}
+
+pub(super) fn channel_availability(access: &Access, pbx_id: PbxCallId) -> ChannelAvailability {
+    match channel_binding(access, pbx_id) {
+        Some(binding) if binding.is_closed() => ChannelAvailability::Retiring,
+        Some(_) => ChannelAvailability::Live,
+        None => ChannelAvailability::Missing,
     }
 }
 

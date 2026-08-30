@@ -1023,7 +1023,7 @@ fn call_snapshots_are_derived_from_current_call_and_appearance_state() {
     assert!(after.metadata == metadata);
     assert_eq!(after.codec, Codec::G72264k);
 
-    let by_pbx = controller.call_by_pbx(PbxCallId(1)).unwrap();
+    let by_pbx = controller.primary_call_by_pbx(PbxCallId(1)).unwrap();
     assert_eq!(by_pbx.digits, after.digits);
     assert_eq!(by_pbx.info, after.info);
     assert!(by_pbx.metadata == after.metadata);
@@ -1721,7 +1721,7 @@ fn retrieval_has_one_call_identity_and_failure_cleans_every_index() {
         ]
     );
     assert!(controller.call(CallId(22)).is_none());
-    assert!(controller.call_by_pbx(PbxCallId(1)).is_none());
+    assert!(controller.primary_call_by_pbx(PbxCallId(1)).is_none());
     assert!(controller.invariant_error().is_none());
 }
 
@@ -3725,6 +3725,24 @@ fn first_serialized_answer_wins_and_later_answers_are_noops() {
         CallId(3)
     );
     assert_eq!(
+        controller
+            .primary_call_by_pbx(PbxCallId(8))
+            .unwrap()
+            .sccp_id,
+        CallId(2)
+    );
+    assert_eq!(
+        controller.active_call_by_pbx(PbxCallId(8)).unwrap().sccp_id,
+        CallId(3)
+    );
+    assert_eq!(
+        controller
+            .active_or_primary_call_by_pbx(PbxCallId(8))
+            .unwrap()
+            .sccp_id,
+        CallId(3)
+    );
+    assert_eq!(
         controller.appearance_for_call(CallId(2)).unwrap().state,
         CallState::RemoteInUse
     );
@@ -4842,7 +4860,10 @@ fn registered_device_runtime_tracks_capabilities_and_selection() {
     controller.begin_phone_call(CallId(12), binding(), Codec::Pcma, now);
     let state = controller.registered_device(&device).unwrap();
     assert_eq!(state.registration.firmware, "SCCP-test");
-    assert_eq!(state.capabilities.audio()[0].codec, Codec::Pcma);
+    assert_eq!(
+        state.capabilities.as_ref().unwrap().audio()[0].codec,
+        Codec::Pcma
+    );
     assert_eq!(state.selected_line, Some(1));
     assert!(state.is_call_selected(CallId(12)));
 
@@ -4868,6 +4889,50 @@ fn registered_device_runtime_tracks_capabilities_and_selection() {
             .selected_calls()
             .count(),
         0
+    );
+}
+
+#[test]
+fn registered_device_distinguishes_pending_empty_and_reported_capabilities() {
+    let mut controller = Controller::new(Duration::from_secs(1));
+    let registration = registration();
+    let device = registration.id.clone();
+    controller.registered(registration);
+
+    assert!(
+        controller
+            .registered_device(&device)
+            .unwrap()
+            .capabilities
+            .is_none()
+    );
+    controller.capabilities(&device, Vec::new());
+    assert!(
+        controller
+            .registered_device(&device)
+            .unwrap()
+            .capabilities
+            .as_ref()
+            .is_some_and(StationMediaCapabilities::is_empty)
+    );
+    controller.capabilities(
+        &device,
+        vec![MediaCapability {
+            codec: Codec::Pcmu,
+            max_frames_per_packet: 4,
+            codec_parameters: [0; 8],
+        }],
+    );
+    assert_eq!(
+        controller
+            .registered_device(&device)
+            .unwrap()
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .audio()
+            .len(),
+        1
     );
 }
 
@@ -4923,7 +4988,7 @@ fn newer_session_retires_old_calls_and_rejects_late_session_state() {
     assert!(controller.pbx_call(PbxCallId(1)).is_none());
     let state = controller.registered_device(&device).unwrap();
     assert_eq!(state.session_generation, new_generation);
-    assert!(state.capabilities.is_empty());
+    assert!(state.capabilities.is_none());
     assert_eq!(
         state.audio_encryption,
         StationEncryptionCapabilities::NotReported
@@ -4951,7 +5016,7 @@ fn newer_session_retires_old_calls_and_rejects_late_session_state() {
             .registered_device(&device)
             .unwrap()
             .capabilities
-            .is_empty()
+            .is_none()
     );
 
     assert!(controller.session_is_current(&device, new_generation));
@@ -4962,8 +5027,14 @@ fn newer_session_retires_old_calls_and_rejects_late_session_state() {
         old_encryption.clone(),
     ));
     let state = controller.registered_device(&device).unwrap();
-    assert_eq!(state.capabilities.audio(), old_capabilities.audio());
-    assert_eq!(state.capabilities.video(), old_capabilities.video());
+    assert_eq!(
+        state.capabilities.as_ref().unwrap().audio(),
+        old_capabilities.audio()
+    );
+    assert_eq!(
+        state.capabilities.as_ref().unwrap().video(),
+        old_capabilities.video()
+    );
     assert_eq!(state.audio_encryption, old_encryption);
     assert!(controller.invariant_error().is_none());
 }
@@ -5533,7 +5604,7 @@ fn call_transition_pbx_hangup_races_abort_without_resurrection() {
         let outcome = controller
             .pbx_hangup_with_effects(hung_up)
             .expect("the racing PBX hangup is claimed");
-        assert!(controller.call_by_pbx(hung_up).is_none());
+        assert!(controller.primary_call_by_pbx(hung_up).is_none());
         assert!(
             controller
                 .abort_call_transition(transition.id, &progress)

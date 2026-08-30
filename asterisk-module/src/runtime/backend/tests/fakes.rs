@@ -378,6 +378,7 @@ impl MediaBackend for FakeBackend {
     fn configure_media(
         &self,
         _: PbxCallId,
+        _: &DeviceId,
         remote: MediaEndpoint,
         _: Codec,
     ) -> Result<MediaEndpoint, Self::Error> {

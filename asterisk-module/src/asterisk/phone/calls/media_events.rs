@@ -1,14 +1,49 @@
 //! Audio/video acknowledgement, recovery, and media telemetry events.
 
 use super::super::{
-    Access, AmiMediaDirection, AmiMediaKind, AmiMediaState, DriverEffect, HandsetAcknowledgement,
-    LogLevel, MediaFailureDisposition, MediaStatus, MediaStreamState, NonNull, PhoneDeviceEvent,
-    PhoneDeviceEventKind, ast_log, controller_step, execute_effects, media_event, native_channel,
-    normalize_phone_media_endpoint, normalize_phone_video_endpoint, publish_ami_event,
-    recover_failed_media_transmission, set_remote_video_endpoint, with_channel,
+    Access, AmiMediaDirection, AmiMediaKind, AmiMediaState, CallId, DeviceId, DriverEffect,
+    LogLevel, MediaEndpoint, MediaFailureDisposition, MediaStatus, MediaStreamState, NonNull,
+    PhoneDeviceEvent, PhoneDeviceEventKind, TransmitOpenOutcome, ast_log, controller_step,
+    execute_effects, media_event, native_channel, normalize_phone_media_endpoint,
+    normalize_phone_video_endpoint, publish_ami_event, recover_failed_media_transmission,
+    set_remote_video_endpoint, with_channel,
 };
 use super::{handle_handset_hangup, owned_pbx_call};
 use crate::runtime::controller::VideoFallbackReason;
+
+async fn commit_transmit_open(
+    access: &Access,
+    device_id: &DeviceId,
+    call_id: CallId,
+    endpoint: MediaEndpoint,
+) {
+    let codec_id = endpoint.codec.wire_value();
+    let packet_ms = endpoint.packet_ms;
+    let (actions, accepted) = controller_step(&access.shared.controller, |controller| {
+        let actions =
+            controller.media_transmission_started_for_device(device_id, call_id, endpoint);
+        let accepted = controller.call(call_id).is_some_and(|call| {
+            call.device_id == *device_id && call.audio_transmit == MediaStreamState::Open(endpoint)
+        });
+        (actions, accepted)
+    });
+    execute_effects(access, actions).await;
+    if accepted {
+        publish_ami_event(
+            access,
+            &media_event(
+                device_id,
+                call_id,
+                AmiMediaKind::Audio,
+                AmiMediaDirection::Transmit,
+                AmiMediaState::Open,
+                MediaStatus::Ok,
+                Some(codec_id),
+                Some(packet_ms),
+            ),
+        );
+    }
+}
 
 pub(super) async fn handle_media_event(
     access: &Access,
@@ -312,67 +347,13 @@ pub(super) async fn handle_media_event(
             }
             actions
         }
-        PhoneDeviceEventKind::TransmitChannelImplied { call_id, endpoint } => {
-            let codec_id = endpoint.codec.wire_value();
-            let packet_ms = endpoint.packet_ms;
-            let accepted = controller_step(&access.shared.controller, |controller| {
-                controller.media_transmission_started_for_device(&device_id, call_id, endpoint);
-                controller.call(call_id).is_some_and(|call| {
-                    call.device_id == device_id
-                        && call.audio_transmit == MediaStreamState::Open(endpoint)
-                })
-            });
-            if accepted {
-                publish_ami_event(
-                    access,
-                    &media_event(
-                        &device_id,
-                        call_id,
-                        AmiMediaKind::Audio,
-                        AmiMediaDirection::Transmit,
-                        AmiMediaState::Open,
-                        MediaStatus::Ok,
-                        Some(codec_id),
-                        Some(packet_ms),
-                    ),
-                );
-            }
-            Vec::new()
-        }
-        PhoneDeviceEventKind::TransmitChannelStarted {
+        PhoneDeviceEventKind::TransmitChannelOpen {
             call_id,
-            status: MediaStatus::Ok,
+            outcome: TransmitOpenOutcome::Acknowledged,
             mut endpoint,
         } => match normalize_phone_media_endpoint(access, &device_id, &mut endpoint) {
             Ok(()) => {
-                let codec_id = endpoint.codec.wire_value();
-                let packet_ms = endpoint.packet_ms;
-                let (actions, accepted) =
-                    controller_step(&access.shared.controller, |controller| {
-                        let actions = controller
-                            .media_transmission_started_for_device(&device_id, call_id, endpoint);
-                        let accepted = controller.call(call_id).is_some_and(|call| {
-                            call.device_id == device_id
-                                && call.audio_transmit == MediaStreamState::Open(endpoint)
-                        });
-                        (actions, accepted)
-                    });
-                execute_effects(access, actions).await;
-                if accepted {
-                    publish_ami_event(
-                        access,
-                        &media_event(
-                            &device_id,
-                            call_id,
-                            AmiMediaKind::Audio,
-                            AmiMediaDirection::Transmit,
-                            AmiMediaState::Open,
-                            MediaStatus::Ok,
-                            Some(codec_id),
-                            Some(packet_ms),
-                        ),
-                    );
-                }
+                commit_transmit_open(access, &device_id, call_id, endpoint).await;
                 Vec::new()
             }
             Err(error) => {
@@ -386,8 +367,18 @@ pub(super) async fn handle_media_event(
                 Vec::new()
             }
         },
-        PhoneDeviceEventKind::TransmitChannelStarted {
-            call_id, status, ..
+        PhoneDeviceEventKind::TransmitChannelOpen {
+            call_id,
+            outcome: TransmitOpenOutcome::Implied | TransmitOpenOutcome::NotReported,
+            endpoint,
+        } => {
+            commit_transmit_open(access, &device_id, call_id, endpoint).await;
+            Vec::new()
+        }
+        PhoneDeviceEventKind::TransmitChannelOpen {
+            call_id,
+            outcome: TransmitOpenOutcome::Rejected(status),
+            ..
         } => {
             ast_log(
                 LogLevel::Warning,
@@ -396,22 +387,10 @@ pub(super) async fn handle_media_event(
             handle_handset_hangup(access, call_id, false).await;
             Vec::new()
         }
-        PhoneDeviceEventKind::HandsetAcknowledgementTimedOut {
-            call_id,
-            acknowledgement,
-            ..
-        } => {
-            // A coupled 79x1 transaction is settled atomically by the
-            // protocol session's TransmitChannelImplied event. Any timeout
-            // reaching this layer therefore belongs to a still-unsettled
-            // required acknowledgement and is call-fatal.
-            let operation = match acknowledgement {
-                HandsetAcknowledgement::OpenReceiveChannel => "open receive channel",
-                HandsetAcknowledgement::StartMediaTransmission => "start media transmission",
-            };
+        PhoneDeviceEventKind::HandsetAcknowledgementTimedOut { call_id, .. } => {
             ast_log(
                 LogLevel::Warning,
-                &format!("phone did not acknowledge {operation} for call {call_id:?}"),
+                &format!("phone did not acknowledge open receive channel for call {call_id:?}"),
             );
             handle_handset_hangup(access, call_id, false).await;
             Vec::new()

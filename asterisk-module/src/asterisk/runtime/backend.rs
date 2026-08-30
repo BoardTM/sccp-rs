@@ -6,23 +6,25 @@ use super::{
     AsteriskChannelMetadata, AsteriskDatabase, AsteriskHints, AsteriskPartyUpdates, BargeOperation,
     BridgeOperation, CONFERENCE_ANNOUNCEMENT_PLAYBACK_WINDOW, CallFeatureError,
     CallFeatureProvider, CallId, CallMetadata, CallTransition, CallTransitionProgress,
-    ChannelAllocationError, ChannelMetadataError, Codec, ConferenceAnnouncement,
-    ConferenceAnnouncementOperation, ConferenceId, ConferenceTaskCancellation,
-    ControlProviderError, DeviceId, DirectMediaCall, DriverEffect, Duration, EffectExecutionError,
-    HandsetEffect, HashSet, Instant, LogLevel, MAX_RESTORE_ATTEMPTS, MediaAnchorReason,
-    MediaEndpoint, MutexExt, NonNull, PARKING_NOTIFICATION_TIME, ParkingOperation,
-    PartyUpdateError, PbxBackendError, PbxBridgeId, PbxCallId, PbxEffect, PbxServiceCapabilities,
-    PendingParkingNotification, PhoneCallState, PhoneCommand, PhoneCommandAction, PickupOperation,
-    RecordingError, RedirectReasonCode, RedirectingUpdate, RemoteHangupPlan,
-    RuntimeCallSignalDeliveryError, RuntimeCallSignalDeliveryResult, Shared, Weak,
-    allocate_announcement_generation, announcement_generation_is_current, ast_log, audio_framing,
-    c_string, cancel_no_answer_timer, configured_audio_processing, configured_audio_traffic_class,
+    ChannelAllocationError, ChannelAvailability, ChannelMetadataError, Codec,
+    ConferenceAnnouncement, ConferenceAnnouncementOperation, ConferenceId,
+    ConferenceTaskCancellation, ControlProviderError, DeviceId, DirectMediaCall, DriverEffect,
+    Duration, EffectExecutionError, HandsetEffect, HashSet, Instant, LogLevel,
+    MAX_RESTORE_ATTEMPTS, MediaAnchorReason, MediaEndpoint, MutexExt, NonNull,
+    PARKING_NOTIFICATION_TIME, ParkingOperation, PartyUpdateError, PbxBackendError, PbxBridgeId,
+    PbxCallId, PbxEffect, PbxServiceCapabilities, PendingParkingNotification, PhoneCallState,
+    PhoneCommand, PhoneCommandAction, PickupOperation, RecordingError, RedirectReasonCode,
+    RedirectingUpdate, RemoteHangupPlan, RuntimeCallSignalDeliveryError,
+    RuntimeCallSignalDeliveryResult, Shared, Weak, allocate_announcement_generation,
+    announcement_generation_is_current, ast_log, audio_framing, c_string, cancel_no_answer_timer,
+    channel_availability, configured_audio_processing, configured_audio_traffic_class,
     configured_dtmf_mode, controller_step, direct_media_call, execute_backend_cleanup_effects,
-    handset_effect_call_id, local_media_endpoint, native_bridging, native_channel,
-    publish_ami_event, publish_line, redirected_call_update, remove_channel,
-    replacement_anchor_plan, restore_attempts_exhausted, restore_redirecting_update,
-    show_conference_list, start_announcement, take_pending_retrieval_by_pbx,
-    validate_native_channel_metadata, validate_redirecting_update, with_channel,
+    handset_effect_call_id, local_media_endpoint, native_audio_format, native_bridging,
+    native_channel, pbx_audio_format, publish_ami_event, publish_line, redirected_call_update,
+    remove_channel, replacement_anchor_plan, restore_attempts_exhausted,
+    restore_redirecting_update, show_conference_list, start_announcement,
+    take_pending_retrieval_by_pbx, validate_native_channel_metadata, validate_redirecting_update,
+    with_channel,
 };
 use super::{
     AsteriskRecording, BridgeBackend, CString, CallDirection, CallInfo, CallServiceBackend,
@@ -147,7 +149,7 @@ pub async fn execute_call_transition_result(
 ) -> Result<bool, ControlProviderError> {
     let line = controller_step(&access.shared.controller, |controller| {
         controller
-            .call_by_pbx(transition.target_pbx_id)
+            .active_or_primary_call_by_pbx(transition.target_pbx_id)
             .map(|call| call.line.clone())
     });
     let backend = AsteriskBackend::new(access);
@@ -221,6 +223,31 @@ pub async fn execute_one_effect(
     index: usize,
     effect: DriverEffect,
 ) -> Result<(), EffectExecutionError<AsteriskBackendError, String>> {
+    let discard_stale_media_effect = match &effect {
+        DriverEffect::Backend(
+            PbxEffect::ConfigureMedia { call_id, .. }
+            | PbxEffect::ConfigureMediaOnly { call_id, .. },
+        ) => channel_availability(access, *call_id) == ChannelAvailability::Retiring,
+        DriverEffect::Handset(
+            HandsetEffect::BeginMedia { call_id, .. }
+            | HandsetEffect::BeginAnswerMedia { call_id, .. }
+            | HandsetEffect::BeginOutboundMedia { call_id, .. }
+            | HandsetEffect::BeginOneWayMedia { call_id, .. }
+            | HandsetEffect::BeginEarlyMedia { call_id, .. }
+            | HandsetEffect::StartMedia { call_id, .. },
+        ) => {
+            let pbx_id = controller_step(&access.shared.controller, |controller| {
+                controller.call_pbx_id(*call_id)
+            });
+            pbx_id.is_none_or(|pbx_id| {
+                channel_availability(access, pbx_id) == ChannelAvailability::Retiring
+            })
+        }
+        _ => false,
+    };
+    if discard_stale_media_effect {
+        return Ok(());
+    }
     match effect {
         DriverEffect::Backend(effect) => {
             let followup =
@@ -1300,7 +1327,7 @@ pub async fn begin_handset_media(
     let (packet_ms, max_frames_per_packet) = audio_framing(access, &device_id, call_id, codec);
     // Validate that Asterisk has an RTP instance, but leave the SCCP source
     // filter unrestricted so NAT does not prevent the phone opening media.
-    receive_media_source(access, call_id, codec)?;
+    receive_media_source(access, &device_id, call_id, codec)?;
     let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
     let audio_processing = configured_audio_processing(access, &device_id, call_id);
     if state != PhoneCallState::Connected {
@@ -1358,7 +1385,7 @@ pub async fn begin_answer_media(
 ) -> Result<(), String> {
     admit_clear_audio_media(access, &device_id, call_id)?;
     let (packet_ms, max_frames_per_packet) = audio_framing(access, &device_id, call_id, codec);
-    receive_media_source(access, call_id, codec)?;
+    receive_media_source(access, &device_id, call_id, codec)?;
     let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
     let audio_processing = configured_audio_processing(access, &device_id, call_id);
     access
@@ -1398,7 +1425,7 @@ pub async fn begin_outbound_media(
 ) -> Result<(), String> {
     admit_clear_audio_media(access, &device_id, call_id)?;
     let (packet_ms, max_frames_per_packet) = audio_framing(access, &device_id, call_id, codec);
-    let mut endpoint = receive_media_source(access, call_id, codec)?;
+    let mut endpoint = receive_media_source(access, &device_id, call_id, codec)?;
     endpoint.packet_ms = packet_ms;
     endpoint.max_frames_per_packet = max_frames_per_packet;
     let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
@@ -1439,14 +1466,18 @@ pub async fn begin_outbound_media(
 
 pub fn receive_media_source(
     access: &Access,
+    device_id: &DeviceId,
     call_id: CallId,
     codec: Codec,
 ) -> Result<MediaEndpoint, String> {
     let pbx_id = controller_step(&access.shared.controller, |controller| {
-        controller.call_pbx_id(call_id)
+        controller
+            .call(call_id)
+            .filter(|call| &call.device_id == device_id)
+            .map(|call| call.pbx_id)
     })
     .ok_or_else(|| format!("call {call_id:?} has no Asterisk channel"))?;
-    local_media_endpoint(access, pbx_id, codec)
+    local_media_endpoint(access, pbx_id, device_id, codec)
         .ok_or_else(|| format!("call {call_id:?} has no local media endpoint"))
 }
 
@@ -1682,7 +1713,9 @@ pub async fn handle_effect_error(
             } => {
                 if let Some(pending) = take_pending_retrieval_by_pbx(access, pbx_id) {
                     let call_id = controller_step(&access.shared.controller, |controller| {
-                        controller.call_by_pbx(pbx_id).map(|call| call.sccp_id)
+                        controller
+                            .active_or_primary_call_by_pbx(pbx_id)
+                            .map(|call| call.sccp_id)
                     });
                     if let Some(call_id) = call_id {
                         access
@@ -1725,7 +1758,7 @@ pub async fn handle_effect_error(
         PbxEffect::StartConferenceDestination { operation } => {
             let handset = controller_step(&access.shared.controller, |controller| {
                 controller
-                    .call_by_pbx(operation.call_id)
+                    .active_or_primary_call_by_pbx(operation.call_id)
                     .map(|call| (call.device_id.clone(), call.sccp_id))
             });
             if let Some((device_id, call_id)) = handset {

@@ -701,7 +701,7 @@ impl DeviceQueryProvider for RuntimeDeviceQueryProvider {
                     .ok_or(DeviceQueryLookupError::CurrentDeviceUnavailable)?;
                 controller_step(&shared.controller, |controller| {
                     controller
-                        .call_by_pbx(PbxCallId(pbx_id))
+                        .active_or_primary_call_by_pbx(PbxCallId(pbx_id))
                         .map(|call| call.device_id.clone())
                 })
                 .ok_or(DeviceQueryLookupError::CurrentDeviceUnavailable)?
@@ -722,7 +722,9 @@ pub fn device_query_snapshot(shared: &Shared, device_id: &DeviceId) -> Option<De
             address: device.registration.peer,
             reported_address: device.registration.reported_address_for_peer(),
             firmware: device.registration.firmware.clone(),
-            capability_count: device.capabilities.audio().len() + device.capabilities.video().len(),
+            capability_count: device.capabilities.as_ref().map_or(0, |capabilities| {
+                capabilities.audio().len() + capabilities.video().len()
+            }),
         });
         let features = controller
             .feature_state(device_id)
@@ -808,7 +810,7 @@ impl LineQueryProvider for RuntimeLineQueryProvider {
                     .ok_or(LineQueryLookupError::CurrentLineUnavailable)?;
                 controller_step(&shared.controller, |controller| {
                     controller
-                        .call_by_pbx(PbxCallId(pbx_id))
+                        .active_or_primary_call_by_pbx(PbxCallId(pbx_id))
                         .map(|call| call.line.clone())
                 })
                 .ok_or(LineQueryLookupError::CurrentLineUnavailable)?
@@ -943,8 +945,8 @@ impl CalledPartyProvider for RuntimeCalledPartyProvider {
             .ok_or(CalledPartyProviderError::NotDriverChannel)?;
         let owned = controller_step(&shared.controller, |controller| {
             controller
-                .call(state.sccp_id)
-                .is_some_and(|call| call.pbx_id == state.pbx_id)
+                .active_or_primary_call_by_pbx(state.pbx_id)
+                .is_some()
         });
         if !owned {
             return Err(CalledPartyProviderError::Unavailable);
@@ -1004,22 +1006,19 @@ impl HandsetMessageProvider for RuntimeHandsetMessageProvider {
             .ok_or(HandsetMessageProviderError::Unavailable)?;
         let state = unsafe { state_from_channel(channel.as_raw().cast::<sys::ast_channel>()) }
             .ok_or(HandsetMessageProviderError::NotDriverChannel)?;
-        let device_id = controller_step(&shared.controller, |controller| {
-            controller
-                .call(state.sccp_id)
-                .filter(|call| call.pbx_id == state.pbx_id)
-                .map(|call| call.device_id.clone())
+        let call = controller_step(&shared.controller, |controller| {
+            controller.active_or_primary_call_by_pbx(state.pbx_id)
         })
         .ok_or(HandsetMessageProviderError::Unavailable)?;
         let registered = controller_step(&shared.controller, |controller| {
-            controller.is_registered(&device_id)
+            controller.is_registered(&call.device_id)
         });
         if !registered {
             return Err(HandsetMessageProviderError::NotRegistered);
         }
         self.phone
             .try_send(PhoneCommand::new(
-                device_id,
+                call.device_id,
                 PhoneCommandAction::SetStatusMessage {
                     message: operation.0.clone(),
                     beep: false,
@@ -1146,9 +1145,12 @@ pub fn audio_preference_policy(
             .map(|device| device.capabilities.clone())
     })
     .ok_or(CodecPreferenceProviderError::Unavailable)?;
-    let station = (!station.audio().is_empty()).then_some(station);
+    let station = station.filter(|capabilities| !capabilities.audio().is_empty());
     let mut configured = Vec::new();
     for codec in media.codecs.iter().copied() {
+        if station.is_none() && !matches!(codec, Codec::Pcma | Codec::Pcmu) {
+            continue;
+        }
         let Ok(format) = pbx_audio_format(codec) else {
             continue;
         };

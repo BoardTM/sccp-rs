@@ -40,6 +40,7 @@ pub trait MediaBackend: PbxBackendError {
     fn configure_media(
         &self,
         call_id: PbxCallId,
+        device_id: &DeviceId,
         remote: MediaEndpoint,
         codec: Codec,
     ) -> Result<MediaEndpoint, Self::Error>;
@@ -134,7 +135,7 @@ pub trait PbxBackend:
                 codec,
                 remote,
             } => self
-                .configure_media(*call_id, *remote, *codec)
+                .configure_media(*call_id, device_id, *remote, *codec)
                 .map(|endpoint| {
                     Some(HandsetEffect::StartMedia {
                         device_id: device_id.clone(),
@@ -144,10 +145,11 @@ pub trait PbxBackend:
                 }),
             PbxEffect::ConfigureMediaOnly {
                 call_id,
+                device_id,
                 codec,
                 remote,
             } => self
-                .configure_media(*call_id, *remote, *codec)
+                .configure_media(*call_id, device_id, *remote, *codec)
                 .map(|_| None),
             PbxEffect::Hold { call_id } => self.hold(*call_id).map(|()| None),
             PbxEffect::Resume { call_id } => self.resume(*call_id).map(|()| None),

@@ -215,9 +215,7 @@ pub struct RegistrationWireDetails {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistrationWireLayout {
     Alternate32,
-    Canonical {
-        prefix_bytes: u8,
-    },
+    Canonical { prefix_bytes: u8 },
 }
 
 impl Default for RegistrationWireLayout {
@@ -1646,9 +1644,7 @@ pub enum ClientMessage {
     Register(RegistrationMessage),
     /// Reports the UDP port on which the station expects media.
     /// Supplies the station RTP port to server-side media setup.
-    IpPort {
-        rtp_port: u16,
-    },
+    IpPort { rtp_port: u16 },
     /// Reports a digit pressed on the station keypad.
     /// Associates the input with its line and call when the wire layout permits.
     KeypadButton {
@@ -1692,9 +1688,7 @@ pub enum ClientMessage {
     },
     /// Requests the configured status of one station line.
     /// Uses the line instance to select the directory number response.
-    LineStatRequest {
-        line_instance: u32,
-    },
+    LineStatRequest { line_instance: u32 },
     /// Requests the station's current device configuration.
     /// Prompts the server to return its configuration status.
     ConfigStatRequest,
@@ -1762,9 +1756,7 @@ pub enum ClientMessage {
     },
     /// Requests removal of the station registration.
     /// Carries the station-provided reason for ending the session.
-    Unregister {
-        reason: u32,
-    },
+    Unregister { reason: u32 },
     /// Requests a registration token before full station registration.
     /// Supplies the station identity used for token admission control.
     RegisterToken(RegisterTokenMessage),
@@ -1779,22 +1771,16 @@ pub enum ClientMessage {
     },
     /// Requests call-forwarding state for one line.
     /// Prompts the server to return configured forwarding destinations.
-    ForwardStatusRequest {
-        line_instance: u32,
-    },
+    ForwardStatusRequest { line_instance: u32 },
     /// Requests the contents of one speed-dial entry.
     /// Uses the speed-dial instance to select the response.
-    SpeedDialStatusRequest {
-        speed_dial_instance: u32,
-    },
+    SpeedDialStatusRequest { speed_dial_instance: u32 },
     /// Returns media connection statistics collected by the station.
     /// Carries packet, jitter, latency, and quality data for a call.
     ConnectionStatisticsResponse(ConnectionStatistics),
     /// Reports whether the station headset is enabled.
     /// Updates the server's view of the station audio accessory state.
-    HeadsetStatus {
-        enabled: bool,
-    },
+    HeadsetStatus { enabled: bool },
     /// Reports a station media-resource state change.
     /// Carries the resource type, direction, and availability details.
     MediaResourceNotification(MediaResourceNotification),
@@ -1822,14 +1808,10 @@ pub enum ClientMessage {
     },
     /// Reports how many line appearances the station can register.
     /// Lets the server constrain provisioning to the station's capacity.
-    RegisterAvailableLines {
-        lines: u32,
-    },
+    RegisterAvailableLines { lines: u32 },
     /// Requests the configured service URL at an index.
     /// Prompts the server to return its URL, label, and extension text.
-    ServiceUrlStatusRequest {
-        index: u32,
-    },
+    ServiceUrlStatusRequest { index: u32 },
     /// Requests the state of a provisioned feature button.
     /// Carries the feature index and station capability bits.
     FeatureStatusRequest {
@@ -1929,9 +1911,7 @@ pub enum ServerMessage {
     },
     /// Rejects a station registration attempt.
     /// Returns a human-readable reason for refusing the registration.
-    RegisterReject {
-        reason: String,
-    },
+    RegisterReject { reason: String },
     /// Acknowledges a station keepalive message.
     /// Confirms that the signaling session remains active.
     KeepAliveAck,
@@ -1963,9 +1943,7 @@ pub enum ServerMessage {
     },
     /// Supplies the firmware or load version assigned to the station.
     /// Answers the station's version request during provisioning.
-    Version {
-        firmware: String,
-    },
+    Version { firmware: String },
     /// Supplies the station's signaling-server list.
     /// Provides primary and failover endpoints for server discovery.
     ServerResponse {
@@ -1986,14 +1964,10 @@ pub enum ServerMessage {
     },
     /// Supplies the soft-key actions supported by the server.
     /// Defines the action identifiers referenced by soft-key sets.
-    SoftKeyTemplate {
-        actions: Vec<values::SoftKey>,
-    },
+    SoftKeyTemplate { actions: Vec<values::SoftKey> },
     /// Supplies the station's soft-key set profile.
     /// Maps call modes to ordered soft-key action lists.
-    SoftKeySet {
-        profile: SoftKeyProfile,
-    },
+    SoftKeySet { profile: SoftKeyProfile },
     /// Selects the soft-key set shown for a call.
     /// Uses a validity mask to enable positions in the selected set.
     SelectSoftKeys {
@@ -2033,10 +2007,7 @@ pub enum ServerMessage {
     },
     /// Displays a transient notification on the station.
     /// Supplies notification text and its timeout.
-    DisplayNotify {
-        timeout_seconds: u32,
-        text: String,
-    },
+    DisplayNotify { timeout_seconds: u32, text: String },
     /// Clears the station's transient notification.
     /// Removes the notification created by a display-notify message.
     ClearNotify,
@@ -2049,9 +2020,7 @@ pub enum ServerMessage {
     },
     /// Clears notifications at a specified priority.
     /// Leaves notifications at other priorities unaffected.
-    ClearPriorityNotify {
-        priority: NotificationPriority,
-    },
+    ClearPriorityNotify { priority: NotificationPriority },
     /// Notifies the station of a DTMF tone state.
     /// Carries digit and call context without requesting local tone generation.
     NotifyDtmfTone(DtmfToneControl),
@@ -2070,9 +2039,7 @@ pub enum ServerMessage {
     },
     /// Stops the active announcement for a conference.
     /// Targets the announcement by conference identifier.
-    StopAnnouncement {
-        conference_id: u32,
-    },
+    StopAnnouncement { conference_id: u32 },
     /// Reports or confirms announcement completion to the station.
     /// Carries the conference identifier and final play status.
     AnnouncementFinish {
@@ -2090,9 +2057,7 @@ pub enum ServerMessage {
     CreateConferenceRequest(CreateConferenceRequest),
     /// Requests deletion of a station-managed conference.
     /// Targets the conference by identifier.
-    DeleteConferenceRequest {
-        conference_id: ConferenceId,
-    },
+    DeleteConferenceRequest { conference_id: ConferenceId },
     /// Requests changes to a station-managed conference.
     /// Carries the updated conference attributes and identifiers.
     ModifyConferenceRequest(ModifyConferenceRequest),
@@ -2110,9 +2075,7 @@ pub enum ServerMessage {
     },
     /// Requests the station's state for conference participants.
     /// Targets the participant set associated with a conference.
-    AuditParticipantRequest {
-        conference_id: ConferenceId,
-    },
+    AuditParticipantRequest { conference_id: ConferenceId },
     /// Requests changes to a conference participant.
     /// Carries updated participant attributes and identifiers.
     ChangeParticipantRequest(ChangeParticipantRequest),
@@ -2137,9 +2100,7 @@ pub enum ServerMessage {
     FlowControlNotify(VideoFlowControl),
     /// Activates the station call-control plane for a line.
     /// Makes the selected line instance the active call plane.
-    ActivateCallPlane {
-        line_instance: u32,
-    },
+    ActivateCallPlane { line_instance: u32 },
     /// Deactivates the station call-control plane.
     /// Removes the currently active call-plane selection.
     DeactivateCallPlane,
@@ -2154,19 +2115,13 @@ pub enum ServerMessage {
     RegisterTokenAck,
     /// Rejects a station registration-token request.
     /// Supplies the delay before the station should retry.
-    RegisterTokenReject {
-        backoff_seconds: u32,
-    },
+    RegisterTokenReject { backoff_seconds: u32 },
     /// Accepts an SPCP registration-token request with a feature word.
     /// Allows the station to continue its SPCP registration sequence.
-    SpcpRegisterTokenAck {
-        features: u32,
-    },
+    SpcpRegisterTokenAck { features: u32 },
     /// Rejects an SPCP registration-token request temporarily.
     /// Supplies the delay before the station should request another token.
-    SpcpRegisterTokenReject {
-        backoff_seconds: u32,
-    },
+    SpcpRegisterTokenReject { backoff_seconds: u32 },
     /// Sets the station ringer behavior for a call.
     /// Carries mode, duration, line, and call context.
     SetRinger {
@@ -2295,9 +2250,7 @@ pub enum ServerMessage {
     Reset(ResetType),
     /// Displays text in the station's general display area.
     /// Replaces the current non-call-specific display text.
-    DisplayText {
-        text: String,
-    },
+    DisplayText { text: String },
     /// Clears the station's general display area.
     /// Removes text previously sent with a display-text message.
     ClearDisplay,
@@ -2400,10 +2353,7 @@ pub enum ServerMessage {
     CallCountResponse(CallCountResponse),
     /// Updates the station's recording indicator for a call.
     /// Carries the call reference and whether recording is active.
-    RecordingStatus {
-        call_reference: u32,
-        active: bool,
-    },
+    RecordingStatus { call_reference: u32, active: bool },
     /// Preserves a recognized server-to-station message without typed decoding.
     /// Retains its catalog identifier and payload bytes for lossless handling.
     KnownOpaque(KnownOpaqueMessage),
@@ -3706,10 +3656,10 @@ mod tests {
     }
 
     #[test]
-    fn enbloc_uses_the_protocol_19_alignment_boundary() {
+    fn enbloc_uses_the_protocol_19_text_width_boundary() {
         for (protocol, payload_len, line_offset) in [
             (ProtocolVersion::V18, 28, 24),
-            (ProtocolVersion::V19, 32, 28),
+            (ProtocolVersion::V19, 29, 25),
         ] {
             let message = ClientMessage::EnblocCall {
                 called_party: "9801".into(),
@@ -3883,12 +3833,10 @@ mod tests {
 
     #[test]
     fn malformed_counts_and_oversized_text_are_rejected() {
+        let mut capabilities = vec![0; 4 + 18 * 16];
+        capabilities[..4].copy_from_slice(&19_u32.to_le_bytes());
         assert!(matches!(
-            ClientMessage::decode(Frame::new(
-                22,
-                wire_id::CAPABILITIES_RES,
-                19_u32.to_le_bytes().to_vec(),
-            )),
+            ClientMessage::decode(Frame::new(22, wire_id::CAPABILITIES_RES, capabilities,)),
             Err(CodecError::CountTooLarge { .. })
         ));
         assert!(matches!(

@@ -110,7 +110,7 @@ impl Controller {
             RegisteredDevice {
                 registration,
                 session_generation,
-                capabilities: StationMediaCapabilities::default(),
+                capabilities: None,
                 audio_encryption: StationEncryptionCapabilities::default(),
                 selected_line: None,
                 active_call: None,
@@ -2596,7 +2596,7 @@ impl Controller {
     }
 
     pub fn pbx_hangup_with_effects(&mut self, pbx_id: PbxCallId) -> Option<PbxHangupOutcome> {
-        let transition_primary = self.call_by_pbx(pbx_id);
+        let transition_primary = self.primary_call_by_pbx(pbx_id);
         #[cfg(any(test, feature = "asterisk-22", feature = "asterisk-23"))]
         let transition_effects = self.abort_call_transitions_for_pbx(pbx_id);
         #[cfg(not(any(test, feature = "asterisk-22", feature = "asterisk-23")))]
@@ -2619,7 +2619,7 @@ impl Controller {
                 .cloned()
         };
         if let Some(transaction) = transfer {
-            let primary = self.call_by_pbx(pbx_id);
+            let primary = self.primary_call_by_pbx(pbx_id);
             let terminated_leg = if transaction.source.pbx_call_id == pbx_id {
                 transaction.source
             } else {
@@ -2651,7 +2651,7 @@ impl Controller {
         if let Some(session) = self.conference_session_by_pbx(pbx_id).cloned() {
             self.conference_mutations
                 .remove(&ConferenceMutationOwner::Session(session.id));
-            let primary = self.call_by_pbx(pbx_id);
+            let primary = self.primary_call_by_pbx(pbx_id);
             if let Some(pending) = session.pending_participant_mutation
                 && pending.kind == ConferenceParticipantMutationKind::Remove
                 && pending.call_id == pbx_id
@@ -2754,12 +2754,22 @@ impl Controller {
             .map(|appearance| appearance.line_instance)
     }
 
-    pub fn call_by_pbx(&self, pbx_id: PbxCallId) -> Option<CallSnapshot> {
+    pub fn primary_call_by_pbx(&self, pbx_id: PbxCallId) -> Option<CallSnapshot> {
         self.call_registry
             .pbx
             .get(&pbx_id)
             .and_then(|call| call.appearance_ids.first())
             .and_then(|appearance_id| self.call_snapshot(*appearance_id))
+    }
+
+    pub fn active_call_by_pbx(&self, pbx_id: PbxCallId) -> Option<CallSnapshot> {
+        let appearance_id = self.call_registry.pbx.get(&pbx_id)?.active_appearance?;
+        self.call_snapshot(appearance_id)
+    }
+
+    pub fn active_or_primary_call_by_pbx(&self, pbx_id: PbxCallId) -> Option<CallSnapshot> {
+        self.active_call_by_pbx(pbx_id)
+            .or_else(|| self.primary_call_by_pbx(pbx_id))
     }
 
     pub fn calls(&self) -> impl Iterator<Item = CallSnapshot> + '_ {
@@ -2799,11 +2809,7 @@ impl Controller {
     }
 
     pub fn active_call_id(&self, pbx_id: PbxCallId) -> Option<CallId> {
-        let call = self.call_registry.pbx.get(&pbx_id)?;
-        self.call_registry
-            .appearances
-            .get(&call.active_appearance?)
-            .map(|appearance| appearance.sccp_id)
+        self.active_call_by_pbx(pbx_id).map(|call| call.sccp_id)
     }
 
     pub fn call_appearance(&self, appearance_id: CallAppearanceId) -> Option<&CallAppearance> {

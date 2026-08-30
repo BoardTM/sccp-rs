@@ -171,22 +171,21 @@ pub fn set_remote_video_endpoint(
     dead_code,
     reason = "used when a video command descriptor is available"
 )]
-pub fn local_video_endpoint(access: &Access, pbx_id: PbxCallId) -> Option<MediaEndpointAddress> {
+pub fn local_video_endpoint(
+    access: &Access,
+    pbx_id: PbxCallId,
+    device_id: &DeviceId,
+) -> Option<MediaEndpointAddress> {
     let endpoint = with_channel(access, pbx_id, |channel| {
         NonNull::new(channel).and_then(|channel| unsafe {
             native_channel::video::local_video_endpoint(channel).ok()
         })
     })
     .flatten()?;
-    let device_id = controller_step(&access.shared.controller, |controller| {
-        controller
-            .call_by_pbx(pbx_id)
-            .map(|call| call.device_id.clone())
-    })?;
     let config = access.config();
     let external = resolved_external_addresses(access, &config);
-    let policy = address_selection_policy(&config, &device_id, external)?;
-    let (signaling_peer, registration_reported) = station_address_context(access, &device_id)?;
+    let policy = address_selection_policy(&config, device_id, external)?;
+    let (signaling_peer, registration_reported) = station_address_context(access, device_id)?;
     let (address, _) = policy
         .advertised_media(endpoint.address, signaling_peer, registration_reported)
         .ok()?;
@@ -199,6 +198,7 @@ pub fn local_video_endpoint(access: &Access, pbx_id: PbxCallId) -> Option<MediaE
 pub fn local_media_endpoint(
     access: &Access,
     pbx_id: PbxCallId,
+    device_id: &DeviceId,
     codec: Codec,
 ) -> Option<MediaEndpoint> {
     let endpoint = with_channel(access, pbx_id, |channel| {
@@ -206,15 +206,10 @@ pub fn local_media_endpoint(
             .and_then(|channel| unsafe { native_channel::local_media_endpoint(channel).ok() })
     });
     let endpoint = endpoint.flatten()?;
-    let device_id = controller_step(&access.shared.controller, |controller| {
-        controller
-            .call_by_pbx(pbx_id)
-            .map(|call| call.device_id.clone())
-    })?;
     let config = access.config();
     let external = resolved_external_addresses(access, &config);
-    let policy = address_selection_policy(&config, &device_id, external)?;
-    let (signaling_peer, registration_reported) = station_address_context(access, &device_id)?;
+    let policy = address_selection_policy(&config, device_id, external)?;
+    let (signaling_peer, registration_reported) = station_address_context(access, device_id)?;
     let (address, _) = policy
         .advertised_media(endpoint.address, signaling_peer, registration_reported)
         .ok()?;
@@ -277,7 +272,8 @@ pub(super) fn prepare_anchor_retarget(
     access: &Access,
     call: &DirectMediaCall,
 ) -> Option<PendingMediaRetarget> {
-    let Some(mut endpoint) = local_media_endpoint(access, call.pbx_id, call.codec) else {
+    let Some(mut endpoint) = local_media_endpoint(access, call.pbx_id, &call.device_id, call.codec)
+    else {
         return None;
     };
     let (packet_ms, max_frames_per_packet) =
@@ -386,13 +382,15 @@ pub fn recover_failed_media_transmission(
         .media_anchors
         .lock_unpoisoned()
         .is_anchored(call.pbx_id);
-    let anchor = local_media_endpoint(access, call.pbx_id, call.codec).map(|mut endpoint| {
-        let (packet_ms, max_frames_per_packet) =
-            audio_framing(access, &call.device_id, call.call_id, call.codec);
-        endpoint.packet_ms = packet_ms;
-        endpoint.max_frames_per_packet = max_frames_per_packet;
-        endpoint
-    });
+    let anchor = local_media_endpoint(access, call.pbx_id, &call.device_id, call.codec).map(
+        |mut endpoint| {
+            let (packet_ms, max_frames_per_packet) =
+                audio_framing(access, &call.device_id, call.call_id, call.codec);
+            endpoint.packet_ms = packet_ms;
+            endpoint.max_frames_per_packet = max_frames_per_packet;
+            endpoint
+        },
+    );
     let Some(anchor) = direct_failure_anchor(failed_endpoint, anchor, anchoring_required) else {
         return MediaFailureDisposition::Hangup;
     };
@@ -452,11 +450,12 @@ pub fn audio_framing(
         controller
             .registered_device(device)
             .and_then(|state| {
-                state
-                    .capabilities
-                    .audio()
-                    .iter()
-                    .find(|capability| capability.codec == codec)
+                state.capabilities.as_ref().and_then(|capabilities| {
+                    capabilities
+                        .audio()
+                        .iter()
+                        .find(|capability| capability.codec == codec)
+                })
             })
             .map(|capability| capability.max_frames_per_packet)
     });

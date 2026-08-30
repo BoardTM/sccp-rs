@@ -3181,8 +3181,9 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
     ));
     assert!(matches!(
         events.recv().await,
-        Some(Event::Device(DeviceEvent { session_generation: _, device_id: _, event: DeviceEventKind::TransmitChannelImplied {
+        Some(Event::Device(DeviceEvent { session_generation: _, device_id: _, event: DeviceEventKind::TransmitChannelOpen {
             call_id: CallId(1),
+            outcome: TransmitOpenOutcome::Implied,
             endpoint: actual,
             ..
         } })) if actual == endpoint
@@ -3275,9 +3276,9 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         Some(Event::Device(DeviceEvent {
             session_generation: _,
             device_id: _,
-            event: DeviceEventKind::TransmitChannelStarted {
+            event: DeviceEventKind::TransmitChannelOpen {
                 call_id: CallId(1),
-                status: MediaStatus::Ok,
+                outcome: TransmitOpenOutcome::Acknowledged,
                 ..
             }
         }))
@@ -3433,9 +3434,9 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         Some(Event::Device(DeviceEvent {
             session_generation: _,
             device_id: _,
-            event: DeviceEventKind::TransmitChannelStarted {
+            event: DeviceEventKind::TransmitChannelOpen {
                 call_id: CallId(1),
-                status: MediaStatus::UnspecifiedError,
+                outcome: TransmitOpenOutcome::Rejected(MediaStatus::UnspecifiedError),
                 ..
             }
         }))
@@ -3753,18 +3754,12 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         )
         .await
         .unwrap();
-    assert!(matches!(
-        events.recv().await,
-        Some(Event::Device(DeviceEvent {
-            session_generation: _,
-            device_id: _,
-            event: DeviceEventKind::Digit {
-                call_id: CallId(1),
-                digit: Digit::Number(4),
-                ..
-            }
-        }))
-    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), events.recv())
+            .await
+            .is_err(),
+        "an RTP-negotiated digit was duplicated on the signaling channel"
+    );
 
     phone
         .write_all(
@@ -3830,9 +3825,9 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         .unwrap();
     assert!(matches!(
         events.recv().await,
-        Some(Event::Device(DeviceEvent { session_generation: _, device_id: _, event: DeviceEventKind::TransmitChannelStarted {
+        Some(Event::Device(DeviceEvent { session_generation: _, device_id: _, event: DeviceEventKind::TransmitChannelOpen {
             call_id: CallId(1),
-            status: MediaStatus::Ok,
+            outcome: TransmitOpenOutcome::Acknowledged,
             endpoint: MediaEndpoint {
                 address,
                 rtp_port: 4000,
@@ -3968,9 +3963,9 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
         .unwrap();
     assert!(matches!(
         events.recv().await,
-        Some(Event::Device(DeviceEvent { session_generation: _, device_id: _, event: DeviceEventKind::TransmitChannelStarted {
+        Some(Event::Device(DeviceEvent { session_generation: _, device_id: _, event: DeviceEventKind::TransmitChannelOpen {
             call_id: CallId(1),
-            status: MediaStatus::Ok,
+            outcome: TransmitOpenOutcome::Acknowledged,
             endpoint: MediaEndpoint {
                 address,
                 rtp_port: 5000,
@@ -4155,8 +4150,10 @@ fn handset_acknowledgement_deadlines_are_bounded_ordered_and_exactly_once() {
     let mut first = session_call(20);
     first.media.receive.state = MediaChannelState::Opening;
     first.media.receive.deadline = Some(now);
-    first.media.transmit.state = MediaChannelState::Opening;
-    first.media.transmit.deadline = Some(now + Duration::from_millis(1));
+    first.media.transmit.state = MediaChannelState::Open;
+    first.media.transmit_confirmation = TransmitConfirmation::Awaiting {
+        deadline: now + Duration::from_millis(1),
+    };
     first.media.coupled_transmit_endpoint = Some(MediaEndpoint {
         address: "198.51.100.20".parse().unwrap(),
         rtp_port: 6000,
@@ -4167,20 +4164,35 @@ fn handset_acknowledgement_deadlines_are_bounded_ordered_and_exactly_once() {
         telephone_event_payload: 0,
     });
     let mut second = session_call(10);
-    second.media.transmit.state = MediaChannelState::Opening;
-    second.media.transmit.deadline = Some(now);
+    let second_endpoint = MediaEndpoint {
+        address: "198.51.100.10".parse().unwrap(),
+        rtp_port: 5000,
+        rtcp_port: 5001,
+        codec: Codec::Pcmu,
+        packet_ms: 20,
+        max_frames_per_packet: 1,
+        telephone_event_payload: 0,
+    };
+    second.media.transmit.state = MediaChannelState::Open;
+    second.media.transmit.peer = Some(second_endpoint);
+    second.media.transmit_confirmation = TransmitConfirmation::Awaiting { deadline: now };
     let mut calls = HashMap::from([(first.call_id, first), (second.call_id, second)]);
 
     assert_eq!(
         expire_handset_acknowledgements(&mut calls, now),
         [
-            (CallId(10), HandsetAcknowledgement::StartMediaTransmission,),
-            (CallId(20), HandsetAcknowledgement::OpenReceiveChannel),
+            ExpiredHandsetAcknowledgement::Transmit {
+                call_id: CallId(10),
+                endpoint: second_endpoint,
+            },
+            ExpiredHandsetAcknowledgement::Receive {
+                call_id: CallId(20),
+            },
         ]
     );
     assert_eq!(
         calls[&CallId(10)].media.transmit.state,
-        MediaChannelState::Closed
+        MediaChannelState::Open
     );
     assert_eq!(
         calls[&CallId(20)].media.receive.state,
@@ -4194,6 +4206,24 @@ fn handset_acknowledgement_deadlines_are_bounded_ordered_and_exactly_once() {
     assert!(expire_handset_acknowledgements(&mut calls, now).is_empty());
     assert!(expire_handset_acknowledgements(&mut calls, now + Duration::from_millis(1)).is_empty());
     assert!(expire_handset_acknowledgements(&mut calls, now + Duration::from_secs(1)).is_empty());
+}
+
+#[test]
+fn late_transmit_acknowledgements_confirm_silently_but_rejections_remain_reportable() {
+    assert_eq!(
+        TransmitConfirmation::NotReported.acknowledgement_is_reportable(MediaStatus::Ok),
+        Some(false)
+    );
+    assert_eq!(
+        TransmitConfirmation::NotReported
+            .acknowledgement_is_reportable(MediaStatus::UnspecifiedError),
+        Some(true)
+    );
+    assert_eq!(
+        TransmitConfirmation::Settled(TransmitOpenOutcome::Acknowledged)
+            .acknowledgement_is_reportable(MediaStatus::Ok),
+        None
+    );
 }
 
 #[tokio::test]
@@ -4505,7 +4535,7 @@ async fn hangup_statistics_are_exactly_correlated_retained_and_not_replayed() {
         .unwrap();
     assert!(matches!(
         events.recv().await,
-        Some(Event::Device(DeviceEvent { session_generation: _, device_id: _, event: DeviceEventKind::TransmitChannelStarted { endpoint, .. } })) if endpoint == transmit_peer
+        Some(Event::Device(DeviceEvent { session_generation: _, device_id: _, event: DeviceEventKind::TransmitChannelOpen { outcome: TransmitOpenOutcome::Acknowledged, endpoint, .. } })) if endpoint == transmit_peer
     ));
     handle
         .send(Command::new(

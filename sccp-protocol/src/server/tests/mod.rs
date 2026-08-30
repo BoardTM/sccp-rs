@@ -184,6 +184,7 @@ fn session_call(call_id: u64) -> SessionCall {
         video_receive: VideoReceive::default(),
         video_transmit: VideoTransmit::default(),
         state: CallState::Connected,
+        ringer: None,
         history_disposition: CallHistoryDisposition::Placed,
         dialed_number: String::new(),
         statistics_directory_number: String::new(),

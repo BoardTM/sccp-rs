@@ -417,7 +417,7 @@ fn video_rtp_has_independent_transactional_ownership_and_glue() {
     assert!(runtime.contains("VideoFallbackReason::LocalEndpointUnavailable"));
     assert!(runtime.contains_literal("unable to apply configured video socket QoS"));
     assert!(runtime.contains_literal("unable to allocate optional video RTP"));
-    assert!(runtime.contains("local_video_endpoint(access, pbx_id)"));
+    assert!(runtime.contains("local_video_endpoint(access, pbx_id, &binding.device_id)"));
 
     let receive = rust_match_arm(
         &calls,
@@ -431,6 +431,35 @@ fn video_rtp_has_independent_transactional_ownership_and_glue() {
     let unload = function_body(&driver, "pub(super) fn unload()", "pub(super) fn reload()");
     assert!(unload.contains("has_active_channels()"));
     assert!(unload.contains("native_registration().take()"));
+}
+
+#[test]
+fn native_hangup_retires_the_binding_until_serialized_cleanup() {
+    let exports = source("src/asterisk/exports.rs");
+    let hangup = rust_item(&exports, "pub unsafe fn hangup_channel");
+    assert!(hangup.contains(".get(&state.pbx_id)"));
+    assert!(hangup.contains("binding.close()"));
+    assert!(!hangup.contains(".remove(&state.pbx_id)"));
+
+    let backend = source("src/asterisk/runtime/backend.rs");
+    let execute = rust_item(&backend, "pub async fn execute_one_effect");
+    assert!(execute.contains("ChannelAvailability::Retiring"));
+    assert!(execute.contains("discard_stale_media_effect"));
+
+    let services = source("src/asterisk/runtime/services.rs");
+    let cleanup = rust_item(&services, "pub async fn handle_runtime_hangup_signal");
+    assert!(cleanup.contains("remove_channel(access, pbx_id)"));
+}
+
+#[test]
+fn shared_media_owner_selects_format_before_remote_endpoint() {
+    let media = source("src/asterisk/runtime/backend/media_effects.rs");
+    let configure = rust_item(&media, "fn configure_media");
+    let format = configure.find("native_channel::set_audio_format").unwrap();
+    let endpoint = configure.find("native_channel::set_remote_media").unwrap();
+    assert!(format < endpoint);
+    assert!(configure.contains("device_id: &DeviceId"));
+    assert!(configure.contains("local_media_endpoint(self.access, call_id, device_id, codec)"));
 }
 
 #[test]

@@ -431,7 +431,7 @@ pub async fn execute_handset_effect(access: &Access, effect: HandsetEffect) -> R
                 // Do not constrain the handset's receive channel to the
                 // advertised server endpoint: SCCP's wildcard source is
                 // required when the media path traverses NAT.
-                receive_media_source(access, call_id, codec)?;
+                receive_media_source(access, &device_id, call_id, codec)?;
                 let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
                 let audio_processing = configured_audio_processing(access, &device_id, call_id);
                 access

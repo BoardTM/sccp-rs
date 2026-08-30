@@ -123,10 +123,10 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
             "legacy enbloc call",
             ProtocolVersion::V3,
             MessageId::EnblocCall.wire_value(),
-            28,
+            24,
             ClientMessage::EnblocCall {
                 called_party: "2001".into(),
-                line_instance: 2,
+                line_instance: 0,
             },
         ),
         (
@@ -143,7 +143,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
             "v22 enbloc call",
             ProtocolVersion::V22,
             MessageId::EnblocCall.wire_value(),
-            32,
+            29,
             ClientMessage::EnblocCall {
                 called_party: "2001".into(),
                 line_instance: 2,
