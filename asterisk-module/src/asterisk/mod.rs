@@ -16,8 +16,8 @@
 //! # Native CLI
 //!
 //! The module registers exactly `sccp show devices`, `sccp show lines`,
-//! `sccp show channels`, `sccp reload`, `sccp reset <device>`,
-//! `sccp restart <device>`, bounded DND/message/call controls, and
+//! `sccp show channels`, `sccp reload`, `sccp reset <device|all>`,
+//! `sccp restart <device|all>`, bounded DND/message/call controls, and
 //! `sccp set forwarding <device> <line> <all|busy|noanswer>
 //! <destination|off>`. The three show commands provide bounded, deterministic
 //! list and detail views with completion for their typed selectors. Mutating
@@ -83,9 +83,9 @@ use crate::ami::controls::{
     CliControlError, ControlOperation, ControlOutcome, ControlProvider, ControlProviderError,
     MAX_ASSIGNED_CHANNEL_ID_BYTES, MAX_BOOLEAN_BYTES, MAX_CALL_ID_BYTES, MAX_DEVICE_SELECTOR_BYTES,
     MAX_DIAL_DESTINATION_BYTES, MAX_LINE_SELECTOR_BYTES, MAX_MESSAGE_BYTES, MAX_TIMEOUT_BYTES,
-    MessageTarget, ResetMode, complete_cli_device, complete_cli_value, execute_cli_answer,
-    execute_cli_device_control, execute_cli_end, execute_cli_message, execute_cli_originate,
-    register_control_actions,
+    MessageTarget, ResetMode, ResetTarget, complete_cli_device, complete_cli_reset_target,
+    complete_cli_value, execute_cli_answer, execute_cli_device_control, execute_cli_end,
+    execute_cli_message, execute_cli_originate, register_control_actions,
 };
 use crate::ami::events::{
     AmiEventError, AmiEventPublisher, FeatureChange, MediaDirection as AmiMediaDirection,

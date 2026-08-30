@@ -90,6 +90,12 @@ impl ResetMode {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResetTarget {
+    Device(DeviceId),
+    RegisteredDevices,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub enum ControlOperation {
     Message {
@@ -99,7 +105,7 @@ pub enum ControlOperation {
         timeout_seconds: u8,
     },
     Reset {
-        device_id: DeviceId,
+        target: ResetTarget,
         mode: ResetMode,
     },
     Answer {
@@ -132,9 +138,9 @@ impl fmt::Debug for ControlOperation {
                 .field("beep", beep)
                 .field("timeout_seconds", timeout_seconds)
                 .finish(),
-            Self::Reset { device_id, mode } => formatter
+            Self::Reset { target, mode } => formatter
                 .debug_struct("Reset")
-                .field("device_id", device_id)
+                .field("target", target)
                 .field("mode", mode)
                 .finish(),
             Self::Answer { call_id, device_id } => formatter
@@ -168,8 +174,10 @@ pub enum ControlOutcome {
         persistent: bool,
     },
     Reset {
-        device_id: DeviceId,
+        target: ResetTarget,
         mode: ResetMode,
+        attempted: usize,
+        delivered: usize,
     },
     Answer {
         device_id: DeviceId,
@@ -247,9 +255,13 @@ pub fn execute_cli_device_control<P: ControlProvider + ?Sized>(
     device: &str,
     mode: ResetMode,
 ) -> Result<ControlOutcome, CliControlError> {
-    let device_id = parse_cli_device(device)?;
+    let target = if device.eq_ignore_ascii_case("all") {
+        ResetTarget::RegisteredDevices
+    } else {
+        ResetTarget::Device(parse_cli_device(device)?)
+    };
     provider
-        .execute(ControlOperation::Reset { device_id, mode })
+        .execute(ControlOperation::Reset { target, mode })
         .map_err(Into::into)
 }
 
@@ -382,6 +394,22 @@ pub fn complete_cli_device<'a>(
 ) -> Option<String> {
     complete_cli_value(
         devices.into_iter().map(DeviceId::as_str),
+        prefix,
+        ordinal,
+        MAX_DEVICE_SELECTOR_BYTES,
+    )
+}
+
+pub fn complete_cli_reset_target<'a>(
+    devices: impl IntoIterator<Item = &'a DeviceId>,
+    prefix: &str,
+    ordinal: usize,
+) -> Option<String> {
+    complete_cli_value(
+        devices
+            .into_iter()
+            .map(DeviceId::as_str)
+            .chain(std::iter::once("all")),
         prefix,
         ordinal,
         MAX_DEVICE_SELECTOR_BYTES,
@@ -669,7 +697,7 @@ fn execute_control_request<P: ControlProvider + ?Sized>(
             }
         }
         ControlAction::DeviceRestart => ControlOperation::Reset {
-            device_id: parse_device(required(&fields, "devicename")?)?,
+            target: ResetTarget::Device(parse_device(required(&fields, "devicename")?)?),
             mode: fields
                 .get("type")
                 .map(|value| parse_reset_mode(value))
@@ -839,7 +867,11 @@ fn outcome_response(outcome: ControlOutcome) -> ManagerResponse {
             }
             ("Message delivered", failed != 0, fields)
         }
-        ControlOutcome::Reset { device_id, mode } => (
+        ControlOutcome::Reset {
+            target: ResetTarget::Device(device_id),
+            mode,
+            ..
+        } => (
             "Device command delivered",
             false,
             vec![
@@ -847,6 +879,21 @@ fn outcome_response(outcome: ControlOutcome) -> ManagerResponse {
                 public("Type", mode.as_str()),
             ],
         ),
+        ControlOutcome::Reset {
+            target: ResetTarget::RegisteredDevices,
+            mode,
+            attempted,
+            delivered,
+        } => {
+            let failed = attempted.saturating_sub(delivered);
+            let fields = vec![
+                public("Type", mode.as_str()),
+                public("Attempted", attempted),
+                public("Delivered", delivered),
+                public("Failed", failed),
+            ];
+            ("Device command delivered", failed != 0, fields)
+        }
         ControlOutcome::Answer { device_id, call_id } => (
             "Call answered",
             false,
@@ -951,9 +998,12 @@ mod tests {
                 delivered: 1,
                 persistent: false,
             },
-            ControlOperation::Reset { device_id, mode } => {
-                ControlOutcome::Reset { device_id, mode }
-            }
+            ControlOperation::Reset { target, mode } => ControlOutcome::Reset {
+                target,
+                mode,
+                attempted: 1,
+                delivered: 1,
+            },
             ControlOperation::Answer { call_id, device_id } => ControlOutcome::Answer {
                 device_id: device_id.unwrap_or_else(device),
                 call_id,
@@ -1089,8 +1139,10 @@ mod tests {
             assert_eq!(
                 execute_cli_device_control(&provider, device_id, mode).unwrap(),
                 ControlOutcome::Reset {
-                    device_id: DeviceId::new(device_id).unwrap(),
+                    target: ResetTarget::Device(DeviceId::new(device_id).unwrap()),
                     mode,
+                    attempted: 1,
+                    delivered: 1,
                 }
             );
         }
@@ -1098,12 +1150,41 @@ mod tests {
             provider.operations.lock().unwrap().as_slice(),
             [
                 ControlOperation::Reset {
+                    target: ResetTarget::Device(_),
                     mode: ResetMode::Reset,
-                    ..
                 },
                 ControlOperation::Reset {
+                    target: ResetTarget::Device(_),
                     mode: ResetMode::Restart,
-                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn cli_reset_and_restart_all_use_the_registered_device_target() {
+        let provider = FakeProvider::default();
+        for mode in [ResetMode::Reset, ResetMode::Restart] {
+            assert_eq!(
+                execute_cli_device_control(&provider, "ALL", mode).unwrap(),
+                ControlOutcome::Reset {
+                    target: ResetTarget::RegisteredDevices,
+                    mode,
+                    attempted: 1,
+                    delivered: 1,
+                }
+            );
+        }
+        assert!(matches!(
+            provider.operations.lock().unwrap().as_slice(),
+            [
+                ControlOperation::Reset {
+                    target: ResetTarget::RegisteredDevices,
+                    mode: ResetMode::Reset,
+                },
+                ControlOperation::Reset {
+                    target: ResetTarget::RegisteredDevices,
+                    mode: ResetMode::Restart,
                 }
             ]
         ));
@@ -1156,6 +1237,11 @@ mod tests {
             complete_cli_device(devices.iter(), "SEP0011223344559", 0),
             None
         );
+        assert_eq!(
+            complete_cli_reset_target(devices.iter(), "a", 0).as_deref(),
+            Some("all")
+        );
+        assert_eq!(complete_cli_reset_target(devices.iter(), "a", 1), None);
         assert_eq!(
             complete_cli_value(["silent", "off", "reject", "off"], "", 0, 6).as_deref(),
             Some("off")

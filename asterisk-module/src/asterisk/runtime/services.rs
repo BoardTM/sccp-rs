@@ -25,7 +25,7 @@ use super::{
     ParkingRejection, ParticipantId, PbxAudioFormat, PbxServiceCapabilities, PendingPark,
     RecordingCallback, RecordingDirection, RecordingEvent, RecordingProvider,
     RecordingRegistryError, RecordingSessionControl, RecordingTogglePlan, RecordingToggleRejection,
-    ResetMode, ResetType, RuntimeRecordings, begin_parking_retrieval,
+    ResetMode, ResetTarget, ResetType, RuntimeRecordings, begin_parking_retrieval,
     execute_call_transition_result, ordered_recording_start, ordered_recording_stop,
     plan_recording_toggle, preferred_codec, registered_device_ids, remove_conference_participant,
     set_conference_participant_moderator, set_conference_participant_muted,

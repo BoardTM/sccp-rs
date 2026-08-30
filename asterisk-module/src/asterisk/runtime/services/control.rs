@@ -1,13 +1,17 @@
 //! Runtime control delivery and call-control services.
 
+use tokio::task::JoinSet;
+
 use super::{
     Access, ActiveSystemMessage, CallId, CallState, ControlOperation, ControlOutcome,
     ControlProviderError, DeviceId, Duration, Instant, LineInstance, LogLevel,
     MANAGER_CONTROL_DELIVERY_TIMEOUT, MessageTarget, MutexExt as _, PbxAudioFormat, PhoneCommand,
-    PhoneCommandAction, ResetMode, ResetType, ast_log, cancel_no_answer_timer, controller_step,
-    execute_call_transition_result, execute_control_cleanup, execute_control_effects,
-    native_uniqueid_in_use, preferred_codec, registered_device_ids,
+    PhoneCommandAction, ResetMode, ResetTarget, ResetType, ast_log, cancel_no_answer_timer,
+    controller_step, execute_call_transition_result, execute_control_cleanup,
+    execute_control_effects, native_uniqueid_in_use, preferred_codec, registered_device_ids,
 };
+
+const MAX_RESET_DELIVERY_CONCURRENCY: usize = 32;
 
 pub async fn handle_control_operation(
     access: &Access,
@@ -82,30 +86,40 @@ pub async fn handle_control_operation(
                 persistent,
             })
         }
-        ControlOperation::Reset { device_id, mode } => {
-            if !access.config().devices.contains_key(&device_id) {
-                return Err(ControlProviderError::DeviceNotFound);
-            }
-            let registered = controller_step(&access.shared.controller, |controller| {
-                controller.is_registered(&device_id)
-            });
-            if !registered {
-                return Err(ControlProviderError::DeviceNotRegistered);
-            }
+        ControlOperation::Reset { target, mode } => {
             let reset_type = match mode {
                 ResetMode::Reset => ResetType::Reset,
                 ResetMode::Restart => ResetType::Restart,
                 ResetMode::ApplyConfiguration => ResetType::ApplyConfiguration,
             };
-            send_confirmed_control(
-                access,
-                PhoneCommand::new(
-                    device_id.clone(),
-                    PhoneCommandAction::ResetDevice { reset_type },
-                ),
-            )
-            .await?;
-            Ok(ControlOutcome::Reset { device_id, mode })
+            let (attempted, delivered) = match &target {
+                ResetTarget::Device(device_id) => {
+                    if !access.config().devices.contains_key(device_id) {
+                        return Err(ControlProviderError::DeviceNotFound);
+                    }
+                    let registered = controller_step(&access.shared.controller, |controller| {
+                        controller.is_registered(device_id)
+                    });
+                    if !registered {
+                        return Err(ControlProviderError::DeviceNotRegistered);
+                    }
+                    deliver_reset(access, device_id.clone(), reset_type).await?;
+                    (1, 1)
+                }
+                ResetTarget::RegisteredDevices => {
+                    let mut devices = registered_device_ids(&access.shared);
+                    devices.sort();
+                    let attempted = devices.len();
+                    let delivered = deliver_registered_resets(access, devices, reset_type).await;
+                    (attempted, delivered)
+                }
+            };
+            Ok(ControlOutcome::Reset {
+                target,
+                mode,
+                attempted,
+                delivered,
+            })
         }
         ControlOperation::Answer { call_id, device_id } => {
             answer_control_call(access, call_id, device_id).await
@@ -120,6 +134,52 @@ pub async fn handle_control_operation(
             originate_control_call(access, device_id, line, destination, assigned_channel_id).await
         }
     }
+}
+
+async fn deliver_reset(
+    access: &Access,
+    device_id: DeviceId,
+    reset_type: ResetType,
+) -> Result<(), ControlProviderError> {
+    send_confirmed_control(
+        access,
+        PhoneCommand::new(device_id, PhoneCommandAction::ResetDevice { reset_type }),
+    )
+    .await
+}
+
+async fn deliver_registered_resets(
+    access: &Access,
+    devices: Vec<DeviceId>,
+    reset_type: ResetType,
+) -> usize {
+    let mut devices = devices.into_iter();
+    let mut pending = JoinSet::new();
+    for device_id in devices.by_ref().take(MAX_RESET_DELIVERY_CONCURRENCY) {
+        spawn_reset_delivery(&mut pending, access.clone(), device_id, reset_type);
+    }
+    let mut delivered = 0;
+    let deliveries = async {
+        while let Some(result) = pending.join_next().await {
+            if matches!(result, Ok(Ok(()))) {
+                delivered += 1;
+            }
+            if let Some(device_id) = devices.next() {
+                spawn_reset_delivery(&mut pending, access.clone(), device_id, reset_type);
+            }
+        }
+    };
+    let _ = tokio::time::timeout(MANAGER_CONTROL_DELIVERY_TIMEOUT, deliveries).await;
+    delivered
+}
+
+fn spawn_reset_delivery(
+    pending: &mut JoinSet<Result<(), ControlProviderError>>,
+    access: Access,
+    device_id: DeviceId,
+    reset_type: ResetType,
+) {
+    pending.spawn(async move { deliver_reset(&access, device_id, reset_type).await });
 }
 
 pub async fn deliver_status_message(

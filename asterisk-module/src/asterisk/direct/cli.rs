@@ -511,13 +511,13 @@ device_control_cli_handler!(
     cli_reset,
     ResetMode::Reset,
     c"sccp reset",
-    c"Usage: sccp reset <device>\n"
+    c"Usage: sccp reset <device|all>\n"
 );
 device_control_cli_handler!(
     cli_restart,
     ResetMode::Restart,
     c"sccp restart",
-    c"Usage: sccp restart <device>\n"
+    c"Usage: sccp restart <device|all>\n"
 );
 
 unsafe fn run_control_cli(

@@ -31,11 +31,11 @@ use super::{
     MAX_DIAL_DESTINATION_BYTES, MAX_DND_MODE_BYTES, MAX_LINE_SELECTOR_BYTES, MAX_MESSAGE_BYTES,
     MAX_TIMEOUT_BYTES, MODULE, MediaEndpoint, ModuleConfig, NoAnswerPolicy, NonNull, PartySnapshot,
     PbxCallId, PhoneCallState, PhoneCommand, PhoneCommandAction, REQUESTED_CHANNEL_UNAVAILABLE,
-    ReloadSelection, ResetMode, RingDuration, RingerMode, SharedNoAnswerRoute,
+    ReloadSelection, ResetMode, ResetTarget, RingDuration, RingerMode, SharedNoAnswerRoute,
     SorceryConfigurationProvider, StationSessionTarget, Tone, USER_BUSY, c_int,
-    canonical_ip_address, complete_cli_device, complete_cli_value, compose_channel_metadata,
-    controller_step, execute_cli_answer, execute_cli_device_control, execute_cli_dnd,
-    execute_cli_end, execute_cli_message, execute_cli_originate, native_channel,
+    canonical_ip_address, complete_cli_device, complete_cli_reset_target, complete_cli_value,
+    compose_channel_metadata, controller_step, execute_cli_answer, execute_cli_device_control,
+    execute_cli_dnd, execute_cli_end, execute_cli_message, execute_cli_originate, native_channel,
     parse_cli_forwarding_mutation, pbx_audio_format, pbx_audio_formats_from_mask,
     pbx_video_formats_from_mask, plan_inbound_bindings, plan_shared_no_answer_route, raw, sys,
 };
@@ -1466,9 +1466,21 @@ pub fn execute_device_control_cli(fd: c_int, device: &str, mode: ResetMode) {
     let output = match module_access() {
         Some(access) => {
             match execute_cli_device_control(&access.control_provider(), device, mode) {
-                Ok(ControlOutcome::Reset { device_id, mode }) => {
-                    format!("{device_id}: {} command delivered\n", mode.as_str())
-                }
+                Ok(ControlOutcome::Reset {
+                    target: ResetTarget::Device(device_id),
+                    mode,
+                    ..
+                }) => format!("{device_id}: {} command delivered\n", mode.as_str()),
+                Ok(ControlOutcome::Reset {
+                    target: ResetTarget::RegisteredDevices,
+                    mode,
+                    attempted,
+                    delivered,
+                }) => format!(
+                    "{} command: {attempted} attempted, {delivered} delivered, {} failed\n",
+                    mode.as_str(),
+                    attempted.saturating_sub(delivered)
+                ),
                 Ok(_) => "Device command returned an unexpected result\n".to_owned(),
                 Err(CliControlError::InvalidDevice) => "Invalid device selector\n".to_owned(),
                 Err(CliControlError::Provider(error)) => {
@@ -1485,7 +1497,7 @@ pub fn execute_device_control_cli(fd: c_int, device: &str, mode: ResetMode) {
 pub fn complete_device_control_cli(prefix: &str, ordinal: usize) -> Option<String> {
     let access = module_access()?;
     let devices = registered_device_ids(&access.shared);
-    complete_cli_device(devices.iter(), prefix, ordinal)
+    complete_cli_reset_target(devices.iter(), prefix, ordinal)
 }
 
 pub fn execute_control_cli(fd: c_int, command: ControlCliCommand, arguments: &[String]) {

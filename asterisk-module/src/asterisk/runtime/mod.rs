@@ -65,7 +65,7 @@ use crate::asterisk::{
     RecordingState, RecordingTogglePlan, RecordingToggleRejection, RedirectReasonCode,
     RedirectingUpdate, RegisteredDeviceSummary, RegistrationContextRegistry, RegistrationFallback,
     RegistrationRegistryError, RegistrationTokenPolicy, ReloadPlan, ReloadSelection,
-    RemoteHangupPlan, ResetMode, ResetType, ResolvedExternalAddresses, Runtime,
+    RemoteHangupPlan, ResetMode, ResetTarget, ResetType, ResolvedExternalAddresses, Runtime,
     RuntimeStatusProvider, RuntimeStatusProviderError, RuntimeStatusSnapshot, RwLock, Semaphore,
     Server, ServerConfig, ServerHandle, ServerIngress, ServiceControlProvider, ServiceOperation,
     ServiceOutcome, ServiceProviderError, SharedNoAnswerRoute, SignalingQos, SignalingSocket,
