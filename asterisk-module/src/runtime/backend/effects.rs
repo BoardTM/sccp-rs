@@ -439,9 +439,8 @@ pub enum HandsetEffect {
         call_id: CallId,
         codec: Codec,
     },
-    /// Open receive media for a physical inbound answer whose provisional
-    /// OffHook UI has already been emitted by the protocol session. Full
-    /// Connected presentation is deferred until OpenReceiveChannelAck.
+    /// Present provisional answer state and open receive media for a physical
+    /// inbound answer. Full Connected presentation remains acknowledgement-gated.
     BeginAnswerMedia {
         device_id: DeviceId,
         call_id: CallId,

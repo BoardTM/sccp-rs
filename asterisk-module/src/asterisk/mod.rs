@@ -69,11 +69,11 @@ use sccp_protocol::{
     MediaEndpointAddress, MediaStatus, MediaTrafficClass, MultimediaReceiveDescriptor,
     MultimediaTransmitControl, MultimediaTransmitDescriptor, PARKING_MENU_MAX_ITEMS,
     ParkingMenuEntry, ParticipantId, PhoneAlarmTelemetry, PhoneLocationTelemetry,
-    PhoneServiceEvent, PhoneServicePayload, PhoneServicePriority, ProtocolVersion, ReceiveTransmit,
-    RegistrationFallback, RegistrationTokenPolicy, ResetType, RingDuration, RingerMode, Server,
-    ServerConfig, ServerHandle, ServerIngress, SignalingQos, SignalingSocket, SoftKey, StationIo,
-    StationMediaCapabilities, StationSessionTarget, StationTransport, Tone, TransactionId,
-    TransmitOpenOutcome,
+    PhoneServiceEvent, PhoneServicePayload, PhoneServicePriority, ProtocolVersion,
+    ReceiveChannelPurpose, ReceiveTransmit, RegistrationFallback, RegistrationTokenPolicy,
+    ResetType, RingDuration, RingerMode, Server, ServerConfig, ServerHandle, ServerIngress,
+    SignalingQos, SignalingSocket, SoftKey, StationIo, StationMediaCapabilities,
+    StationSessionTarget, StationTransport, Tone, TransactionId, TransmitOpenOutcome,
 };
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};

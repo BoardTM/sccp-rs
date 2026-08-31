@@ -962,6 +962,15 @@ pub enum TransmitOpenOutcome {
     Rejected(MediaStatus),
 }
 
+/// Station presentation coupled to an audio receive-channel request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiveChannelPurpose {
+    /// Opens receive media without changing the call presentation.
+    Media,
+    /// Presents provisional answer state immediately before opening receive media.
+    InboundAnswer,
+}
+
 /// One station-targeted operation submitted through [`ServerHandle`].
 ///
 /// Construction does not consult live session state; target and call
@@ -1215,6 +1224,7 @@ pub enum CommandAction {
     /// Applies codec, packetization, DTMF, source, and processing constraints.
     OpenReceiveChannel {
         call_id: CallId,
+        purpose: ReceiveChannelPurpose,
         /// Optional RTP source restriction. `None` accepts media from any
         /// source and is encoded as the SCCP wildcard endpoint `0.0.0.0:0`.
         source: Option<MediaEndpoint>,
@@ -7366,6 +7376,7 @@ async fn handle_session_command(
                 }
                 CommandAction::OpenReceiveChannel {
                     call_id,
+                    purpose,
                     source,
                     codec,
                     packet_ms,
@@ -7374,6 +7385,16 @@ async fn handle_session_command(
                     audio_processing,
                     ..
                 } => {
+                    if purpose == ReceiveChannelPurpose::InboundAnswer {
+                        let call_state = require_call(state, call_id)?.state;
+                        if call_state != CallState::OffHook {
+                            return Err(ServerError::InvalidCallTransaction {
+                                call_id,
+                                operation: "open inbound answer media",
+                                state: call_state,
+                            });
+                        }
+                    }
                     let telephone_event_payload = dtmf_mode.telephone_event_payload(state.features);
                     let request = allocate_media_request_identity(state, call_id)?;
                     let call = require_call_mut(state, call_id)?;
@@ -7392,6 +7413,18 @@ async fn handle_session_command(
                     }
                     call.media.coupled_transmit_endpoint = None;
                     let call = call.clone();
+                    if purpose == ReceiveChannelPurpose::InboundAnswer {
+                        send_message(
+                            stream,
+                            &ServerMessage::CallState {
+                                state: CallState::Connected,
+                                line_instance: call.line_instance,
+                                call_reference: call.wire_reference,
+                            },
+                            protocol,
+                        )
+                        .await?;
+                    }
                     send_message(
                         stream,
                         &ServerMessage::OpenReceiveChannel {

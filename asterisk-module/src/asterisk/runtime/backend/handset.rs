@@ -4,10 +4,11 @@ use super::{
     Access, CallDirection, CallId, CallInfo, ConferenceId, DeviceId, HandsetEffect, IpAddr,
     IpAddressType, Ipv4Addr, LineInstance, MANAGER_CONTROL_DELIVERY_TIMEOUT, MediaEndpointAddress,
     MultimediaReceiveDescriptor, MultimediaTransmitControl, MultimediaTransmitDescriptor,
-    PhoneCallState, PhoneCommand, PhoneCommandAction, ProtocolVersion, SessionGeneration,
-    VideoPlan, audio_framing, begin_answer_media, begin_handset_media, begin_outbound_media,
-    call_event, configured_audio_processing, configured_audio_traffic_class, configured_dtmf_mode,
-    configured_video_traffic_class, controller_step, publish_ami_event, receive_media_source,
+    PhoneCallState, PhoneCommand, PhoneCommandAction, ProtocolVersion, ReceiveChannelPurpose,
+    SessionGeneration, VideoPlan, audio_framing, begin_answer_media, begin_handset_media,
+    begin_outbound_media, call_event, configured_audio_processing, configured_audio_traffic_class,
+    configured_dtmf_mode, configured_video_traffic_class, controller_step, publish_ami_event,
+    receive_media_source,
 };
 
 pub async fn send_handset_call_state(
@@ -455,6 +456,7 @@ pub async fn execute_handset_effect(access: &Access, effect: HandsetEffect) -> R
                         device_id,
                         PhoneCommandAction::OpenReceiveChannel {
                             call_id,
+                            purpose: ReceiveChannelPurpose::Media,
                             source: None,
                             codec,
                             packet_ms,

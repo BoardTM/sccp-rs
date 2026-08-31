@@ -3855,12 +3855,17 @@ fn pending_answer_owner_disconnect_terminates_shared_call_and_ignores_late_ack()
     let mut controller = shared_inbound_controller();
     assert!(!controller.phone_answer(CallId(2)).is_empty());
 
-    let effects = controller.disconnected(&DeviceId::new("SEP001122334455").unwrap());
+    let disconnected = DeviceId::new("SEP001122334455").unwrap();
+    let effects = controller.disconnected(&disconnected);
     assert!(effects.iter().any(|effect| matches!(
         effect,
         DriverEffect::Backend(PbxEffect::Hangup {
             call_id: PbxCallId(8)
         })
+    )));
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        DriverEffect::Handset(effect) if effect.device_id() == &disconnected
     )));
     assert!(effects.iter().any(|effect| matches!(
         effect,
@@ -8876,7 +8881,7 @@ fn fake_handset_hold_departure_failure_destination_and_shutdown_are_idempotent()
 }
 
 #[test]
-fn fake_handset_partial_failures_and_disconnect_release_only_owned_presentations() {
+fn fake_handset_partial_failures_and_disconnect_do_not_target_departed_presentations() {
     let mut handset = FakeHandsets::default();
 
     let mut consultation = connected_outbound_controller();
@@ -8979,14 +8984,7 @@ fn fake_handset_partial_failures_and_disconnect_release_only_owned_presentations
     let mut disconnected = active_three_party_conference_with_media();
     handset.clear();
     handset.apply(&disconnected.disconnected(&device));
-    assert_eq!(
-        handset.call_states(),
-        [
-            (CallId(4), HandsetCallState::OnHook, true),
-            (CallId(2), HandsetCallState::OnHook, true),
-            (CallId(3), HandsetCallState::OnHook, true),
-        ]
-    );
+    assert!(handset.effects.is_empty());
     assert!(handset.announcements().is_empty());
     assert!(disconnected.calls().next().is_none());
     assert!(consultation.invariant_error().is_none());

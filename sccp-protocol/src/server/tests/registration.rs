@@ -2227,6 +2227,7 @@ async fn duplicate_registration_token_leaves_the_live_session_addressable() {
             device_id.clone(),
             CommandAction::OpenReceiveChannel {
                 call_id,
+                purpose: ReceiveChannelPurpose::Media,
                 source: None,
                 codec: Codec::Pcmu,
                 packet_ms: 20,

@@ -13,8 +13,8 @@ use super::{
     MAX_RESTORE_ATTEMPTS, MediaAnchorReason, MediaEndpoint, MutexExt, NonNull,
     PARKING_NOTIFICATION_TIME, ParkingOperation, PartyUpdateError, PbxBackendError, PbxBridgeId,
     PbxCallId, PbxEffect, PbxServiceCapabilities, PendingParkingNotification, PhoneCallState,
-    PhoneCommand, PhoneCommandAction, PickupOperation, RecordingError, RedirectReasonCode,
-    RedirectingUpdate, RemoteHangupPlan, RuntimeCallSignalDeliveryError,
+    PhoneCommand, PhoneCommandAction, PickupOperation, ReceiveChannelPurpose, RecordingError,
+    RedirectReasonCode, RedirectingUpdate, RemoteHangupPlan, RuntimeCallSignalDeliveryError,
     RuntimeCallSignalDeliveryResult, Shared, Weak, allocate_announcement_generation,
     announcement_generation_is_current, ast_log, audio_framing, c_string, cancel_no_answer_timer,
     channel_availability, configured_audio_processing, configured_audio_traffic_class,
@@ -1361,6 +1361,7 @@ pub async fn begin_handset_media(
             device_id,
             PhoneCommandAction::OpenReceiveChannel {
                 call_id,
+                purpose: ReceiveChannelPurpose::Media,
                 source: None,
                 codec,
                 packet_ms,
@@ -1373,10 +1374,9 @@ pub async fn begin_handset_media(
         .map_err(|error| error.to_string())
 }
 
-/// Begin the receive side of a handset answer without publishing the full
-/// Connected UI. The protocol session has already sent the provisional
-/// OffHook/ActivateCallPlane sequence in response to the physical OffHook;
-/// Connected presentation is gated on OpenReceiveChannelAck.
+/// Begin a handset answer by presenting provisional answer state immediately
+/// before opening receive media. Full Connected presentation remains gated on
+/// the receive-channel acknowledgement.
 pub async fn begin_answer_media(
     access: &Access,
     device_id: DeviceId,
@@ -1402,6 +1402,7 @@ pub async fn begin_answer_media(
             device_id,
             PhoneCommandAction::OpenReceiveChannel {
                 call_id,
+                purpose: ReceiveChannelPurpose::InboundAnswer,
                 source: None,
                 codec,
                 packet_ms,

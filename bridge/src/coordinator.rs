@@ -10,7 +10,8 @@ use sccp_protocol::{
     CommandAction as SccpCommandAction, DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET,
     DEFAULT_AUDIO_PACKET_MS, DeviceEvent, DeviceEventKind, DeviceId, DeviceRegistration, Digit,
     DtmfMode, Event as SccpEvent, LineInstance, MediaEndpoint, MediaStatus, MediaTrafficClass,
-    ServerHandle, SessionGeneration, SoftKey, StationMediaCapabilities, TransmitOpenOutcome,
+    ReceiveChannelPurpose, ServerHandle, SessionGeneration, SoftKey, StationMediaCapabilities,
+    TransmitOpenOutcome,
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -751,6 +752,7 @@ impl Coordinator {
             device,
             SccpCommandAction::OpenReceiveChannel {
                 call_id,
+                purpose: ReceiveChannelPurpose::Media,
                 source: Some(source),
                 codec,
                 packet_ms: DEFAULT_AUDIO_PACKET_MS,
@@ -928,6 +930,7 @@ impl Coordinator {
             binding.device.clone(),
             SccpCommandAction::OpenReceiveChannel {
                 call_id,
+                purpose: ReceiveChannelPurpose::Media,
                 source: Some(source),
                 codec,
                 packet_ms: DEFAULT_AUDIO_PACKET_MS,
@@ -1152,6 +1155,7 @@ impl Coordinator {
                         call.device.clone(),
                         SccpCommandAction::OpenReceiveChannel {
                             call_id,
+                            purpose: ReceiveChannelPurpose::Media,
                             source: Some(source),
                             codec: remote.codec,
                             packet_ms: DEFAULT_AUDIO_PACKET_MS,

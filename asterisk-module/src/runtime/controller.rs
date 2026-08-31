@@ -6,9 +6,11 @@
 //!
 //! PBX calls, handset appearances, and media directions have separate typed
 //! identities and lifetimes. A physical inbound answer claims one appearance
-//! but does not answer the PBX or publish Connected until its receive-channel
-//! acknowledgement. An outbound PBX answer publishes Connected immediately;
-//! its ordinary media path then opens receive and starts transmit in sequence.
+//! and presents provisional station answer state before opening receive media,
+//! but does not answer the PBX or publish the runtime Connected event until the
+//! receive-channel acknowledgement. An outbound PBX answer publishes Connected
+//! immediately; its ordinary media path then opens receive and starts transmit
+//! in sequence.
 //! Only an explicitly selected NAT early-progress transaction couples those
 //! two wire requests, and its receive acknowledgement settles both protocol
 //! directions before the runtime receives the corresponding typed events.
@@ -1370,6 +1372,12 @@ impl Controller {
                 actions.push(PbxEffect::Hangup { call_id: pbx_id }.into());
             }
         }
+        actions.retain(|effect| {
+            !matches!(
+                effect,
+                DriverEffect::Handset(effect) if effect.device_id() == device
+            )
+        });
         debug_assert!(self.invariant_error().is_none());
         actions
     }

@@ -274,6 +274,184 @@ fn multimedia_transmit_controls_encode_only_their_typed_parameter_words() {
 }
 
 #[tokio::test]
+async fn inbound_answer_media_presents_connected_immediately_before_receive_across_versions() {
+    for protocol in [ProtocolVersion::V11, ProtocolVersion::V22] {
+        let device = definition();
+        let device_id = device.id.clone();
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            advertised_address: Ipv4Addr::LOCALHOST,
+            ..ServerConfig::default()
+        };
+        let (server, handle, mut events) = Server::bind(config, [device]).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(server.run());
+        let mut phone = TcpStream::connect(address).await.unwrap();
+        let mut decoder = FrameDecoder::new();
+
+        phone.write_all(&register_bytes(protocol)).await.unwrap();
+        read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::Registered(_),
+                ..
+            }))
+        ));
+
+        let call_id = handle
+            .offer_incoming_call(
+                device_id.clone(),
+                LineInstance::new(1),
+                CallInfo {
+                    direction: crate::types::CallDirection::Inbound,
+                    calling_number: "1002".into(),
+                    called_number: "1001".into(),
+                    ..CallInfo::default()
+                },
+            )
+            .await
+            .unwrap();
+        read_until_message(
+            &mut phone,
+            &mut decoder,
+            if protocol >= ProtocolVersion::V8 {
+                wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS
+            } else {
+                wire_id::DISPLAY_PROMPT_STATUS
+            },
+        )
+        .await;
+        phone
+            .write_all(
+                &ClientMessage::SoftKeyEvent {
+                    event: SoftKey::Answer.wire_value(),
+                    line_instance: 1,
+                    call_reference: 0,
+                }
+                .encode(protocol)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        read_until_message(&mut phone, &mut decoder, wire_id::SET_LAMP).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::SoftKey {
+                    call_id: Some(answered),
+                    soft_key: SoftKey::Answer,
+                    ..
+                },
+                ..
+            })) if answered == call_id
+        ));
+
+        handle
+            .send_confirmed(Command::new(
+                device_id.clone(),
+                CommandAction::OpenReceiveChannel {
+                    call_id,
+                    purpose: ReceiveChannelPurpose::InboundAnswer,
+                    source: None,
+                    codec: Codec::Pcmu,
+                    packet_ms: 20,
+                    max_frames_per_packet: 1,
+                    dtmf_mode: DtmfMode::Skinny,
+                    audio_processing: AudioProcessingPolicy::default(),
+                },
+            ))
+            .await
+            .unwrap();
+        let frames =
+            read_until_message(&mut phone, &mut decoder, wire_id::OPEN_RECEIVE_CHANNEL).await;
+        let connected = frames
+            .iter()
+            .position(|frame| {
+                matches!(
+                    ServerMessage::decode(frame.clone(), protocol),
+                    Ok(ServerMessage::CallState {
+                        state: CallState::Connected,
+                        ..
+                    })
+                )
+            })
+            .expect("inbound answer media omitted provisional Connected");
+        let open = frames
+            .iter()
+            .position(|frame| frame.message_id == wire_id::OPEN_RECEIVE_CHANNEL)
+            .expect("inbound answer media omitted OpenReceiveChannel");
+        assert_eq!(open, connected + 1);
+        assert!(frames[..open].iter().all(|frame| {
+            !matches!(
+                frame.message_id,
+                wire_id::SET_SPEAKER_MODE
+                    | wire_id::DISPLAY_PROMPT_STATUS
+                    | wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS
+                    | wire_id::SELECT_SOFT_KEYS
+            )
+        }));
+
+        let (wire_reference, passthrough_party_id) =
+            match ServerMessage::decode(frames[open].clone(), protocol).unwrap() {
+                ServerMessage::OpenReceiveChannel {
+                    call_reference,
+                    passthrough_party_id,
+                    ..
+                } => (call_reference, passthrough_party_id),
+                other => panic!("unexpected receive request: {other:?}"),
+            };
+        phone
+            .write_all(
+                &ClientMessage::OpenReceiveChannelAck {
+                    status: MediaStatus::Ok,
+                    address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    port: 4000,
+                    call_reference: wire_reference,
+                    passthrough_party_id,
+                }
+                .encode(protocol)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::ReceiveChannelOpened {
+                    call_id: opened,
+                    status: MediaStatus::Ok,
+                    ..
+                },
+                ..
+            })) if opened == call_id
+        ));
+
+        assert!(matches!(
+            handle
+                .send_confirmed(Command::new(
+                    device_id.clone(),
+                    CommandAction::OpenMultimediaReceiveChannel {
+                        call_id,
+                        descriptor: video_receive_descriptor(
+                            1,
+                            MediaEndpointAddress {
+                                address: "192.0.2.1".parse().unwrap(),
+                                port: 5000,
+                            },
+                        ),
+                    },
+                ))
+                .await,
+            Err(ServerError::CommandWrite(message)) if message.contains("state OffHook")
+        ));
+
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn video_receive_session_correlates_fragmented_acknowledgements_and_preserves_audio() {
     let device = definition();
     let device_id = device.id.clone();
@@ -375,6 +553,7 @@ async fn video_receive_session_correlates_fragmented_acknowledgements_and_preser
             device_id.clone(),
             CommandAction::OpenReceiveChannel {
                 call_id,
+                purpose: ReceiveChannelPurpose::Media,
                 source: None,
                 codec: Codec::Pcmu,
                 packet_ms: 20,
@@ -946,6 +1125,7 @@ async fn video_transmit_session_correlates_frames_and_preserves_receive_and_audi
             device_id.clone(),
             CommandAction::OpenReceiveChannel {
                 call_id,
+                purpose: ReceiveChannelPurpose::Media,
                 source: None,
                 codec: Codec::Pcmu,
                 packet_ms: 20,
@@ -3641,6 +3821,7 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
             device_id.clone(),
             CommandAction::OpenReceiveChannel {
                 call_id: CallId(1),
+                purpose: ReceiveChannelPurpose::Media,
                 source: Some(MediaEndpoint {
                     address: "192.0.2.1".parse().unwrap(),
                     rtp_port: 4000,
@@ -4000,6 +4181,7 @@ async fn configured_dtmf_mode_selects_rtp_or_signaling_without_duplicate_digits(
             device_id.clone(),
             CommandAction::OpenReceiveChannel {
                 call_id: CallId(1),
+                purpose: ReceiveChannelPurpose::Media,
                 source: Some(MediaEndpoint {
                     address: "192.0.2.1".parse().unwrap(),
                     rtp_port: 4000,
@@ -4437,6 +4619,7 @@ async fn hangup_statistics_are_exactly_correlated_retained_and_not_replayed() {
             device_id.clone(),
             CommandAction::OpenReceiveChannel {
                 call_id,
+                purpose: ReceiveChannelPurpose::Media,
                 source: Some(MediaEndpoint {
                     address: "192.0.2.1".parse().unwrap(),
                     rtp_port: 5000,
