@@ -3659,7 +3659,7 @@ mod tests {
     fn enbloc_uses_the_protocol_19_text_width_boundary() {
         for (protocol, payload_len, line_offset) in [
             (ProtocolVersion::V18, 28, 24),
-            (ProtocolVersion::V19, 29, 25),
+            (ProtocolVersion::V19, 32, 28),
         ] {
             let message = ClientMessage::EnblocCall {
                 called_party: "9801".into(),

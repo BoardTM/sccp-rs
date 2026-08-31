@@ -33,8 +33,8 @@ use super::values::{
 use super::wire::{CodecError, Frame};
 use super::*;
 use crate::types::{
-    CallInfo, DateTemplate, DeviceId, LegacyCodePage, MediaEndpoint, MediaTrafficClass,
-    SoftKeyProfile,
+    CallInfo, DateTemplate, DeviceId, LegacyCodePage, MAX_STATION_BUTTON_INSTANCE, MediaEndpoint,
+    MediaTrafficClass, SoftKeyProfile,
 };
 
 mod conference;
@@ -1322,6 +1322,7 @@ enum EnblocWireLayout {
     WithoutLine,
     Line24,
     Line25Packed,
+    Line25Aligned,
     Line25Candidates,
 }
 
@@ -1329,7 +1330,7 @@ impl EnblocWireLayout {
     fn select(protocol: u32, payload_bytes: usize, message_id: u32) -> Result<Self, CodecError> {
         match (protocol, payload_bytes) {
             (..=16, 24) => Ok(Self::WithoutLine),
-            (17.., 28) => Ok(Self::Line24),
+            (..=18, 28) => Ok(Self::Line24),
             (19.., 29..=31) => Ok(Self::Line25Packed),
             (19.., 32) => Ok(Self::Line25Candidates),
             _ => Err(CodecError::InvalidLength(message_id)),
@@ -1340,7 +1341,7 @@ impl EnblocWireLayout {
         match protocol {
             ..=16 => Self::WithoutLine,
             17..=18 => Self::Line24,
-            19.. => Self::Line25Packed,
+            19.. => Self::Line25Aligned,
         }
     }
 }
@@ -1805,12 +1806,25 @@ struct WireConnectionStatisticsPackedPrefix {
     quality_size: u32,
 }
 
+fn validate_enbloc_line_instance(line_instance: u32, message_id: u32) -> Result<(), CodecError> {
+    if line_instance <= MAX_STATION_BUTTON_INSTANCE {
+        Ok(())
+    } else {
+        Err(CodecError::InvalidValue {
+            message_id,
+            field: "line instance",
+            value: u64::from(line_instance),
+        })
+    }
+}
+
 fn enbloc_from_wire<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
     payload: &[u8],
     message_id: u32,
 ) -> Result<ClientMessage, CodecError> {
     let value: WireEnblocWithLine<TEXT_BYTES, ALIGNMENT_BYTES> = decode(message_id, payload)?;
     value.called_party.validate(message_id)?;
+    validate_enbloc_line_instance(value.line_instance, message_id)?;
     Ok(ClientMessage::EnblocCall {
         called_party: value.called_party.text()?,
         line_instance: value.line_instance,
@@ -1821,6 +1835,7 @@ fn enbloc_from_packed_wire(payload: &[u8], message_id: u32) -> Result<ClientMess
     let value: WireEnblocWithLine<25, 0> = decode_prefix(message_id, payload)?;
     value.called_party.validate(message_id)?;
     validate_zero_payload(&payload[29..], message_id, payload.len() - 29)?;
+    validate_enbloc_line_instance(value.line_instance, message_id)?;
     Ok(ClientMessage::EnblocCall {
         called_party: value.called_party.text()?,
         line_instance: value.line_instance,
@@ -1837,7 +1852,7 @@ fn select_enbloc_candidate(
         (Ok(packed), Ok(aligned)) if packed == aligned => Ok(packed),
         (Ok(_), Ok(_)) => Err(CodecError::InvalidValue {
             message_id,
-            field: "ambiguous Enbloc layout",
+            field: "conflicting Enbloc layout",
             value: payload_bytes as u64,
         }),
         (Ok(message), Err(_)) | (Err(_), Ok(message)) => Ok(message),
@@ -1860,6 +1875,7 @@ fn decode_enbloc(
         }
         EnblocWireLayout::Line24 => enbloc_from_wire::<24, 0>(payload, message_id),
         EnblocWireLayout::Line25Packed => enbloc_from_packed_wire(payload, message_id),
+        EnblocWireLayout::Line25Aligned => enbloc_from_wire::<25, 3>(payload, message_id),
         EnblocWireLayout::Line25Candidates => select_enbloc_candidate(
             enbloc_from_packed_wire(payload, message_id),
             enbloc_from_wire::<25, 3>(payload, message_id),
@@ -1873,6 +1889,7 @@ fn enbloc_to_wire<const TEXT_BYTES: usize, const ALIGNMENT_BYTES: usize>(
     called_party: &str,
     line_instance: u32,
 ) -> Result<Vec<u8>, CodecError> {
+    validate_enbloc_line_instance(line_instance, wire_id::ENBLOC_CALL)?;
     encode(
         wire_id::ENBLOC_CALL,
         &WireEnblocWithLine::<TEXT_BYTES, ALIGNMENT_BYTES> {
@@ -1905,7 +1922,25 @@ fn encode_enbloc(
         }),
         EnblocWireLayout::Line24 => enbloc_to_wire::<24, 0>(called_party, line_instance),
         EnblocWireLayout::Line25Packed => enbloc_to_wire::<25, 0>(called_party, line_instance),
+        EnblocWireLayout::Line25Aligned => enbloc_to_wire::<25, 3>(called_party, line_instance),
         EnblocWireLayout::Line25Candidates => unreachable!("candidate selection is decode-only"),
+    }
+}
+
+fn decode_on_hook(payload: &[u8], message_id: u32) -> Result<ClientMessage, CodecError> {
+    match payload.len() {
+        0 => Ok(ClientMessage::OnHook {
+            line_instance: 0,
+            call_reference: 0,
+        }),
+        8 => {
+            let value: WireLineCall = decode(message_id, payload)?;
+            Ok(ClientMessage::OnHook {
+                line_instance: value.line_instance,
+                call_reference: value.call_reference,
+            })
+        }
+        _ => Err(CodecError::InvalidLength(message_id)),
     }
 }
 
@@ -2337,13 +2372,7 @@ impl ClientMessage {
                     call_reference: value.call_reference,
                 })
             }
-            wire_id::ON_HOOK => {
-                let value: WireLineCall = decode(frame.message_id, p)?;
-                Ok(Self::OnHook {
-                    line_instance: value.line_instance,
-                    call_reference: value.call_reference,
-                })
-            }
+            wire_id::ON_HOOK => decode_on_hook(p, frame.message_id),
             wire_id::OFF_HOOK_WITH_CALLING_PARTY => match protocol_version {
                 19.. => decode_off_hook_with_calling_party::<25, 2>(p, frame.message_id),
                 _ => decode_off_hook_with_calling_party::<24, 0>(p, frame.message_id),
@@ -8247,7 +8276,7 @@ mod tests {
         for (version, line_instance, payload_bytes) in [
             (ProtocolVersion::V3, 0, 24),
             (ProtocolVersion::V17, 2, 28),
-            (ProtocolVersion::V22, 2, 29),
+            (ProtocolVersion::V22, 2, 32),
         ] {
             let message = ClientMessage::EnblocCall {
                 called_party: "2001".into(),
@@ -8261,6 +8290,31 @@ mod tests {
                 message
             );
         }
+
+        let early_with_line = encode(
+            wire_id::ENBLOC_CALL,
+            &WireEnblocWithLine::<24, 0> {
+                called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", "2001")
+                    .unwrap(),
+                line_instance: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ClientMessage::decode_with_version(
+                Frame::new(
+                    ProtocolVersion::V3.wire(),
+                    wire_id::ENBLOC_CALL,
+                    early_with_line,
+                ),
+                ProtocolVersion::V3,
+            )
+            .unwrap(),
+            ClientMessage::EnblocCall {
+                called_party: "2001".into(),
+                line_instance: 2,
+            }
+        );
 
         let packed = encode(
             wire_id::ENBLOC_CALL,
@@ -8316,17 +8370,74 @@ mod tests {
             &WireEnblocWithLine::<25, 3> {
                 called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", "2001")
                     .unwrap(),
-                line_instance: 1,
+                line_instance: MAX_STATION_BUTTON_INSTANCE,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ClientMessage::decode_with_version(
+                Frame::new(ProtocolVersion::V22.wire(), wire_id::ENBLOC_CALL, aligned),
+                ProtocolVersion::V22,
+            )
+            .unwrap(),
+            ClientMessage::EnblocCall {
+                called_party: "2001".into(),
+                line_instance: MAX_STATION_BUTTON_INSTANCE,
+            }
+        );
+
+        let invalid_aligned_line = encode(
+            wire_id::ENBLOC_CALL,
+            &WireEnblocWithLine::<25, 3> {
+                called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", "2001")
+                    .unwrap(),
+                line_instance: MAX_STATION_BUTTON_INSTANCE + 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            ClientMessage::decode_with_version(
+                Frame::new(
+                    ProtocolVersion::V22.wire(),
+                    wire_id::ENBLOC_CALL,
+                    invalid_aligned_line,
+                ),
+                ProtocolVersion::V22,
+            )
+            .is_err()
+        );
+
+        let invalid_line = encode(
+            wire_id::ENBLOC_CALL,
+            &WireEnblocWithLine::<25, 0> {
+                called_party: WireAlignedText::new(wire_id::ENBLOC_CALL, "called party", "2001")
+                    .unwrap(),
+                line_instance: MAX_STATION_BUTTON_INSTANCE + 1,
             },
         )
         .unwrap();
         assert!(matches!(
             ClientMessage::decode_with_version(
-                Frame::new(ProtocolVersion::V22.wire(), wire_id::ENBLOC_CALL, aligned,),
+                Frame::new(
+                    ProtocolVersion::V22.wire(),
+                    wire_id::ENBLOC_CALL,
+                    invalid_line,
+                ),
                 ProtocolVersion::V22,
             ),
             Err(CodecError::InvalidValue {
-                field: "ambiguous Enbloc layout",
+                field: "line instance",
+                ..
+            })
+        ));
+        assert!(matches!(
+            ClientMessage::EnblocCall {
+                called_party: "2001".into(),
+                line_instance: MAX_STATION_BUTTON_INSTANCE + 1,
+            }
+            .encode(ProtocolVersion::V22),
+            Err(CodecError::InvalidValue {
+                field: "line instance",
                 ..
             })
         ));
@@ -8337,6 +8448,55 @@ mod tests {
             ),
             Err(CodecError::InvalidLength(wire_id::ENBLOC_CALL))
         ));
+    }
+
+    #[test]
+    fn on_hook_accepts_only_fieldless_and_identified_layouts() {
+        assert_eq!(
+            ClientMessage::decode_with_version(
+                Frame::new(ProtocolVersion::V22.wire(), wire_id::ON_HOOK, Vec::new()),
+                ProtocolVersion::V22,
+            )
+            .unwrap(),
+            ClientMessage::OnHook {
+                line_instance: 0,
+                call_reference: 0,
+            }
+        );
+
+        let identified = encode(
+            wire_id::ON_HOOK,
+            &WireLineCall {
+                line_instance: 2,
+                call_reference: 42,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ClientMessage::decode_with_version(
+                Frame::new(ProtocolVersion::V22.wire(), wire_id::ON_HOOK, identified),
+                ProtocolVersion::V22,
+            )
+            .unwrap(),
+            ClientMessage::OnHook {
+                line_instance: 2,
+                call_reference: 42,
+            }
+        );
+
+        for payload_bytes in [1, 2, 3, 4, 5, 6, 7, 9, 12] {
+            assert!(matches!(
+                ClientMessage::decode_with_version(
+                    Frame::new(
+                        ProtocolVersion::V22.wire(),
+                        wire_id::ON_HOOK,
+                        vec![0; payload_bytes],
+                    ),
+                    ProtocolVersion::V22,
+                ),
+                Err(CodecError::InvalidLength(wire_id::ON_HOOK))
+            ));
+        }
     }
 
     #[test]

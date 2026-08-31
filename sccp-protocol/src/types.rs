@@ -20,6 +20,8 @@ use crate::message::values::{
 };
 use crate::message::wire::CodecError;
 
+pub(crate) const MAX_STATION_BUTTON_INSTANCE: u32 = u8::MAX as u32;
+
 /// Validated date and time display template advertised during registration.
 ///
 /// Examples include `D/M/Y`, `Y.M.D`, and `M-D-YYA`; the final `A` selects a
@@ -897,11 +899,10 @@ impl DeviceDefinition {
             // ButtonTemplate definition field. Add-on slots are logical
             // expansion-module positions and retain their separate u32
             // contract; they are not emitted as template definitions.
-            if kind != ButtonNamespace::AddonModule && instance > u32::from(u8::MAX) {
+            if kind != ButtonNamespace::AddonModule && instance > MAX_STATION_BUTTON_INSTANCE {
                 return Err(CodecError::InvalidDefinition(format!(
                     "device {} has a {kind} button with instance {instance}; maximum wire instance is {}",
-                    self.id,
-                    u8::MAX
+                    self.id, MAX_STATION_BUTTON_INSTANCE
                 )));
             }
             if !instances.insert((kind, instance)) {

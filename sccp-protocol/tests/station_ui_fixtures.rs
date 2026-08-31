@@ -143,7 +143,7 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
             "v22 enbloc call",
             ProtocolVersion::V22,
             MessageId::EnblocCall.wire_value(),
-            29,
+            32,
             ClientMessage::EnblocCall {
                 called_party: "2001".into(),
                 line_instance: 2,
@@ -263,6 +263,57 @@ fn station_ui_input_fixtures_cover_key_hook_and_accessory_layouts() {
     ] {
         assert_encoded_client_fixture(name, protocol, message_id, payload_len, expected);
     }
+}
+
+#[test]
+fn station_ui_input_fixtures_accept_length_selected_dial_and_hook_layouts() {
+    let protocol = ProtocolVersion::V22;
+    let expected = ClientMessage::EnblocCall {
+        called_party: "2001".into(),
+        line_instance: 2,
+    };
+
+    let mut aligned = vec![0; 32];
+    aligned[..4].copy_from_slice(b"2001");
+    aligned[28..32].copy_from_slice(&2_u32.to_le_bytes());
+    assert_client_fixture(
+        "aligned enbloc call",
+        protocol,
+        MessageId::EnblocCall.wire_value(),
+        &aligned,
+        expected.clone(),
+    );
+
+    let mut packed = vec![0; 29];
+    packed[..4].copy_from_slice(b"2001");
+    packed[25..29].copy_from_slice(&2_u32.to_le_bytes());
+    assert_client_fixture(
+        "packed enbloc call",
+        protocol,
+        MessageId::EnblocCall.wire_value(),
+        &packed,
+        expected.clone(),
+    );
+
+    packed.extend_from_slice(&[0; 3]);
+    assert_client_fixture(
+        "padded packed enbloc call",
+        protocol,
+        MessageId::EnblocCall.wire_value(),
+        &packed,
+        expected,
+    );
+
+    assert_client_fixture(
+        "fieldless on-hook",
+        protocol,
+        MessageId::OnHook.wire_value(),
+        &[],
+        ClientMessage::OnHook {
+            line_instance: 0,
+            call_reference: 0,
+        },
+    );
 }
 
 #[test]

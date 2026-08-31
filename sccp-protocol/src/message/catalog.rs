@@ -357,7 +357,7 @@ message_catalog! {
     (EnblocCall => ENBLOC_CALL, 0x0004, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: Some(PayloadSizeBounds { minimum: 24, maximum: 32 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
     (Stimulus => STIMULUS, 0x0005, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (OffHook => OFF_HOOK, 0x0006, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
-    (OnHook => ON_HOOK, 0x0007, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
+    (OnHook => ON_HOOK, 0x0007, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::VersionAndLengthSelected, fixed_payload_bytes: None, payload_size_bounds: Some(PayloadSizeBounds { minimum: 0, maximum: 8 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("fieldless form omits line and call identity"), response: ResponseExpectation::None, verification: ContractVerification::StructuralAndValidated }),
     (HookFlash => HOOK_FLASH, 0x0008, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (ForwardStatusRequest => FORWARD_STAT_REQ, 0x0009, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (SpeedDialStatusRequest => SPEED_DIAL_STAT_REQ, 0x000a, StationToControl, ContractMetadata { scope: ContractScope::Base, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: None, payload_size_bounds: None, runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::SessionSelected { before: MessageId::SpeedDialStatus, from: MessageId::SpeedDialStatusDynamic, selector: SessionResponseSelector::DynamicMessagesOrProtocol { minimum_protocol: 9 } }, verification: ContractVerification::Structural }),
@@ -604,7 +604,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "3cdd3d739a3410bf32ab91e1effc09762b6a696a0304f51e8735e51439a83eb3"
+            "d8d291836879483d4c9f0773457d847454c9c2bfc296bba6c34c54cf949e7b2b"
         );
     }
 
@@ -778,6 +778,7 @@ mod tests {
 
         for (id, minimum, maximum) in [
             (MessageId::EnblocCall, 24, 32),
+            (MessageId::OnHook, 0, 8),
             (MessageId::ConnectionStatisticsResponse, 61, 668),
         ] {
             assert_eq!(
@@ -786,6 +787,16 @@ mod tests {
                 "{id}"
             );
         }
+
+        let on_hook = MessageId::OnHook.contract().unwrap();
+        assert_eq!(
+            on_hook.payload_layout,
+            PayloadLayout::VersionAndLengthSelected
+        );
+        assert_eq!(
+            on_hook.field_fidelity,
+            FieldFidelity::SemanticProjection("fieldless form omits line and call identity")
+        );
 
         let call_count = MessageId::CallCountRequest.contract().unwrap();
         assert_eq!(

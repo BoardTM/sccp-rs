@@ -857,7 +857,7 @@ async fn unknown_device_type_receives_the_configured_generic_layout() {
 }
 
 #[tokio::test]
-async fn on_hook_enbloc_creates_one_addressable_call_before_atomic_routing() {
+async fn on_hook_enbloc_creates_one_call_and_fieldless_on_hook_ends_it() {
     let config = ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         advertised_address: Ipv4Addr::LOCALHOST,
@@ -958,6 +958,35 @@ async fn on_hook_enbloc_creates_one_addressable_call_before_atomic_routing() {
         ServerMessage::decode(frame.clone(), protocol),
         Ok(ServerMessage::DialedNumber { ref number, .. }) if number == "8675309"
     )));
+
+    phone
+        .write_all(
+            &Frame::new(protocol.wire(), wire_id::ON_HOOK, Vec::new())
+                .encode()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let frames = read_until_message(&mut phone, &mut decoder, wire_id::SET_RINGER).await;
+    assert!(frames.iter().any(|frame| matches!(
+        ServerMessage::decode(frame.clone(), protocol),
+        Ok(ServerMessage::CallState {
+            state: CallState::OnHook,
+            line_instance: 1,
+            ..
+        })
+    )));
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            session_generation: _,
+            device_id: _,
+            event: DeviceEventKind::OnHook {
+                call_id: ended_call_id,
+                line_instance: LineInstance(1),
+            },
+        })) if ended_call_id == call_id
+    ));
 
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
