@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[package.metadata.release]
+release = false
+
 [dependencies]
 sccp-protocol = { path = "../sccp-protocol" }
 pjsua = { path = "pjsua" }
