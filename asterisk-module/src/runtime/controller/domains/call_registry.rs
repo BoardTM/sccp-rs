@@ -1643,11 +1643,6 @@ impl Controller {
             .appearances
             .get(&winner_id)
             .map(|appearance| appearance.info.direction);
-        let coupled_media_pending = self
-            .call_registry
-            .appearances
-            .get(&winner_id)
-            .is_some_and(|appearance| self.pending_route_media.contains(&appearance.sccp_id));
         let media_state = self.call_registry.appearances.get(&winner_id).map_or(
             MediaStreamState::Closed,
             |appearance| {
@@ -1707,7 +1702,7 @@ impl Controller {
                 .into(),
             ),
             MediaStreamState::Opening => {
-                if winner_direction == Some(CallDirection::Outbound) && !coupled_media_pending {
+                if winner_direction == Some(CallDirection::Outbound) {
                     effects.push(
                         HandsetEffect::SetCallState {
                             device_id: winner.device_id,

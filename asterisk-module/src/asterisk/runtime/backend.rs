@@ -1324,7 +1324,8 @@ pub async fn begin_handset_media(
     state: PhoneCallState,
 ) -> Result<(), String> {
     admit_clear_audio_media(access, &device_id, call_id)?;
-    let (packet_ms, max_frames_per_packet) = audio_framing(access, &device_id, call_id, codec);
+    let framing =
+        audio_framing(access, &device_id, call_id, codec).map_err(|error| error.to_string())?;
     // Validate that Asterisk has an RTP instance, but leave the SCCP source
     // filter unrestricted so NAT does not prevent the phone opening media.
     receive_media_source(access, &device_id, call_id, codec)?;
@@ -1364,8 +1365,8 @@ pub async fn begin_handset_media(
                 purpose: ReceiveChannelPurpose::Media,
                 source: None,
                 codec,
-                packet_ms,
-                max_frames_per_packet,
+                packet_ms: framing.packet_ms,
+                max_frames_per_packet: framing.max_frames_per_packet,
                 dtmf_mode,
                 audio_processing,
             },
@@ -1384,7 +1385,8 @@ pub async fn begin_answer_media(
     codec: Codec,
 ) -> Result<(), String> {
     admit_clear_audio_media(access, &device_id, call_id)?;
-    let (packet_ms, max_frames_per_packet) = audio_framing(access, &device_id, call_id, codec);
+    let framing =
+        audio_framing(access, &device_id, call_id, codec).map_err(|error| error.to_string())?;
     receive_media_source(access, &device_id, call_id, codec)?;
     let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
     let audio_processing = configured_audio_processing(access, &device_id, call_id);
@@ -1405,8 +1407,8 @@ pub async fn begin_answer_media(
                 purpose: ReceiveChannelPurpose::InboundAnswer,
                 source: None,
                 codec,
-                packet_ms,
-                max_frames_per_packet,
+                packet_ms: framing.packet_ms,
+                max_frames_per_packet: framing.max_frames_per_packet,
                 dtmf_mode,
                 audio_processing,
             },
@@ -1425,10 +1427,11 @@ pub async fn begin_outbound_media(
     codec: Codec,
 ) -> Result<(), String> {
     admit_clear_audio_media(access, &device_id, call_id)?;
-    let (packet_ms, max_frames_per_packet) = audio_framing(access, &device_id, call_id, codec);
+    let framing =
+        audio_framing(access, &device_id, call_id, codec).map_err(|error| error.to_string())?;
     let mut endpoint = receive_media_source(access, &device_id, call_id, codec)?;
-    endpoint.packet_ms = packet_ms;
-    endpoint.max_frames_per_packet = max_frames_per_packet;
+    endpoint.packet_ms = framing.packet_ms;
+    endpoint.max_frames_per_packet = framing.max_frames_per_packet;
     let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
     let audio_processing = configured_audio_processing(access, &device_id, call_id);
     let traffic_class = configured_audio_traffic_class(access, &device_id)
@@ -1442,8 +1445,8 @@ pub async fn begin_outbound_media(
                 source: None,
                 endpoint,
                 codec,
-                packet_ms,
-                max_frames_per_packet,
+                packet_ms: framing.packet_ms,
+                max_frames_per_packet: framing.max_frames_per_packet,
                 dtmf_mode,
                 audio_processing,
                 traffic_class,

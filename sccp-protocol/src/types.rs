@@ -1174,8 +1174,7 @@ impl Default for CallInfo {
 
 /// Default audio packetization interval, in milliseconds.
 pub const DEFAULT_AUDIO_PACKET_MS: u32 = 20;
-/// Default maximum number of codec frames carried in one audio packet.
-pub const DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET: u32 = 1;
+pub const DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET: u32 = 0;
 
 /// Per-appearance station audio processing sent on the receive and transmit
 /// channel setup messages.

@@ -390,7 +390,9 @@ pub(super) async fn handle_media_event(
         PhoneDeviceEventKind::HandsetAcknowledgementTimedOut { call_id, .. } => {
             ast_log(
                 LogLevel::Warning,
-                &format!("phone did not acknowledge open receive channel for call {call_id:?}"),
+                &format!(
+                    "timed out waiting for open receive channel acknowledgement for call {call_id:?}"
+                ),
             );
             handle_handset_hangup(access, call_id, false).await;
             Vec::new()

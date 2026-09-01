@@ -195,21 +195,22 @@ pub fn negotiate_audio(
         if !pbx.contains(&pbx_format) {
             continue;
         }
-        let station_max_frames = station.and_then(|capabilities| {
+        let station_max_packet_ms = station.and_then(|capabilities| {
             capabilities
                 .iter()
                 .find(|capability| capability.codec == codec)
-                .map(|capability| capability.max_frames_per_packet)
+                .map(|capability| capability.max_packet_ms)
         });
-        if station.is_some() && station_max_frames.is_none_or(|maximum| maximum == 0) {
+        if station.is_some()
+            && station_max_packet_ms.is_none_or(|maximum| maximum < DEFAULT_AUDIO_PACKET_MS)
+        {
             continue;
         }
         return Ok(NegotiatedAudio {
             codec,
             pbx_format,
             packet_ms: DEFAULT_AUDIO_PACKET_MS,
-            max_frames_per_packet: station_max_frames
-                .unwrap_or(DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET),
+            max_frames_per_packet: DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET,
         });
     }
     if has_representable {
@@ -323,12 +324,12 @@ mod tests {
         let station = [
             MediaCapability {
                 codec: Codec::Pcma,
-                max_frames_per_packet: 2,
+                max_packet_ms: 40,
                 codec_parameters: [0; 8],
             },
             MediaCapability {
                 codec: Codec::Pcmu,
-                max_frames_per_packet: 2,
+                max_packet_ms: 40,
                 codec_parameters: [0; 8],
             },
         ];
@@ -342,7 +343,7 @@ mod tests {
                 codec: Codec::Pcma,
                 pbx_format: PbxAudioFormat::G711Alaw,
                 packet_ms: 20,
-                max_frames_per_packet: 2,
+                max_frames_per_packet: 0,
             })
         );
     }
@@ -351,7 +352,7 @@ mod tests {
     fn negotiation_requires_exact_station_codec_and_pbx_format() {
         let station = [MediaCapability {
             codec: Codec::G711Ulaw56k,
-            max_frames_per_packet: 2,
+            max_packet_ms: 40,
             codec_parameters: [0; 8],
         }];
         assert_eq!(
@@ -364,7 +365,7 @@ mod tests {
                 codec: Codec::G711Ulaw56k,
                 pbx_format: PbxAudioFormat::G711Ulaw,
                 packet_ms: 20,
-                max_frames_per_packet: 2,
+                max_frames_per_packet: 0,
             })
         );
         assert_eq!(
@@ -386,10 +387,28 @@ mod tests {
     }
 
     #[test]
-    fn negotiation_rejects_an_invalid_zero_frame_station_capability() {
+    fn negotiation_keeps_packet_duration_out_of_the_transmit_frame_count() {
         let station = [MediaCapability {
             codec: Codec::Pcmu,
-            max_frames_per_packet: 0,
+            max_packet_ms: 40,
+            codec_parameters: [0; 8],
+        }];
+        assert_eq!(
+            negotiate_audio(&[Codec::Pcmu], Some(&station), &PbxAudioFormat::ALL),
+            Ok(NegotiatedAudio {
+                codec: Codec::Pcmu,
+                pbx_format: PbxAudioFormat::G711Ulaw,
+                packet_ms: 20,
+                max_frames_per_packet: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn negotiation_rejects_an_invalid_zero_packet_duration_capability() {
+        let station = [MediaCapability {
+            codec: Codec::Pcmu,
+            max_packet_ms: 0,
             codec_parameters: [0; 8],
         }];
         assert_eq!(

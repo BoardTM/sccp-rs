@@ -172,7 +172,7 @@ fn enable_barge_capabilities(controller: &mut Controller, device: &str, codec: C
         &DeviceId::new(device).unwrap(),
         vec![MediaCapability {
             codec,
-            max_frames_per_packet: 4,
+            max_packet_ms: 80,
             codec_parameters: [0; 8],
         }],
     );
@@ -1179,6 +1179,15 @@ fn early_media_modes_are_explicit_and_answer_reuses_the_stream() {
     answer_race.digit(CallId(8), Digit::Number(2), now);
     answer_race.digit(CallId(8), Digit::Pound, now);
     answer_race.pbx_progress_with_media_mode(PbxCallId(1), true, OutboundMediaMode::Coupled);
+    assert_eq!(
+        answer_race.pbx_answer(PbxCallId(1)),
+        [DriverEffect::Handset(HandsetEffect::SetCallState {
+            device_id: DeviceId::new("SEP001122334455").unwrap(),
+            call_id: CallId(8),
+            state: HandsetCallState::Connected,
+            stop_media: false,
+        })]
+    );
     assert!(answer_race.pbx_answer(PbxCallId(1)).is_empty());
     assert_eq!(
         answer_race.call(CallId(8)).unwrap().audio,
@@ -1196,11 +1205,7 @@ fn early_media_modes_are_explicit_and_answer_reuses_the_stream() {
                 ..
             }),
             DriverEffect::Handset(HandsetEffect::SetCallInfo { .. }),
-            DriverEffect::Backend(PbxEffect::ConfigureMediaOnly { .. }),
-            DriverEffect::Handset(HandsetEffect::SetCallState {
-                state: HandsetCallState::Connected,
-                ..
-            })
+            DriverEffect::Backend(PbxEffect::ConfigureMediaOnly { .. })
         ]
     ));
     assert!(answer_race.invariant_error().is_none());
@@ -4857,7 +4862,7 @@ fn registered_device_runtime_tracks_capabilities_and_selection() {
         &device,
         vec![MediaCapability {
             codec: Codec::Pcma,
-            max_frames_per_packet: 4,
+            max_packet_ms: 80,
             codec_parameters: [0; 8],
         }],
     );
@@ -4924,7 +4929,7 @@ fn registered_device_distinguishes_pending_empty_and_reported_capabilities() {
         &device,
         vec![MediaCapability {
             codec: Codec::Pcmu,
-            max_frames_per_packet: 4,
+            max_packet_ms: 80,
             codec_parameters: [0; 8],
         }],
     );
@@ -4952,7 +4957,7 @@ fn newer_session_retires_old_calls_and_rejects_late_session_state() {
     let old_capabilities = StationMediaCapabilities::new(
         vec![MediaCapability {
             codec: Codec::Pcmu,
-            max_frames_per_packet: 4,
+            max_packet_ms: 80,
             codec_parameters: [0; 8],
         }],
         vec![VideoCapability {

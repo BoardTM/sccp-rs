@@ -1,5 +1,52 @@
 use super::support::*;
 
+struct TokenRejectWriteFailure {
+    inner: tokio::io::DuplexStream,
+}
+
+impl tokio::io::AsyncRead for TokenRejectWriteFailure {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl tokio::io::AsyncWrite for TokenRejectWriteFailure {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let message_id = bytes
+            .get(8..12)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_le_bytes);
+        if message_id == Some(wire_id::REGISTER_TOKEN_REJECT) {
+            return std::task::Poll::Ready(Err(std::io::Error::other(
+                "injected registration-token rejection write failure",
+            )));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(context, bytes)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
 #[test]
 fn session_generations_are_nonzero_monotonic_and_fail_closed_at_exhaustion() {
     let next = AtomicU64::new(1);
@@ -2172,7 +2219,92 @@ fn registration_token_parity_requires_a_canonical_sep_mac_identity() {
 }
 
 #[tokio::test]
-async fn duplicate_registration_token_leaves_the_live_session_addressable() {
+async fn failed_replacement_token_response_preserves_the_incumbent() {
+    let config = ServerConfig {
+        advertised_address: Ipv4Addr::LOCALHOST,
+        registration_tokens: RegistrationTokenPolicy {
+            fallback: RegistrationFallback::ReturnToPrimary,
+            backoff: Duration::from_secs(75),
+            server_priority: 1,
+        },
+        ..ServerConfig::default()
+    };
+    let (server, handle, mut events, ingress) =
+        Server::with_ingress(config, [definition()]).unwrap();
+    let task = tokio::spawn(server.run());
+    let protocol = ProtocolVersion::V22;
+    let device_id = DeviceId::new("SEP001122334455").unwrap();
+    let (server_stream, mut phone) = tokio::io::duplex(8_192);
+    ingress
+        .accept(
+            server_stream,
+            SocketAddr::from(([127, 0, 0, 1], 40_080)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    let mut decoder = FrameDecoder::new();
+    phone.write_all(&register_bytes(protocol)).await.unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            event: DeviceEventKind::Registered(_),
+            ..
+        }))
+    ));
+
+    let (server_stream, mut contender) = tokio::io::duplex(8_192);
+    ingress
+        .accept(
+            TokenRejectWriteFailure {
+                inner: server_stream,
+            },
+            SocketAddr::from(([127, 0, 0, 1], 40_081)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    contender
+        .write_all(
+            &ClientMessage::RegisterToken(crate::message::RegisterTokenMessage {
+                device_id: device_id.clone(),
+                device_instance: 1,
+                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                device_type: DeviceType::from(115),
+                flags: 0,
+            })
+            .encode(ProtocolVersion::V17)
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::SessionError { .. })
+    ));
+
+    handle
+        .send_confirmed(Command::new(
+            device_id,
+            CommandAction::BeginCall {
+                line_instance: LineInstance::new(1),
+                call_id: CallId(7_080),
+                codec: Codec::Pcmu,
+            },
+        ))
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::CALL_STATE).await;
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_registration_token_retires_the_incumbent_before_retry() {
     let config = ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         advertised_address: Ipv4Addr::LOCALHOST,
@@ -2293,41 +2425,47 @@ async fn duplicate_registration_token_leaves_the_live_session_addressable() {
     assert_eq!(
         ServerMessage::decode(response, ProtocolVersion::V17).unwrap(),
         ServerMessage::RegisterTokenReject {
-            backoff_seconds: 75,
+            backoff_seconds: REPLACEMENT_REGISTRATION_BACKOFF_SECONDS,
         }
     );
-
-    handle
-        .send_confirmed(Command::new(
-            device_id.clone(),
-            CommandAction::SetCallState {
-                call_id,
-                state: CallState::Connected,
-            },
-        ))
-        .await
-        .unwrap();
-    let frames = read_until_message(&mut phone, &mut decoder, wire_id::CALL_STATE).await;
-    assert!(frames.into_iter().any(|frame| matches!(
-        ServerMessage::decode(frame, protocol),
-        Ok(ServerMessage::CallState {
-            state: CallState::Connected,
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            device_id: actual_device_id,
+            event: DeviceEventKind::Disconnected {},
             ..
-        })
-    )));
-    handle
-        .send_confirmed(Command::new(
-            device_id,
-            CommandAction::CloseReceiveChannel { call_id },
-        ))
-        .await
-        .unwrap();
-    read_until_message(&mut phone, &mut decoder, wire_id::CLOSE_RECEIVE_CHANNEL).await;
-    phone
+        })) if actual_device_id == device_id
+    ));
+    let mut retry = TcpStream::connect(address).await.unwrap();
+    let mut retry_decoder = FrameDecoder::new();
+    retry
         .write_all(&ClientMessage::KeepAlive.encode(protocol).unwrap())
         .await
         .unwrap();
-    read_until_message(&mut phone, &mut decoder, wire_id::KEEP_ALIVE_ACK).await;
+    read_until_message(&mut retry, &mut retry_decoder, wire_id::KEEP_ALIVE_ACK).await;
+    retry
+        .write_all(
+            &ClientMessage::RegisterToken(crate::message::RegisterTokenMessage {
+                device_id,
+                device_instance: 1,
+                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                device_type: DeviceType::from(115),
+                flags: 0,
+            })
+            .encode(ProtocolVersion::V17)
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let response = read_until_message(&mut retry, &mut retry_decoder, wire_id::REGISTER_TOKEN_ACK)
+        .await
+        .into_iter()
+        .find(|frame| frame.message_id == wire_id::REGISTER_TOKEN_ACK)
+        .unwrap();
+    assert_eq!(
+        ServerMessage::decode(response, ProtocolVersion::V17).unwrap(),
+        ServerMessage::RegisterTokenAck
+    );
 
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
@@ -2584,6 +2722,131 @@ async fn secondary_sessions_use_the_secondary_keepalive_deadline() {
             event: DeviceEventKind::Disconnected {},
             ..
         }))
+    ));
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn unregister_acknowledges_then_retires_the_exact_session() {
+    let config = ServerConfig {
+        advertised_address: Ipv4Addr::LOCALHOST,
+        ..ServerConfig::default()
+    };
+    let device = definition();
+    let device_id = device.id.clone();
+    let (server, handle, mut events, ingress) = Server::with_ingress(config, [device]).unwrap();
+    let task = tokio::spawn(server.run());
+    let (server_stream, mut phone) = tokio::io::duplex(8_192);
+    ingress
+        .accept(
+            server_stream,
+            SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    let protocol = ProtocolVersion::V22;
+    let mut decoder = FrameDecoder::new();
+    phone.write_all(&register_bytes(protocol)).await.unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+    let generation = match events.recv().await {
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::Registered(_),
+            ..
+        })) => session_generation,
+        event => panic!("expected registration, got {event:?}"),
+    };
+
+    phone
+        .write_all(
+            &ClientMessage::Unregister { reason: 0 }
+                .encode(protocol)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::UNREGISTER_ACK).await;
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            device_id: actual_device_id,
+            event: DeviceEventKind::Disconnected {},
+        })) if session_generation == generation && actual_device_id == device_id
+    ));
+    let mut byte = [0_u8; 1];
+    assert_eq!(phone.read(&mut byte).await.unwrap(), 0);
+    assert!(matches!(
+        handle
+            .send_confirmed(Command::new(
+                device_id.clone(),
+                CommandAction::ResetDevice {
+                    reset_type: ResetType::Reset,
+                },
+            ))
+            .await,
+        Err(ServerError::CommandWrite(error))
+            if error == ServerError::DeviceNotConnected(device_id).to_string()
+    ));
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn valid_station_traffic_refreshes_the_session_watchdog() {
+    let config = ServerConfig {
+        keepalive_seconds: 5,
+        secondary_keepalive_seconds: 5,
+        ..ServerConfig::default()
+    };
+    let (server, handle, mut events, ingress) =
+        Server::with_ingress(config, [definition()]).unwrap();
+    let task = tokio::spawn(server.run());
+    let (server_stream, mut phone) = tokio::io::duplex(8_192);
+    ingress
+        .accept(
+            server_stream,
+            SocketAddr::from(([127, 0, 0, 1], 40_001)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    let protocol = ProtocolVersion::V22;
+    let mut decoder = FrameDecoder::new();
+    phone.write_all(&register_bytes(protocol)).await.unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+    let generation = match events.recv().await {
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::Registered(_),
+            ..
+        })) => session_generation,
+        event => panic!("expected registration, got {event:?}"),
+    };
+
+    tokio::time::advance(Duration::from_secs(14)).await;
+    phone
+        .write_all(&ClientMessage::TimeDateRequest.encode(protocol).unwrap())
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::DEFINE_TIME_DATE).await;
+    tokio::time::advance(Duration::from_secs(14)).await;
+    tokio::task::yield_now().await;
+    assert!(events.try_recv().is_err());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::Disconnected {},
+            ..
+        })) if session_generation == generation
     ));
 
     handle.shutdown().await.unwrap();

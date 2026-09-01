@@ -10,6 +10,37 @@ use crate::media::direct::direct_failure_anchor;
 use crate::media::encryption::{AudioEncryptionAdmission, MediaEncryptionDecision};
 use crate::runtime::backend::MediaBackend as _;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StationPacketLimit {
+    Unavailable,
+    Pending,
+    Maximum(u32),
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::asterisk) struct AudioFraming {
+    pub packet_ms: u32,
+    pub max_frames_per_packet: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(in crate::asterisk) enum AudioFramingError {
+    #[error("station is unavailable")]
+    StationUnavailable,
+    #[error("audio packet duration must be non-zero")]
+    InvalidRequestedPacketDuration,
+    #[error("codec {codec:?} is not advertised by the station")]
+    UnsupportedCodec { codec: Codec },
+    #[error(
+        "audio packet duration {requested_packet_ms} ms exceeds station maximum {maximum_packet_ms} ms"
+    )]
+    PacketDurationExceedsStationMaximum {
+        requested_packet_ms: u32,
+        maximum_packet_ms: u32,
+    },
+}
+
 fn audio_encryption_admission(
     access: &Access,
     device_id: &DeviceId,
@@ -276,10 +307,9 @@ pub(super) fn prepare_anchor_retarget(
     else {
         return None;
     };
-    let (packet_ms, max_frames_per_packet) =
-        audio_framing(access, &call.device_id, call.call_id, call.codec);
-    endpoint.packet_ms = packet_ms;
-    endpoint.max_frames_per_packet = max_frames_per_packet;
+    let framing = audio_framing(access, &call.device_id, call.call_id, call.codec).ok()?;
+    endpoint.packet_ms = framing.packet_ms;
+    endpoint.max_frames_per_packet = framing.max_frames_per_packet;
     let dtmf_mode = configured_dtmf_mode(access, &call.device_id, call.call_id);
     let audio_processing = configured_audio_processing(access, &call.device_id, call.call_id);
     let traffic_class = configured_audio_traffic_class(access, &call.device_id)?;
@@ -324,12 +354,16 @@ pub(super) fn prepare_direct_retarget(
     let dtmf_mode = configured_dtmf_mode(access, &call.device_id, call.call_id);
     let audio_processing = configured_audio_processing(access, &call.device_id, call.call_id);
     let traffic_class = configured_audio_traffic_class(access, &call.device_id)?;
+    let framing = audio_framing(access, &call.device_id, call.call_id, call.codec).ok()?;
+    let mut endpoint = call.transmit_endpoint;
+    endpoint.packet_ms = framing.packet_ms;
+    endpoint.max_frames_per_packet = framing.max_frames_per_packet;
     Some(PendingMediaRetarget {
         command: PhoneCommand::new(
             call.device_id.clone(),
             PhoneCommandAction::StartMedia {
                 call_id: call.call_id,
-                endpoint: call.transmit_endpoint,
+                endpoint,
                 dtmf_mode,
                 audio_processing,
                 traffic_class,
@@ -382,13 +416,12 @@ pub fn recover_failed_media_transmission(
         .media_anchors
         .lock_unpoisoned()
         .is_anchored(call.pbx_id);
-    let anchor = local_media_endpoint(access, call.pbx_id, &call.device_id, call.codec).map(
+    let anchor = local_media_endpoint(access, call.pbx_id, &call.device_id, call.codec).and_then(
         |mut endpoint| {
-            let (packet_ms, max_frames_per_packet) =
-                audio_framing(access, &call.device_id, call.call_id, call.codec);
-            endpoint.packet_ms = packet_ms;
-            endpoint.max_frames_per_packet = max_frames_per_packet;
-            endpoint
+            let framing = audio_framing(access, &call.device_id, call.call_id, call.codec).ok()?;
+            endpoint.packet_ms = framing.packet_ms;
+            endpoint.max_frames_per_packet = framing.max_frames_per_packet;
+            Some(endpoint)
         },
     );
     let Some(anchor) = direct_failure_anchor(failed_endpoint, anchor, anchoring_required) else {
@@ -440,32 +473,31 @@ pub fn enqueue_media_retarget(
     })
 }
 
-pub fn audio_framing(
+pub(in crate::asterisk) fn audio_framing(
     access: &Access,
     device: &DeviceId,
     call_id: CallId,
     codec: Codec,
-) -> (u32, u32) {
-    let advertised_maximum = controller_step(&access.shared.controller, |controller| {
-        controller
-            .registered_device(device)
-            .and_then(|state| {
-                state.capabilities.as_ref().and_then(|capabilities| {
-                    capabilities
-                        .audio()
-                        .iter()
-                        .find(|capability| capability.codec == codec)
-                })
+) -> Result<AudioFraming, AudioFramingError> {
+    let packet_limit = controller_step(&access.shared.controller, |controller| {
+        let Some(state) = controller.registered_device(device) else {
+            return StationPacketLimit::Unavailable;
+        };
+        let Some(capabilities) = state.capabilities.as_ref() else {
+            return StationPacketLimit::Pending;
+        };
+        capabilities
+            .audio()
+            .iter()
+            .find(|capability| capability.codec == codec)
+            .map_or(StationPacketLimit::Unsupported, |capability| {
+                StationPacketLimit::Maximum(capability.max_packet_ms)
             })
-            .map(|capability| capability.max_frames_per_packet)
     });
-    let max_frames_per_packet = advertised_maximum
-        .filter(|maximum| *maximum != 0)
-        .unwrap_or(DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET);
     let pbx_id = controller_step(&access.shared.controller, |controller| {
         controller.call_pbx_id(call_id)
     });
-    let packet_ms = pbx_id
+    let requested_packet_ms = pbx_id
         .and_then(|pbx_id| {
             access
                 .shared
@@ -475,7 +507,29 @@ pub fn audio_framing(
                 .copied()
         })
         .unwrap_or(DEFAULT_AUDIO_PACKET_MS);
-    (packet_ms, max_frames_per_packet)
+    if requested_packet_ms == 0 {
+        return Err(AudioFramingError::InvalidRequestedPacketDuration);
+    }
+    match packet_limit {
+        StationPacketLimit::Unavailable => {
+            return Err(AudioFramingError::StationUnavailable);
+        }
+        StationPacketLimit::Pending => {}
+        StationPacketLimit::Maximum(maximum) if requested_packet_ms <= maximum => {}
+        StationPacketLimit::Maximum(maximum) => {
+            return Err(AudioFramingError::PacketDurationExceedsStationMaximum {
+                requested_packet_ms,
+                maximum_packet_ms: maximum,
+            });
+        }
+        StationPacketLimit::Unsupported => {
+            return Err(AudioFramingError::UnsupportedCodec { codec });
+        }
+    }
+    Ok(AudioFraming {
+        packet_ms: requested_packet_ms,
+        max_frames_per_packet: DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET,
+    })
 }
 
 pub fn configured_dtmf_mode(access: &Access, device: &DeviceId, call_id: CallId) -> DtmfMode {

@@ -493,7 +493,7 @@ fn decode_audio_entry(
 ) -> Result<MediaCapability, CodecError> {
     Ok(MediaCapability {
         codec: Codec::from(cursor.word(offset)?),
-        max_frames_per_packet: cursor.word(offset + 4)?,
+        max_packet_ms: cursor.word(offset + 4)?,
         codec_parameters: cursor
             .bytes(offset + 8, 8)?
             .try_into()

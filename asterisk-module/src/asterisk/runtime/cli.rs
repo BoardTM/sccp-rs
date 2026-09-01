@@ -70,7 +70,7 @@ fn runtime_cli_inventory_snapshot(
                                     .iter()
                                     .map(|capability| CliCapability {
                                         codec: capability.codec,
-                                        max_frames_per_packet: capability.max_frames_per_packet,
+                                        max_packet_ms: capability.max_packet_ms,
                                     })
                                     .collect(),
                             ),

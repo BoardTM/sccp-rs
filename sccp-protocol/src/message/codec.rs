@@ -2011,7 +2011,7 @@ fn decode_capabilities_response(
         let capability: WireMediaCapability = decode(message_id, entry)?;
         capabilities.push(MediaCapability {
             codec: Codec::from(capability.codec),
-            max_frames_per_packet: capability.max_frames_per_packet,
+            max_packet_ms: capability.max_frames_per_packet,
             codec_parameters: capability.codec_parameters,
         });
     }
@@ -2046,7 +2046,7 @@ fn encode_capabilities_response(capabilities: &[MediaCapability]) -> Result<Vec<
             wire_id::CAPABILITIES_RES,
             &WireMediaCapability {
                 codec: capability.codec.wire_value(),
-                max_frames_per_packet: capability.max_frames_per_packet,
+                max_frames_per_packet: capability.max_packet_ms,
                 codec_parameters: capability.codec_parameters,
             },
         )?);
@@ -8141,7 +8141,7 @@ mod tests {
                 } else {
                     Codec::Pcma
                 },
-                max_frames_per_packet: index + 1,
+                max_packet_ms: index + 1,
                 codec_parameters: [index as u8; 8],
             })
             .collect::<Vec<_>>();
@@ -8159,7 +8159,7 @@ mod tests {
         let capabilities = (0_u32..20)
             .map(|index| MediaCapability {
                 codec: Codec::Unknown(0x1000 + index),
-                max_frames_per_packet: index + 1,
+                max_packet_ms: index + 1,
                 codec_parameters: [index as u8; 8],
             })
             .collect::<Vec<_>>();
@@ -8177,12 +8177,12 @@ mod tests {
         let capabilities = vec![
             MediaCapability {
                 codec: Codec::Pcmu,
-                max_frames_per_packet: 2,
+                max_packet_ms: 2,
                 codec_parameters: [1; 8],
             },
             MediaCapability {
                 codec: Codec::Pcma,
-                max_frames_per_packet: 3,
+                max_packet_ms: 3,
                 codec_parameters: [2; 8],
             },
         ];
@@ -8193,7 +8193,7 @@ mod tests {
                     wire_id::CAPABILITIES_RES,
                     &WireMediaCapability {
                         codec: capability.codec.wire_value(),
-                        max_frames_per_packet: capability.max_frames_per_packet,
+                        max_frames_per_packet: capability.max_packet_ms,
                         codec_parameters: capability.codec_parameters,
                     },
                 )
@@ -8265,7 +8265,7 @@ mod tests {
             .unwrap(),
             ClientMessage::CapabilitiesResponse(vec![MediaCapability {
                 codec: Codec::Pcmu,
-                max_frames_per_packet: 2,
+                max_packet_ms: 2,
                 codec_parameters: [1; 8],
             }])
         );

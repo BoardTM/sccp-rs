@@ -67,7 +67,7 @@ fn multicast_test_state(protocol: ProtocolVersion) -> SessionState {
     );
     state.media_capabilities = vec![MediaCapability {
         codec: Codec::Pcmu,
-        max_frames_per_packet: 2,
+        max_packet_ms: 40,
         codec_parameters: [0; 8],
     }]
     .into();

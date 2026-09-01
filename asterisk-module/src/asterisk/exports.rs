@@ -1348,8 +1348,8 @@ pub unsafe fn update_rtp_peer(
         peer.nat_active || detected_nat,
         peer_supports_codec,
     );
-    let (packet_ms, max_frames_per_packet) =
-        audio_framing(&access, &call.device_id, call.call_id, call.codec);
+    let framing = audio_framing(&access, &call.device_id, call.call_id, call.codec)
+        .map_err(|_| ChannelOperationError::Invalid)?;
     let endpoint = match route {
         DirectMediaRoute::Direct => {
             let Some(address) = peer_address else {
@@ -1360,8 +1360,8 @@ pub unsafe fn update_rtp_peer(
                 rtp_port: peer.port,
                 rtcp_port: peer.port + 1,
                 codec: call.codec,
-                packet_ms,
-                max_frames_per_packet,
+                packet_ms: framing.packet_ms,
+                max_frames_per_packet: framing.max_frames_per_packet,
                 telephone_event_payload: 0,
             }
         }
@@ -1371,8 +1371,8 @@ pub unsafe fn update_rtp_peer(
             else {
                 return Err(ChannelOperationError::Invalid);
             };
-            endpoint.packet_ms = packet_ms;
-            endpoint.max_frames_per_packet = max_frames_per_packet;
+            endpoint.packet_ms = framing.packet_ms;
+            endpoint.max_frames_per_packet = framing.max_frames_per_packet;
             endpoint
         }
     };

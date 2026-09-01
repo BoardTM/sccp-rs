@@ -1,3 +1,5 @@
+use sccp_protocol::DEFAULT_AUDIO_PACKET_MS;
+
 use super::{
     ActiveConferenceAnnouncement, AmiEventPublisher, AppearanceRingMode, AppearanceRingSummary,
     Arc, AsteriskChannel, AsteriskDatabase, AsteriskHints, AsteriskManager, AsteriskPartyUpdates,
@@ -1156,7 +1158,7 @@ pub fn audio_preference_policy(
         };
         if station.as_ref().is_some_and(|capabilities| {
             !capabilities.audio().iter().any(|capability| {
-                capability.codec == codec && capability.max_frames_per_packet != 0
+                capability.codec == codec && capability.max_packet_ms >= DEFAULT_AUDIO_PACKET_MS
             })
         }) {
             continue;

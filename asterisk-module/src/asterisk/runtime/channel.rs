@@ -16,7 +16,8 @@ use crate::pbx::operations::CallFeatureProvider as _;
 use crate::runtime::controller::{VideoFallbackReason, VideoPlan, VideoPlanReadiness};
 use sccp_protocol::message::MediaCapability;
 use sccp_protocol::{
-    IpAddressType, MultimediaPayload, ProtocolVersion, RtpPayloadNumber, SessionGeneration,
+    DEFAULT_AUDIO_PACKET_MS, IpAddressType, MultimediaPayload, ProtocolVersion, RtpPayloadNumber,
+    SessionGeneration,
 };
 
 pub fn handset_effect_call_id(effect: &HandsetEffect) -> Option<CallId> {
@@ -269,7 +270,7 @@ pub unsafe fn preferred_inbound_codec(
             let format = pbx_audio_format(codec).ok()?;
             let station_supports = station.is_none_or(|capabilities| {
                 capabilities.iter().any(|capability| {
-                    capability.codec == codec && capability.max_frames_per_packet != 0
+                    capability.codec == codec && capability.max_packet_ms >= DEFAULT_AUDIO_PACKET_MS
                 })
             });
             station_supports.then_some((codec, format))
@@ -802,7 +803,7 @@ mod allocation_text_tests {
     fn reported_capabilities_preserve_configured_order_for_negotiation() {
         let capabilities = StationMediaCapabilities::from(vec![MediaCapability {
             codec: Codec::G729,
-            max_frames_per_packet: 4,
+            max_packet_ms: 80,
             codec_parameters: [0; 8],
         }]);
         let mut codecs = vec![Codec::Pcma, Codec::G729, Codec::Pcmu];

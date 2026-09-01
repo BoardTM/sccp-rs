@@ -33,7 +33,7 @@ pub enum CliInventoryCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliCapability {
     pub codec: Codec,
-    pub max_frames_per_packet: u32,
+    pub max_packet_ms: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,10 +339,7 @@ impl CliInventorySnapshot {
             .sort_by(|left, right| left.device_id.cmp(&right.device_id));
         for runtime in &mut self.device_runtime {
             runtime.capabilities.sort_by_key(|capability| {
-                (
-                    capability.codec.wire_value(),
-                    capability.max_frames_per_packet,
-                )
+                (capability.codec.wire_value(), capability.max_packet_ms)
             });
             runtime
                 .features
@@ -799,19 +796,17 @@ fn render_selected_capabilities(
         output.field("Position", index)?;
         output.field("Codec", format_args!("{:?}", item.codec))?;
         output.field("Codec ID", item.codec.wire_value())?;
-        return output.field("Max frames per packet", item.max_frames_per_packet);
+        return output.field("Max packet ms", item.max_packet_ms);
     }
     ensure_list_bound(capabilities.len())?;
-    output.line(format_args!(
-        "Position\tCodec\tCodec ID\tMax frames per packet"
-    ))?;
+    output.line(format_args!("Position\tCodec\tCodec ID\tMax packet ms"))?;
     for (index, item) in capabilities.iter().enumerate() {
         output.line(format_args!(
             "{}\t{:?}\t{}\t{}",
             index + 1,
             item.codec,
             item.codec.wire_value(),
-            item.max_frames_per_packet,
+            item.max_packet_ms,
         ))?;
     }
     Ok(())
@@ -1003,11 +998,11 @@ mod tests {
                 capabilities: vec![
                     CliCapability {
                         codec: Codec::G729,
-                        max_frames_per_packet: 2,
+                        max_packet_ms: 40,
                     },
                     CliCapability {
                         codec: Codec::Pcmu,
-                        max_frames_per_packet: 1,
+                        max_packet_ms: 20,
                     },
                 ],
                 features: vec![

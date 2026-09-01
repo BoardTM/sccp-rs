@@ -51,7 +51,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as SyncMutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -60,7 +60,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(test)]
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -130,6 +130,8 @@ const SESSION_ACCEPT_CAPACITY: usize = 128;
 /// unacknowledged before the call owner is notified and the stale correlation
 /// state is retired.
 pub const HANDSET_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+const MEDIA_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(1);
+const SESSION_MEDIA_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Bound for the writer acknowledgement used to serialize commands whose
 /// resources must remain owned until their complete frame reaches the socket.
 pub const ORDERING_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -147,9 +149,8 @@ const MAX_STATISTICS_REFERENCES_PER_SESSION: usize = 4096;
 const DEFAULT_MAX_CALLS_PER_LINE: u16 = 4;
 const DEFAULT_BUSY_TRIGGER_PER_LINE: u16 = 2;
 const PARKING_APPLICATION_ID: u32 = 9090;
-/// Shortest retry delay accepted for a rejected registration token.
+const REPLACEMENT_REGISTRATION_BACKOFF_SECONDS: u32 = 10;
 pub const MIN_REGISTRATION_BACKOFF: Duration = Duration::from_secs(30);
-/// Longest retry delay accepted for a rejected registration token.
 pub const MAX_REGISTRATION_BACKOFF: Duration = Duration::from_secs(86_400);
 /// Maximum number of parked calls rendered in one station selection menu.
 ///
@@ -1380,6 +1381,8 @@ pub enum ServerError {
     CommandWrite(String),
     #[error("SCCP command writer acknowledgement timed out")]
     CommandAcknowledgementTimeout,
+    #[error("SCCP station media cleanup timed out")]
+    MediaCleanupTimeout,
     #[error("SCCP media request identity space is exhausted")]
     MediaRequestIdentityExhausted,
     #[error("SCCP station session generation space is exhausted")]
@@ -1870,6 +1873,7 @@ pub struct Server {
     anonymous_hotline: Arc<RwLock<Option<AnonymousHotlineDefinition>>>,
     definitions: Arc<RwLock<HashMap<DeviceId, DeviceDefinition>>>,
     sessions: Sessions,
+    lifecycle: Arc<Mutex<()>>,
     event_tx: mpsc::Sender<Event>,
     command_rx: mpsc::Receiver<ServerCommand>,
     next_generation: Arc<AtomicU64>,
@@ -1888,6 +1892,83 @@ struct SessionSender {
     generation: SessionGeneration,
     anonymous_hotline: bool,
     tx: mpsc::Sender<SessionCommand>,
+    admission: Arc<SessionAdmission>,
+}
+
+impl SessionSender {
+    fn retire(&self) {
+        self.admission.retire();
+    }
+
+    async fn send_if_active(&self, command: SessionCommand) -> Result<(), SessionCommand> {
+        let mut retirement = self.admission.subscribe();
+        if *retirement.borrow() == SessionAdmissionState::Retired {
+            return Err(command);
+        }
+        tokio::select! {
+            biased;
+            _ = retirement.changed() => Err(command),
+            permit = self.tx.reserve() => {
+                let Ok(permit) = permit else {
+                    return Err(command);
+                };
+                self.admission.commit(permit, command)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionAdmissionState {
+    Active,
+    Retired,
+}
+
+#[derive(Debug)]
+struct SessionAdmission {
+    state: SyncMutex<SessionAdmissionState>,
+    retirement: watch::Sender<SessionAdmissionState>,
+}
+
+impl SessionAdmission {
+    fn new() -> Self {
+        let (retirement, _) = watch::channel(SessionAdmissionState::Active);
+        Self {
+            state: SyncMutex::new(SessionAdmissionState::Active),
+            retirement,
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<SessionAdmissionState> {
+        self.retirement.subscribe()
+    }
+
+    fn retire(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("SCCP session admission lock poisoned");
+        *state = SessionAdmissionState::Retired;
+        self.retirement.send_replace(SessionAdmissionState::Retired);
+    }
+
+    fn commit(
+        &self,
+        permit: mpsc::Permit<'_, SessionCommand>,
+        command: SessionCommand,
+    ) -> Result<(), SessionCommand> {
+        let state = self
+            .state
+            .lock()
+            .expect("SCCP session admission lock poisoned");
+        match *state {
+            SessionAdmissionState::Active => {
+                permit.send(command);
+                Ok(())
+            }
+            SessionAdmissionState::Retired => Err(command),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1948,7 +2029,12 @@ enum SessionCommand {
         ringer: Option<IncomingRing>,
         delivery: Option<IncomingOfferConfirmation>,
     },
-    Disconnect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionDisposition {
+    Continue,
+    Terminate,
 }
 
 #[derive(Clone, Debug)]
@@ -2050,6 +2136,7 @@ impl CallMedia {
 #[derive(Clone, Debug, Default)]
 struct MediaLeg {
     request: Option<MediaRequestIdentity>,
+    activity_generation: u64,
     telephone_event_payload: u8,
     peer: Option<MediaEndpoint>,
     state: MediaChannelState,
@@ -2250,6 +2337,7 @@ impl Server {
                 anonymous_hotline,
                 definitions: Arc::new(RwLock::new(by_id)),
                 sessions: Arc::new(Mutex::new(HashMap::new())),
+                lifecycle: Arc::new(Mutex::new(())),
                 event_tx,
                 command_rx,
                 next_generation: Arc::new(AtomicU64::new(1)),
@@ -2332,7 +2420,7 @@ impl Server {
                                 warn!(%device_id, ?expected, actual = ?session.generation, "discarding incoming offer for a stale session generation");
                                 continue;
                             }
-                            if let Err(error) = session.tx.send(SessionCommand::OfferIncoming {
+                            if let Err(command) = session.send_if_active(SessionCommand::OfferIncoming {
                                 line_instance,
                                 call_id,
                                 info: Box::new(info),
@@ -2343,9 +2431,12 @@ impl Server {
                                 if let SessionCommand::OfferIncoming {
                                     delivery: Some(delivery),
                                     ..
-                                } = error.0
+                                } = command
                                 {
-                                    let _ = delivery.send(IncomingOfferDelivery::SessionMissing);
+                                    let outcome = self
+                                        .unavailable_offer_delivery(&device_id, expected_generation)
+                                        .await;
+                                    let _ = delivery.send(outcome);
                                 }
                                 warn!(%device_id, "discarding incoming offer for a retired session");
                             }
@@ -2401,13 +2492,13 @@ impl Server {
                             drop(sessions);
                             let count = affected.len();
                             for session in affected {
-                                let _ = session.tx.send(SessionCommand::Disconnect).await;
+                                session.retire();
                             }
                             let _ = applied.send(count);
                         }
                         Some(ServerCommand::Shutdown) | None => {
                             let sessions: Vec<_> = self.sessions.lock().await.values().cloned().collect();
-                            for session in sessions { let _ = session.tx.send(SessionCommand::Disconnect).await; }
+                            for session in sessions { session.retire(); }
                             return Ok(());
                         }
                     }
@@ -2433,6 +2524,7 @@ impl Server {
             definitions: Arc::clone(&self.definitions),
             anonymous_hotline: Arc::clone(&self.anonymous_hotline),
             sessions: Arc::clone(&self.sessions),
+            lifecycle: Arc::clone(&self.lifecycle),
             event_tx: self.event_tx.clone(),
             next_generation: Arc::clone(&self.next_generation),
             next_statistics_generation: Arc::clone(&self.next_statistics_generation),
@@ -2474,25 +2566,20 @@ impl Server {
             reject_expired_confirmed_command(written);
             return;
         }
-        let tx = self
-            .sessions
-            .lock()
-            .await
-            .get(&device_id)
-            .map(|session| session.tx.clone());
-        let Some(tx) = tx else {
+        let session = self.sessions.lock().await.get(&device_id).cloned();
+        let Some(session) = session else {
             let _ = written.send(Err(ServerError::DeviceNotConnected(device_id).to_string()));
             return;
         };
-        if let Err(error) = tx
-            .send(SessionCommand::Confirmed {
+        if let Err(command) = session
+            .send_if_active(SessionCommand::Confirmed {
                 command,
                 written,
                 expires_at,
             })
             .await
         {
-            let SessionCommand::Confirmed { written, .. } = error.0 else {
+            let SessionCommand::Confirmed { written, .. } = command else {
                 unreachable!("confirmed dispatch returned a different command variant")
             };
             let _ = written.send(Err(ServerError::DeviceNotConnected(device_id).to_string()));
@@ -2504,16 +2591,38 @@ impl Server {
         device_id: &DeviceId,
         command: SessionCommand,
     ) -> Result<(), ServerError> {
-        let tx = self
+        let session = self
             .sessions
             .lock()
             .await
             .get(device_id)
-            .map(|s| s.tx.clone())
+            .cloned()
             .ok_or_else(|| ServerError::DeviceNotConnected(device_id.clone()))?;
-        tx.send(command)
+        session
+            .send_if_active(command)
             .await
             .map_err(|_| ServerError::DeviceNotConnected(device_id.clone()))
+    }
+
+    async fn unavailable_offer_delivery(
+        &self,
+        device_id: &DeviceId,
+        expected_generation: Option<SessionGeneration>,
+    ) -> IncomingOfferDelivery {
+        let current_generation = self
+            .sessions
+            .lock()
+            .await
+            .get(device_id)
+            .map(|session| session.generation);
+        match (expected_generation, current_generation) {
+            (Some(expected), Some(actual)) if expected != actual => {
+                IncomingOfferDelivery::SessionStale {
+                    actual_generation: actual,
+                }
+            }
+            _ => IncomingOfferDelivery::SessionMissing,
+        }
     }
 
     async fn apply_station_policy(
@@ -2565,7 +2674,7 @@ impl Server {
             .collect::<Vec<_>>();
         drop(sessions);
         for session in affected_sessions {
-            let _ = session.tx.send(SessionCommand::Disconnect).await;
+            session.retire();
         }
         result
     }
@@ -2579,9 +2688,13 @@ fn reject_expired_confirmed_command(written: CommandWriteConfirmation) {
     let _ = written.send(Err(ServerError::CommandAcknowledgementTimeout.to_string()));
 }
 
-fn prepare_session_command(
+struct PreparedSessionCommand {
     command: SessionCommand,
-) -> Option<(SessionCommand, Option<CommandWriteConfirmation>)> {
+    written: Option<CommandWriteConfirmation>,
+    expires_at: Option<Instant>,
+}
+
+fn prepare_session_command(command: SessionCommand) -> Option<PreparedSessionCommand> {
     match command {
         SessionCommand::Confirmed {
             command,
@@ -2592,10 +2705,18 @@ fn prepare_session_command(
                 reject_expired_confirmed_command(written);
                 None
             } else {
-                Some((SessionCommand::Public(command), Some(written)))
+                Some(PreparedSessionCommand {
+                    command: SessionCommand::Public(command),
+                    written: Some(written),
+                    expires_at: Some(expires_at),
+                })
             }
         }
-        command => Some((command, None)),
+        command => Some(PreparedSessionCommand {
+            command,
+            written: None,
+            expires_at: None,
+        }),
     }
 }
 
@@ -2770,6 +2891,7 @@ struct SessionContext {
     definitions: Arc<RwLock<HashMap<DeviceId, DeviceDefinition>>>,
     anonymous_hotline: Arc<RwLock<Option<AnonymousHotlineDefinition>>>,
     sessions: Sessions,
+    lifecycle: Arc<Mutex<()>>,
     event_tx: mpsc::Sender<Event>,
     next_generation: Arc<AtomicU64>,
     next_statistics_generation: Arc<AtomicU64>,
@@ -2818,6 +2940,8 @@ struct SessionRuntimeState {
     media_path_states:
         HashMap<crate::message::values::MediaPathId, crate::message::values::MediaPathEvent>,
     pending_media_path_release: Option<PendingMediaPathRelease>,
+    station_activity_generation: u64,
+    transport_writable: bool,
 }
 
 impl Default for SessionRuntimeState {
@@ -2847,6 +2971,8 @@ impl Default for SessionRuntimeState {
             headset_enabled: false,
             media_path_states: HashMap::new(),
             pending_media_path_release: None,
+            station_activity_generation: 0,
+            transport_writable: true,
         }
     }
 }
@@ -2968,10 +3094,13 @@ async fn run_session(
     context: SessionContext,
 ) -> Result<(), ServerError> {
     let (session_tx, mut session_rx) = mpsc::channel(SESSION_COMMAND_CAPACITY);
+    let admission = Arc::new(SessionAdmission::new());
+    let mut retirement = admission.subscribe();
     let mut decoder = FrameDecoder::new();
     let mut read_buffer = [0_u8; 4096];
     let mut state: Option<SessionState> = None;
-    let mut last_keepalive = Instant::now();
+    let mut unhandled_command = None;
+    let mut last_station_activity = Instant::now();
     let mut session_deadlines = tokio::time::interval(Duration::from_millis(100));
     session_deadlines.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let keepalive_seconds = if context.config.registration_tokens.server_priority == 1 {
@@ -2981,103 +3110,235 @@ async fn run_session(
     };
     let keepalive_timeout = Duration::from_secs(u64::from(keepalive_seconds) * 3);
 
-    loop {
-        tokio::select! {
-            read = stream.read(&mut read_buffer) => {
-                let count = read?;
-                if count == 0 { break; }
-                let frames = match decoder.push(&read_buffer[..count]) {
-                    Ok(frames) => frames,
-                    Err(error) if state.is_none() => {
-                        debug!(
-                            peer = %context.peer,
-                            %error,
-                            "discarding malformed pre-registration SCCP stream"
-                        );
+    let result = async {
+        'session: loop {
+            if *retirement.borrow() == SessionAdmissionState::Retired {
+                break;
+            }
+            tokio::select! {
+                read = stream.read(&mut read_buffer) => {
+                    let count = read?;
+                    if *retirement.borrow() == SessionAdmissionState::Retired {
                         break;
                     }
-                    Err(error) => return Err(error.into()),
-                };
-                for frame in frames {
-                    let decode_protocol = state
-                        .as_ref()
-                        .map_or(ProtocolVersion::V3, |state| state.registration.protocol);
-                    let message_id = frame.message_id;
-                    let message = match ClientMessage::decode_with_version(frame, decode_protocol) {
-                        Ok(message) => message,
-                        Err(error) if message_id != crate::message::wire_id::REGISTER => {
-                            let device_id = state.as_ref().map(|state| state.device.id.clone());
-                            warn!(peer = %context.peer, message_id = format_args!("0x{message_id:04x}"), %error, "ignoring malformed SCCP application message");
-                            let _ = context.event_tx.send(Event::ProtocolWarning {
-                                peer: context.peer,
-                                device_id,
-                                message_id,
-                                error: error.to_string(),
-                            }).await;
-                            continue;
+                    if count == 0 { break; }
+                    let frames = match decoder.push(&read_buffer[..count]) {
+                        Ok(frames) => frames,
+                        Err(error) if state.is_none() => {
+                            debug!(
+                                peer = %context.peer,
+                                %error,
+                                "discarding malformed pre-registration SCCP stream"
+                            );
+                            break;
                         }
                         Err(error) => return Err(error.into()),
                     };
-                    if let ClientMessage::Register(registration) = &message {
-                        if state.is_some() {
-                            return Err(ServerError::Protocol(CodecError::InvalidDefinition("duplicate REGISTER on one TCP session".into())));
+                    for frame in frames {
+                        if *retirement.borrow() == SessionAdmissionState::Retired {
+                            break 'session;
                         }
-                        match handle_registration(&mut stream, registration, &context, &session_tx).await? {
-                            Some(registered) => {
-                                state = Some(registered);
-                                last_keepalive = Instant::now();
+                        let decode_protocol = state
+                            .as_ref()
+                            .map_or(ProtocolVersion::V3, |state| state.registration.protocol);
+                        let message_id = frame.message_id;
+                        let message = match ClientMessage::decode_with_version(frame, decode_protocol) {
+                            Ok(message) => message,
+                            Err(error) if message_id != crate::message::wire_id::REGISTER => {
+                                let device_id = state.as_ref().map(|state| state.device.id.clone());
+                                warn!(peer = %context.peer, message_id = format_args!("0x{message_id:04x}"), %error, "ignoring malformed SCCP application message");
+                                let _ = context.event_tx.send(Event::ProtocolWarning {
+                                    peer: context.peer,
+                                    device_id,
+                                    message_id,
+                                    error: error.to_string(),
+                                }).await;
+                                continue;
                             }
-                            None => return Ok(()),
+                            Err(error) => return Err(error.into()),
+                        };
+                        if let ClientMessage::Register(registration) = &message {
+                            if state.is_some() {
+                                return Err(ServerError::Protocol(CodecError::InvalidDefinition("duplicate REGISTER on one TCP session".into())));
+                            }
+                            match handle_registration(
+                                &mut stream,
+                                registration,
+                                &context,
+                                &session_tx,
+                                &admission,
+                            )
+                            .await?
+                            {
+                                Some(registered) => {
+                                    state = Some(registered.state);
+                                    last_station_activity = Instant::now();
+                                    let state = state
+                                        .as_ref()
+                                        .expect("registered session state was installed");
+                                    info!(device_id = %state.device.id, protocol = %state.registration.protocol, peer = %context.peer, "SCCP device registered");
+                                }
+                                None => break 'session,
+                            }
+                        } else if let Some(state) = state.as_mut() {
+                            last_station_activity = Instant::now();
+                            state.station_activity_generation = state
+                                .station_activity_generation
+                                .checked_add(1)
+                                .unwrap_or_default();
+                            if handle_registered_message(&mut stream, state, message, &context).await?
+                                == SessionDisposition::Terminate
+                            {
+                                break 'session;
+                            }
+                        } else if handle_pre_registration_message(&mut stream, message, &context).await?
+                            == SessionDisposition::Terminate
+                        {
+                            break 'session;
                         }
-                    } else if let Some(state) = state.as_mut() {
-                        if matches!(message, ClientMessage::KeepAlive) { last_keepalive = Instant::now(); }
-                        handle_client_message(&mut stream, state, message, &context).await?;
-                    } else {
-                        handle_pre_registration_message(&mut stream, message, &context).await?;
                     }
                 }
-            }
-            command = session_rx.recv() => {
-                let Some(command) = command else { break };
-                let Some(state) = state.as_mut() else { continue };
-                if handle_session_command_result(&mut stream, state, command, &context).await? {
+                command = session_rx.recv() => {
+                    let Some(command) = command else { break };
+                    if *retirement.borrow() == SessionAdmissionState::Retired {
+                        unhandled_command = Some(command);
+                        break;
+                    }
+                    let Some(state) = state.as_mut() else { continue };
+                    if handle_session_command_result(&mut stream, state, command, &context).await? {
+                        break;
+                    }
+                }
+                changed = retirement.changed(), if state.is_some() => {
+                    if changed.is_err() || *retirement.borrow() == SessionAdmissionState::Retired {
+                        break;
+                    }
+                }
+                _ = session_deadlines.tick(), if state.is_some() => {
+                    if *retirement.borrow() == SessionAdmissionState::Retired {
+                        break;
+                    }
+                    if let Some(state) = state.as_mut()
+                        && handle_session_deadlines(&mut stream, state, &context, Instant::now()).await?
+                            == SessionDisposition::Terminate
+                    {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(last_station_activity + keepalive_timeout), if state.is_some() => {
+                    warn!(peer = %context.peer, "SCCP station activity timeout");
                     break;
                 }
             }
-            _ = session_deadlines.tick(), if state.is_some() => {
-                if let Some(state) = state.as_mut() {
-                    handle_session_deadlines(&mut stream, state, &context, Instant::now()).await?;
-                }
-            }
-            _ = tokio::time::sleep_until(last_keepalive + keepalive_timeout), if state.is_some() => {
-                warn!(peer = %context.peer, "SCCP keepalive timeout");
-                break;
-            }
         }
+        Ok(())
     }
+    .await;
 
+    admission.retire();
+    if let Some(state) = state.as_ref() {
+        reject_pending_session_commands(&mut session_rx, unhandled_command, state, &context).await;
+    }
     if let Some(mut state) = state {
-        drain_session_media(&mut stream, &mut state).await;
-        let mut sessions = context.sessions.lock().await;
-        let was_current = sessions
-            .get(&state.device.id)
-            .is_some_and(|entry| entry.generation == state.generation);
-        if was_current {
-            sessions.remove(&state.device.id);
+        finalize_session(&mut stream, &mut state, &context).await;
+    }
+    result
+}
+
+async fn reject_pending_session_commands(
+    session_rx: &mut mpsc::Receiver<SessionCommand>,
+    first_command: Option<SessionCommand>,
+    state: &SessionState,
+    context: &SessionContext,
+) {
+    let current_generation = context
+        .sessions
+        .lock()
+        .await
+        .get(&state.device.id)
+        .map(|session| session.generation);
+    let offer_outcome = match current_generation {
+        Some(actual_generation) if actual_generation != state.generation => {
+            IncomingOfferDelivery::SessionStale { actual_generation }
         }
-        drop(sessions);
-        if was_current {
-            let _ = context
-                .event_tx
-                .send(Event::device(
-                    state.device.id,
-                    state.generation,
-                    DeviceEventKind::Disconnected {},
-                ))
-                .await;
+        _ => IncomingOfferDelivery::SessionMissing,
+    };
+    let reject = |command| match command {
+        SessionCommand::Confirmed { written, .. } => {
+            let _ = written.send(Err(ServerError::DeviceNotConnected(
+                state.device.id.clone(),
+            )
+            .to_string()));
+        }
+        SessionCommand::OfferIncoming {
+            delivery: Some(delivery),
+            ..
+        } => {
+            let _ = delivery.send(offer_outcome.clone());
+        }
+        SessionCommand::Public(_) | SessionCommand::OfferIncoming { delivery: None, .. } => {}
+    };
+    if let Some(command) = first_command {
+        reject(command);
+    }
+    while let Ok(command) = session_rx.try_recv() {
+        reject(command);
+    }
+}
+
+struct RegisteredSession {
+    state: SessionState,
+}
+
+async fn finalize_session(
+    stream: &mut dyn StationIo,
+    state: &mut SessionState,
+    context: &SessionContext,
+) {
+    if state.transport_writable {
+        match tokio::time::timeout(
+            SESSION_MEDIA_DRAIN_TIMEOUT,
+            drain_session_media(stream, state),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                state.transport_writable = false;
+                warn!(
+                    device_id = %state.device.id,
+                    session_generation = u64::from(state.generation),
+                    %error,
+                    "SCCP session media cleanup failed"
+                );
+            }
+            Err(_) => {
+                state.transport_writable = false;
+                warn!(
+                    device_id = %state.device.id,
+                    session_generation = u64::from(state.generation),
+                    "SCCP session media cleanup timed out"
+                );
+            }
         }
     }
-    Ok(())
+    let event_permit = context.event_tx.reserve().await.ok();
+    let _lifecycle = context.lifecycle.lock().await;
+    let mut sessions = context.sessions.lock().await;
+    let was_current = sessions
+        .get(&state.device.id)
+        .is_some_and(|entry| entry.generation == state.generation);
+    if was_current {
+        sessions.remove(&state.device.id);
+    }
+    drop(sessions);
+    if was_current && let Some(event_permit) = event_permit {
+        event_permit.send(Event::device(
+            state.device.id.clone(),
+            state.generation,
+            DeviceEventKind::Disconnected {},
+        ));
+    }
 }
 
 async fn handle_registration(
@@ -3085,8 +3346,8 @@ async fn handle_registration(
     registration: &crate::message::RegistrationMessage,
     context: &SessionContext,
     session_tx: &mpsc::Sender<SessionCommand>,
-) -> Result<Option<SessionState>, ServerError> {
-    let mut sessions = context.sessions.lock().await;
+    admission: &Arc<SessionAdmission>,
+) -> Result<Option<RegisteredSession>, ServerError> {
     let configured = context
         .definitions
         .read()
@@ -3103,7 +3364,6 @@ async fn handle_registration(
             .map(|hotline| hotline.device_definition(registration.device_id.clone()))
     });
     let Some(definition) = definition else {
-        drop(sessions);
         send_message(
             stream,
             &ServerMessage::RegisterReject {
@@ -3115,7 +3375,6 @@ async fn handle_registration(
         return Ok(None);
     };
     if !transport_allowed(definition.transport, context.transport) {
-        drop(sessions);
         send_message(
             stream,
             &ServerMessage::RegisterReject {
@@ -3132,7 +3391,6 @@ async fn handle_registration(
         .transpose()?
         .unwrap_or(ProtocolVersion::V3);
     if canonical_ip_address(context.peer.ip()).is_ipv6() && protocol < ProtocolVersion::V17 {
-        drop(sessions);
         send_message(
             stream,
             &ServerMessage::RegisterReject {
@@ -3165,18 +3423,6 @@ async fn handle_registration(
         protocol,
         firmware: registration.firmware.clone(),
     };
-    let previous = sessions.insert(
-        registration.device_id.clone(),
-        SessionSender {
-            generation,
-            anonymous_hotline,
-            tx: session_tx.clone(),
-        },
-    );
-    drop(sessions);
-    if let Some(previous) = previous {
-        let _ = previous.tx.send(SessionCommand::Disconnect).await;
-    }
     send_message(
         stream,
         &ServerMessage::RegisterAck {
@@ -3190,22 +3436,33 @@ async fn handle_registration(
     )
     .await?;
     send_message(stream, &ServerMessage::CapabilitiesRequest, protocol).await?;
-    context
+    let state = SessionState::new(definition, device_registration, features, generation);
+    let registered = context
         .event_tx
-        .send(Event::device(
-            registration.device_id.clone(),
-            generation,
-            DeviceEventKind::Registered(device_registration.clone()),
-        ))
+        .reserve()
         .await
         .map_err(|_| ServerError::Stopped)?;
-    info!(device_id = %registration.device_id, %protocol, peer = %context.peer, "SCCP device registered");
-    Ok(Some(SessionState::new(
-        definition,
-        device_registration,
-        features,
-        generation,
-    )))
+    let _lifecycle = context.lifecycle.lock().await;
+    let mut sessions = context.sessions.lock().await;
+    if let Some(previous) = sessions.get(&registration.device_id) {
+        previous.retire();
+    }
+    sessions.insert(
+        registration.device_id.clone(),
+        SessionSender {
+            generation,
+            anonymous_hotline,
+            tx: session_tx.clone(),
+            admission: Arc::clone(admission),
+        },
+    );
+    drop(sessions);
+    registered.send(Event::device(
+        state.device.id.clone(),
+        state.generation,
+        DeviceEventKind::Registered(state.registration.clone()),
+    ));
+    Ok(Some(RegisteredSession { state }))
 }
 
 async fn handle_session_command_result(
@@ -3214,7 +3471,12 @@ async fn handle_session_command_result(
     command: SessionCommand,
     context: &SessionContext,
 ) -> Result<bool, ServerError> {
-    let Some((mut command, written)) = prepare_session_command(command) else {
+    let Some(PreparedSessionCommand {
+        mut command,
+        written,
+        expires_at,
+    }) = prepare_session_command(command)
+    else {
         return Ok(false);
     };
     let offer_call_id = match &command {
@@ -3232,7 +3494,24 @@ async fn handle_session_command_result(
         debug!(device_id = %state.device.id, ?offer_call_id, "discarding incoming call cancelled before it was offered");
         return Ok(false);
     }
-    match handle_session_command(stream, state, command, context).await {
+    let result = match expires_at {
+        Some(expires_at) => {
+            match tokio::time::timeout_at(
+                expires_at,
+                handle_session_command(stream, state, command, context),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    state.transport_writable = false;
+                    Err(ServerError::CommandAcknowledgementTimeout)
+                }
+            }
+        }
+        None => handle_session_command(stream, state, command, context).await,
+    };
+    match result {
         Ok(disconnect) => {
             if let Some(delivery) = offer_delivery {
                 let _ = delivery.send(IncomingOfferDelivery::Presented);
@@ -3268,22 +3547,51 @@ async fn handle_session_deadlines(
     state: &mut SessionState,
     context: &SessionContext,
     now: Instant,
-) -> Result<(), ServerError> {
+) -> Result<SessionDisposition, ServerError> {
+    let mut disposition = SessionDisposition::Continue;
     for expired in expire_handset_acknowledgements(&mut state.calls_by_id, now) {
-        let event = match expired {
-            ExpiredHandsetAcknowledgement::Receive { call_id } => {
-                DeviceEventKind::HandsetAcknowledgementTimedOut {
-                    call_id,
-                    acknowledgement: HandsetAcknowledgement::OpenReceiveChannel,
+        let (event, rollback_result) = match expired {
+            ExpiredHandsetAcknowledgement::Receive {
+                call_id,
+                activity_generation,
+            } => {
+                let rollback = prepare_audio_receive_rollback(state, call_id);
+                let station_responded = state.station_activity_generation != activity_generation;
+                if receive_timeout_disposition(
+                    state.station_activity_generation,
+                    activity_generation,
+                ) == SessionDisposition::Terminate
+                {
+                    disposition = SessionDisposition::Terminate;
                 }
+                let rollback_result = match rollback {
+                    Some(rollback) => rollback_audio_receive(stream, state, rollback).await,
+                    None => Ok(()),
+                };
+                warn!(
+                    device_id = %state.device.id,
+                    session_generation = u64::from(state.generation),
+                    ?call_id,
+                    station_responded,
+                    session_retired = !station_responded,
+                    "SCCP receive-channel acknowledgement deadline expired"
+                );
+                (
+                    DeviceEventKind::HandsetAcknowledgementTimedOut {
+                        call_id,
+                        acknowledgement: HandsetAcknowledgement::OpenReceiveChannel,
+                    },
+                    rollback_result,
+                )
             }
-            ExpiredHandsetAcknowledgement::Transmit { call_id, endpoint } => {
+            ExpiredHandsetAcknowledgement::Transmit { call_id, endpoint } => (
                 DeviceEventKind::TransmitChannelOpen {
                     call_id,
                     outcome: TransmitOpenOutcome::NotReported,
                     endpoint,
-                }
-            }
+                },
+                Ok(()),
+            ),
         };
         context
             .event_tx
@@ -3294,6 +3602,7 @@ async fn handle_session_deadlines(
             ))
             .await
             .map_err(|_| ServerError::Stopped)?;
+        rollback_result?;
     }
     for (key, stop) in expire_multicast_reception_acknowledgements(state, now) {
         send_message(stream, &stop, state.registration.protocol).await?;
@@ -3363,7 +3672,18 @@ async fn handle_session_deadlines(
         }
     }
     prune_connection_statistics(&mut state.pending_connection_statistics, now);
-    Ok(())
+    Ok(disposition)
+}
+
+const fn receive_timeout_disposition(
+    current_activity_generation: u64,
+    request_activity_generation: u64,
+) -> SessionDisposition {
+    if current_activity_generation == request_activity_generation {
+        SessionDisposition::Terminate
+    } else {
+        SessionDisposition::Continue
+    }
 }
 
 fn expire_handset_acknowledgements(
@@ -3384,16 +3704,12 @@ fn expire_handset_acknowledgements(
                 .deadline
                 .is_some_and(|deadline| deadline <= now)
         {
-            call.media.receive.state = MediaChannelState::Closed;
             call.media.receive.deadline = None;
-            call.media.receive.peer = None;
-            if call.media.coupled_transmit_endpoint.take().is_some() {
-                call.media.transmit.state = MediaChannelState::Closed;
-                call.media.transmit.deadline = None;
-                call.media.transmit.peer = None;
-                call.media.transmit_confirmation = TransmitConfirmation::Inactive;
-            }
-            expired.push(ExpiredHandsetAcknowledgement::Receive { call_id });
+            expired.push(ExpiredHandsetAcknowledgement::Receive {
+                call_id,
+                activity_generation: call.media.receive.activity_generation,
+            });
+            continue;
         }
         if matches!(
             call.media.transmit_confirmation,
@@ -3412,6 +3728,7 @@ fn expire_handset_acknowledgements(
 enum ExpiredHandsetAcknowledgement {
     Receive {
         call_id: CallId,
+        activity_generation: u64,
     },
     Transmit {
         call_id: CallId,
@@ -3419,11 +3736,133 @@ enum ExpiredHandsetAcknowledgement {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AudioReceiveRollback {
+    call_id: CallId,
+    wire_reference: u32,
+    receive_request: Option<MediaRequestIdentity>,
+    transmit_request: Option<MediaRequestIdentity>,
+    coupled: bool,
+}
+
+fn prepare_audio_receive_rollback(
+    state: &SessionState,
+    call_id: CallId,
+) -> Option<AudioReceiveRollback> {
+    let call = state.calls_by_id.get(&call_id)?;
+    (call.media.receive.state == MediaChannelState::Opening).then_some(AudioReceiveRollback {
+        call_id,
+        wire_reference: call.wire_reference,
+        receive_request: call.media.receive.request,
+        transmit_request: call.media.transmit.request,
+        coupled: call.media.coupled_transmit_endpoint.is_some(),
+    })
+}
+
+async fn rollback_audio_receive(
+    stream: &mut dyn StationIo,
+    state: &mut SessionState,
+    rollback: AudioReceiveRollback,
+) -> Result<(), ServerError> {
+    match tokio::time::timeout(
+        MEDIA_ROLLBACK_TIMEOUT,
+        write_audio_receive_rollback(stream, state, rollback),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            state.transport_writable = false;
+            Err(error)
+        }
+        Err(_) => {
+            settle_audio_receive_rollback(state, rollback);
+            state.transport_writable = false;
+            warn!(
+                device_id = %state.device.id,
+                session_generation = u64::from(state.generation),
+                call_id = ?rollback.call_id,
+                "SCCP receive-channel rollback timed out"
+            );
+            Err(ServerError::MediaCleanupTimeout)
+        }
+    }
+}
+
+async fn write_audio_receive_rollback(
+    stream: &mut dyn StationIo,
+    state: &mut SessionState,
+    rollback: AudioReceiveRollback,
+) -> Result<(), ServerError> {
+    let protocol = state.registration.protocol;
+    let mut first_error = None;
+    if rollback.coupled
+        && let Err(error) = send_message(
+            stream,
+            &ServerMessage::StopMediaTransmission(AudioStreamControl {
+                conference_id: ConferenceId::new(rollback.wire_reference),
+                call_reference: CallReference::new(rollback.wire_reference),
+                passthrough_party_id: media_request_party_id(
+                    rollback.transmit_request,
+                    rollback.wire_reference,
+                )
+                .into(),
+                port_handling_flag: 0,
+            }),
+            protocol,
+        )
+        .await
+    {
+        first_error = Some(error);
+    }
+    let close_result = send_message(
+        stream,
+        &ServerMessage::CloseReceiveChannel(AudioStreamControl {
+            conference_id: ConferenceId::new(rollback.wire_reference),
+            call_reference: CallReference::new(rollback.wire_reference),
+            passthrough_party_id: media_request_party_id(
+                rollback.receive_request,
+                rollback.wire_reference,
+            )
+            .into(),
+            port_handling_flag: 0,
+        }),
+        protocol,
+    )
+    .await;
+    if first_error.is_none() {
+        first_error = close_result.err();
+    }
+    settle_audio_receive_rollback(state, rollback);
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn settle_audio_receive_rollback(state: &mut SessionState, rollback: AudioReceiveRollback) {
+    if let Some(call) = state.calls_by_id.get_mut(&rollback.call_id)
+        && call.media.receive.request == rollback.receive_request
+    {
+        call.media.receive.state = MediaChannelState::Closed;
+        call.media.receive.deadline = None;
+        call.media.receive.peer = None;
+        if rollback.coupled && call.media.transmit.request == rollback.transmit_request {
+            call.media.transmit.state = MediaChannelState::Closed;
+            call.media.transmit.deadline = None;
+            call.media.transmit.peer = None;
+            call.media.transmit_confirmation = TransmitConfirmation::Inactive;
+            call.media.coupled_transmit_endpoint = None;
+        }
+    }
+}
+
 async fn handle_pre_registration_message(
     stream: &mut dyn StationIo,
     message: ClientMessage,
     context: &SessionContext,
-) -> Result<(), ServerError> {
+) -> Result<SessionDisposition, ServerError> {
+    let mut disposition = SessionDisposition::Continue;
     match message {
         ClientMessage::KeepAlive => {
             send_message(stream, &ServerMessage::KeepAliveAck, ProtocolVersion::V3).await?;
@@ -3444,22 +3883,42 @@ async fn handle_pre_registration_message(
             let transport_permitted = definition.as_ref().is_none_or(|definition| {
                 transport_allowed(definition.transport, context.transport)
             });
-            let already_registered = context.sessions.lock().await.contains_key(&token.device_id);
-            let accept = configured
-                && transport_permitted
-                && !already_registered
-                && context.config.registration_tokens.accepts(&token.device_id);
-            let response = if accept {
-                ServerMessage::RegisterTokenAck
+            let token_permitted = context.config.registration_tokens.accepts(&token.device_id);
+            let incumbent = if configured && transport_permitted && token_permitted {
+                context.sessions.lock().await.get(&token.device_id).cloned()
             } else {
-                ServerMessage::RegisterTokenReject {
-                    backoff_seconds: u32::try_from(
-                        context.config.registration_tokens.backoff.as_secs(),
-                    )
-                    .unwrap_or(u32::MAX),
+                None
+            };
+            let (response, incumbent) = match incumbent {
+                Some(incumbent) => (
+                    ServerMessage::RegisterTokenReject {
+                        backoff_seconds: REPLACEMENT_REGISTRATION_BACKOFF_SECONDS,
+                    },
+                    Some(incumbent),
+                ),
+                None if configured && transport_permitted && token_permitted => {
+                    (ServerMessage::RegisterTokenAck, None)
                 }
+                None => (
+                    ServerMessage::RegisterTokenReject {
+                        backoff_seconds: u32::try_from(
+                            context.config.registration_tokens.backoff.as_secs(),
+                        )
+                        .unwrap_or(u32::MAX),
+                    },
+                    None,
+                ),
             };
             send_message(stream, &response, ProtocolVersion::V17).await?;
+            if let Some(incumbent) = incumbent {
+                let sessions = context.sessions.lock().await;
+                if let Some(current) = sessions.get(&token.device_id)
+                    && current.generation == incumbent.generation
+                {
+                    current.retire();
+                }
+                disposition = SessionDisposition::Terminate;
+            }
         }
         ClientMessage::Alarm {
             severity,
@@ -3571,7 +4030,22 @@ async fn handle_pre_registration_message(
             warn!(peer = %context.peer, message = ?message, "ignoring SCCP message before registration");
         }
     }
-    Ok(())
+    Ok(disposition)
+}
+
+async fn handle_registered_message(
+    stream: &mut dyn StationIo,
+    state: &mut SessionState,
+    message: ClientMessage,
+    context: &SessionContext,
+) -> Result<SessionDisposition, ServerError> {
+    let disposition = if matches!(message, ClientMessage::Unregister { .. }) {
+        SessionDisposition::Terminate
+    } else {
+        SessionDisposition::Continue
+    };
+    handle_client_message(stream, state, message, context).await?;
+    Ok(disposition)
 }
 
 async fn handle_client_message(
@@ -4587,35 +5061,31 @@ async fn handle_client_message(
                     max_frames_per_packet: call.media.max_frames_per_packet,
                     telephone_event_payload: call.media.receive.telephone_event_payload,
                 };
-                let stored = state
-                    .calls_by_id
-                    .get_mut(&call_id)
-                    .expect("media call identifier came from session state");
-                let implied_transmit = if status == MediaStatus::Ok {
+                let (implied_transmit, rollback_result) = if status == MediaStatus::Ok {
+                    let stored = state
+                        .calls_by_id
+                        .get_mut(&call_id)
+                        .expect("media call identifier came from session state");
                     stored.media.receive.state = MediaChannelState::Open;
                     stored.media.receive.peer = Some(endpoint);
+                    stored.media.receive.deadline = None;
                     if let Some(endpoint) = stored.media.coupled_transmit_endpoint.take() {
                         stored.media.transmit.state = MediaChannelState::Open;
                         stored.media.transmit.peer = Some(endpoint);
                         stored.media.transmit.deadline = None;
                         stored.media.transmit_confirmation =
                             TransmitConfirmation::Settled(TransmitOpenOutcome::Implied);
-                        Some(endpoint)
+                        (Some(endpoint), Ok(()))
                     } else {
-                        None
+                        (None, Ok(()))
                     }
                 } else {
-                    stored.media.receive.state = MediaChannelState::Closed;
-                    stored.media.receive.peer = None;
-                    if stored.media.coupled_transmit_endpoint.take().is_some() {
-                        stored.media.transmit.state = MediaChannelState::Closed;
-                        stored.media.transmit.peer = None;
-                        stored.media.transmit.deadline = None;
-                        stored.media.transmit_confirmation = TransmitConfirmation::Inactive;
-                    }
-                    None
+                    let rollback_result = match prepare_audio_receive_rollback(state, call_id) {
+                        Some(rollback) => rollback_audio_receive(stream, state, rollback).await,
+                        None => Ok(()),
+                    };
+                    (None, rollback_result)
                 };
-                stored.media.receive.deadline = None;
                 context
                     .event_tx
                     .send(Event::device(
@@ -4629,6 +5099,7 @@ async fn handle_client_message(
                     ))
                     .await
                     .map_err(|_| ServerError::Stopped)?;
+                rollback_result?;
                 if let Some(endpoint) = implied_transmit {
                     context
                         .event_tx
@@ -4689,13 +5160,23 @@ async fn handle_client_message(
                     max_frames_per_packet: call.media.max_frames_per_packet,
                     telephone_event_payload: call.media.transmit.telephone_event_payload,
                 };
+                let coupled = call.media.coupled_transmit_endpoint.is_some();
+                let rollback = if ack.status != MediaStatus::Ok && coupled {
+                    prepare_audio_receive_rollback(state, call_id)
+                } else {
+                    None
+                };
+                let rollback_result = match rollback {
+                    Some(rollback) => rollback_audio_receive(stream, state, rollback).await,
+                    None => Ok(()),
+                };
                 let stored = state
                     .calls_by_id
                     .get_mut(&call_id)
                     .expect("media call identifier came from session state");
-                let coupled = stored.media.coupled_transmit_endpoint.take().is_some();
                 let outcome = match ack.status {
                     MediaStatus::Ok => {
+                        stored.media.coupled_transmit_endpoint = None;
                         stored.media.transmit.state = MediaChannelState::Open;
                         stored.media.transmit.peer = Some(endpoint);
                         TransmitOpenOutcome::Acknowledged
@@ -4703,10 +5184,11 @@ async fn handle_client_message(
                     status => {
                         stored.media.transmit.state = MediaChannelState::Closed;
                         stored.media.transmit.peer = None;
-                        if coupled {
+                        if coupled && rollback.is_none() {
                             stored.media.receive.state = MediaChannelState::Closed;
                             stored.media.receive.deadline = None;
                             stored.media.receive.peer = None;
+                            stored.media.coupled_transmit_endpoint = None;
                         }
                         TransmitOpenOutcome::Rejected(status)
                     }
@@ -4728,6 +5210,7 @@ async fn handle_client_message(
                         .await
                         .map_err(|_| ServerError::Stopped)?;
                 }
+                rollback_result?;
             }
         }
         ClientMessage::Alarm {
@@ -6302,10 +6785,6 @@ async fn handle_session_command(
         SessionCommand::Confirmed { .. } => {
             unreachable!("confirmed commands are unwrapped by the session loop")
         }
-        SessionCommand::Disconnect => {
-            drain_session_media(stream, state).await;
-            return Ok(true);
-        }
         SessionCommand::OfferIncoming {
             line_instance,
             call_id,
@@ -6431,7 +6910,6 @@ async fn handle_session_command(
             let action = command.action;
             match action {
                 CommandAction::DisconnectDevice { .. } => {
-                    drain_session_media(stream, state).await;
                     return Ok(true);
                 }
                 CommandAction::BeginCall {
@@ -7396,6 +7874,7 @@ async fn handle_session_command(
                         }
                     }
                     let telephone_event_payload = dtmf_mode.telephone_event_payload(state.features);
+                    let activity_generation = state.station_activity_generation;
                     let request = allocate_media_request_identity(state, call_id)?;
                     let call = require_call_mut(state, call_id)?;
                     call.media.requested = true;
@@ -7405,9 +7884,9 @@ async fn handle_session_command(
                     call.media.receive.telephone_event_payload = telephone_event_payload;
                     call.media.receive.peer = None;
                     call.media.receive.state = MediaChannelState::Opening;
-                    call.media.receive.deadline =
-                        Some(Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT);
+                    call.media.receive.deadline = None;
                     call.media.receive.request = Some(request);
+                    call.media.receive.activity_generation = activity_generation;
                     if call.media.transmit.state == MediaChannelState::Closed {
                         call.media.transmit.request = None;
                     }
@@ -7444,6 +7923,8 @@ async fn handle_session_command(
                         protocol,
                     )
                     .await?;
+                    require_call_mut(state, call_id)?.media.receive.deadline =
+                        Some(Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT);
                 }
                 CommandAction::OpenMultimediaReceiveChannel {
                     call_id,
@@ -7631,6 +8112,7 @@ async fn handle_session_command(
                         .map(|source| source.address)
                         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                     let source_port = source.map_or(0, |source| source.rtp_port);
+                    let activity_generation = state.station_activity_generation;
                     let request = allocate_media_request_identity(state, call_id)?;
                     let call = require_call_mut(state, call_id)?;
                     call.media.requested = true;
@@ -7640,18 +8122,16 @@ async fn handle_session_command(
                     call.media.receive.telephone_event_payload = telephone_event_payload;
                     call.media.receive.peer = None;
                     call.media.receive.state = MediaChannelState::Opening;
-                    call.media.receive.deadline =
-                        Some(Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT);
+                    call.media.receive.deadline = None;
                     call.media.receive.request = Some(request);
+                    call.media.receive.activity_generation = activity_generation;
                     endpoint.telephone_event_payload = telephone_event_payload;
                     call.media.transmit.telephone_event_payload = telephone_event_payload;
                     call.media.transmit.peer = Some(endpoint);
                     call.media.transmit.state = MediaChannelState::Open;
                     call.media.transmit.deadline = None;
                     call.media.transmit.request = Some(request);
-                    call.media.transmit_confirmation = TransmitConfirmation::Awaiting {
-                        deadline: Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT,
-                    };
+                    call.media.transmit_confirmation = TransmitConfirmation::Inactive;
                     call.media.coupled_transmit_endpoint = Some(endpoint);
                     let call = call.clone();
                     send_message(
@@ -7685,6 +8165,10 @@ async fn handle_session_command(
                         protocol,
                     )
                     .await?;
+                    let deadline = Instant::now() + HANDSET_ACKNOWLEDGEMENT_TIMEOUT;
+                    let call = require_call_mut(state, call_id)?;
+                    call.media.receive.deadline = Some(deadline);
+                    call.media.transmit_confirmation = TransmitConfirmation::Awaiting { deadline };
                 }
                 CommandAction::CloseReceiveChannel { call_id, .. } => {
                     let call = require_call_mut(state, call_id)?;
@@ -7765,7 +8249,7 @@ async fn handle_session_command(
                     echo_cancellation,
                     g723_bitrate,
                 } => {
-                    validate_multicast_route(state, route, None)?;
+                    validate_multicast_route(state, route)?;
                     let wire_call_reference = require_call(state, call_id)?.wire_reference;
                     let request = allocate_multicast_request_identity(state)?;
                     let key = MulticastKey {
@@ -7828,7 +8312,7 @@ async fn handle_session_command(
                     max_frames_per_packet,
                     g723_bitrate,
                 } => {
-                    validate_multicast_route(state, route, Some(max_frames_per_packet))?;
+                    validate_multicast_route(state, route)?;
                     let wire_call_reference = require_call(state, call_id)?.wire_reference;
                     let request = allocate_multicast_request_identity(state)?;
                     let key = MulticastKey {
@@ -9402,7 +9886,6 @@ fn expire_multimedia_transmit_acknowledgements(
 fn validate_multicast_route(
     state: &SessionState,
     route: MulticastMediaRoute,
-    max_frames_per_packet: Option<u32>,
 ) -> Result<(), ServerError> {
     if !route.address.is_multicast() {
         return Err(ServerError::InvalidMulticastMedia(
@@ -9430,11 +9913,9 @@ fn validate_multicast_route(
         .audio()
         .iter()
         .find(|capability| capability.codec == route.codec)
-        .filter(|capability| capability.max_frames_per_packet != 0)
+        .filter(|capability| capability.max_packet_ms != 0)
         .ok_or(ServerError::UnsupportedMulticastCodec)?;
-    if let Some(requested) = max_frames_per_packet
-        && (requested == 0 || requested > capability.max_frames_per_packet)
-    {
+    if route.packet_millis > capability.max_packet_ms {
         return Err(ServerError::InvalidMulticastMedia(
             "packet framing exceeds the advertised capability",
         ));
@@ -9565,16 +10046,72 @@ fn take_all_multicast_stops(state: &mut SessionState) -> Vec<ServerMessage> {
         .collect()
 }
 
-async fn drain_session_media(stream: &mut dyn StationIo, state: &mut SessionState) {
+fn take_all_audio_stops(state: &mut SessionState) -> Vec<ServerMessage> {
+    let mut call_ids = state.calls_by_id.keys().copied().collect::<Vec<_>>();
+    call_ids.sort_unstable_by_key(|call_id| call_id.get());
+    let mut messages = Vec::new();
+    for call_id in call_ids {
+        let call = state
+            .calls_by_id
+            .get_mut(&call_id)
+            .expect("call identifier came from session state");
+        if call.media.transmit.state != MediaChannelState::Closed {
+            messages.push(ServerMessage::StopMediaTransmission(AudioStreamControl {
+                conference_id: ConferenceId::new(call.wire_reference),
+                call_reference: CallReference::new(call.wire_reference),
+                passthrough_party_id: media_request_party_id(
+                    call.media.transmit.request,
+                    call.wire_reference,
+                )
+                .into(),
+                port_handling_flag: 0,
+            }));
+        }
+        if call.media.receive.state != MediaChannelState::Closed {
+            messages.push(ServerMessage::CloseReceiveChannel(AudioStreamControl {
+                conference_id: ConferenceId::new(call.wire_reference),
+                call_reference: CallReference::new(call.wire_reference),
+                passthrough_party_id: media_request_party_id(
+                    call.media.receive.request,
+                    call.wire_reference,
+                )
+                .into(),
+                port_handling_flag: 0,
+            }));
+        }
+        call.media.receive.state = MediaChannelState::Closed;
+        call.media.receive.deadline = None;
+        call.media.receive.peer = None;
+        call.media.transmit.state = MediaChannelState::Closed;
+        call.media.transmit.deadline = None;
+        call.media.transmit.peer = None;
+        call.media.transmit_confirmation = TransmitConfirmation::Inactive;
+        call.media.coupled_transmit_endpoint = None;
+    }
+    messages
+}
+
+async fn drain_session_media(
+    stream: &mut dyn StationIo,
+    state: &mut SessionState,
+) -> Result<(), ServerError> {
     let protocol = state.registration.protocol;
-    let messages = take_all_multimedia_receive_closes(state)
+    let messages = take_all_audio_stops(state)
         .into_iter()
+        .chain(take_all_multimedia_receive_closes(state))
         .chain(take_all_multimedia_transmit_stops(state))
         .chain(take_all_multicast_stops(state));
+    let mut first_error = None;
     for message in messages {
-        if send_message(stream, &message, protocol).await.is_err() {
-            break;
+        if let Err(error) = send_message(stream, &message, protocol).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 

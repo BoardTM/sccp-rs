@@ -2127,7 +2127,7 @@ async fn video_transmit_deadline_stops_and_retires_the_exact_generation() {
 fn multicast_admission_requires_a_routable_supported_audio_shape() {
     let state = multicast_test_state(ProtocolVersion::V22);
     let valid = multicast_route("239.1.2.3".parse().unwrap(), Codec::Pcmu);
-    assert!(validate_multicast_route(&state, valid, Some(2)).is_ok());
+    assert!(validate_multicast_route(&state, valid).is_ok());
 
     for route in [
         MulticastMediaRoute {
@@ -2141,7 +2141,7 @@ fn multicast_admission_requires_a_routable_supported_audio_shape() {
         },
     ] {
         assert!(matches!(
-            validate_multicast_route(&state, route, None),
+            validate_multicast_route(&state, route),
             Err(ServerError::InvalidMulticastMedia(_))
         ));
     }
@@ -2149,7 +2149,6 @@ fn multicast_admission_requires_a_routable_supported_audio_shape() {
         validate_multicast_route(
             &state,
             multicast_route("239.1.2.3".parse().unwrap(), Codec::H264),
-            None,
         ),
         Err(ServerError::UnsupportedMulticastCodec)
     ));
@@ -2157,23 +2156,25 @@ fn multicast_admission_requires_a_routable_supported_audio_shape() {
         validate_multicast_route(
             &state,
             multicast_route("239.1.2.3".parse().unwrap(), Codec::Pcma),
-            None,
         ),
         Err(ServerError::UnsupportedMulticastCodec)
     ));
-    for requested_frames in [0, 3] {
-        assert!(matches!(
-            validate_multicast_route(&state, valid, Some(requested_frames)),
-            Err(ServerError::InvalidMulticastMedia(_))
-        ));
-    }
+    assert!(matches!(
+        validate_multicast_route(
+            &state,
+            MulticastMediaRoute {
+                packet_millis: 60,
+                ..valid
+            },
+        ),
+        Err(ServerError::InvalidMulticastMedia(_))
+    ));
 
     let legacy = multicast_test_state(ProtocolVersion::V16);
     assert!(matches!(
         validate_multicast_route(
             &legacy,
             multicast_route("ff15::1".parse().unwrap(), Codec::Pcmu),
-            None,
         ),
         Err(ServerError::InvalidMulticastMedia(_))
     ));
@@ -2181,7 +2182,6 @@ fn multicast_admission_requires_a_routable_supported_audio_shape() {
         validate_multicast_route(
             &state,
             multicast_route("ff15::1".parse().unwrap(), Codec::Pcmu),
-            None,
         )
         .is_ok()
     );
@@ -2342,7 +2342,7 @@ async fn multicast_session_enforces_transaction_identity_order_and_teardown() {
         .write_all(
             &ClientMessage::CapabilitiesResponse(vec![MediaCapability {
                 codec: Codec::Pcmu,
-                max_frames_per_packet: 2,
+                max_packet_ms: 40,
                 codec_parameters: [0; 8],
             }])
             .encode(protocol)
@@ -2911,7 +2911,7 @@ async fn multicast_receive_deadline_stops_and_retires_the_pending_generation() {
         .write_all(
             &ClientMessage::CapabilitiesResponse(vec![MediaCapability {
                 codec: Codec::Pcmu,
-                max_frames_per_packet: 1,
+                max_packet_ms: 20,
                 codec_parameters: [0; 8],
             }])
             .encode(protocol)
@@ -3531,6 +3531,31 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
         )
         .await
         .unwrap();
+    let rollback = read_until_server_message(&mut phone, &mut decoder, protocol, |message| {
+        matches!(message, ServerMessage::CloseReceiveChannel(_))
+    })
+    .await;
+    let stop = rollback
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                ServerMessage::StopMediaTransmission(control)
+                    if control.passthrough_party_id.get() == third_request_party
+            )
+        })
+        .unwrap();
+    let close = rollback
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                ServerMessage::CloseReceiveChannel(control)
+                    if control.passthrough_party_id.get() == third_request_party
+            )
+        })
+        .unwrap();
+    assert!(stop < close);
     assert!(matches!(
         events.recv().await,
         Some(Event::Device(DeviceEvent {
@@ -3641,6 +3666,234 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
             .is_err(),
         "late receive acknowledgement resurrected a failed coupled transaction"
     );
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn receive_acknowledgement_timeout_retires_only_a_silent_session() {
+    let device = definition();
+    let device_id = device.id.clone();
+    let config = ServerConfig {
+        advertised_address: Ipv4Addr::LOCALHOST,
+        ..ServerConfig::default()
+    };
+    let (server, handle, mut events, ingress) = Server::with_ingress(config, [device]).unwrap();
+    let task = tokio::spawn(server.run());
+    let (server_stream, mut phone) = tokio::io::duplex(8_192);
+    ingress
+        .accept(
+            server_stream,
+            SocketAddr::from(([127, 0, 0, 1], 40_090)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    let protocol = ProtocolVersion::V22;
+    let call_id = CallId::new(90);
+    let mut decoder = FrameDecoder::new();
+    phone.write_all(&register_bytes(protocol)).await.unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+    let generation = match events.recv().await {
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::Registered(_),
+            ..
+        })) => session_generation,
+        event => panic!("expected registration, got {event:?}"),
+    };
+    handle
+        .send_confirmed(Command::new(
+            device_id.clone(),
+            CommandAction::BeginCall {
+                line_instance: LineInstance::new(1),
+                call_id,
+                codec: Codec::Pcmu,
+            },
+        ))
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
+    handle
+        .send_confirmed(Command::new(
+            device_id.clone(),
+            CommandAction::SetCallState {
+                call_id,
+                state: CallState::Proceed,
+            },
+        ))
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
+    let endpoint = MediaEndpoint {
+        address: "198.51.100.90".parse().unwrap(),
+        rtp_port: 6090,
+        rtcp_port: 6091,
+        codec: Codec::Pcmu,
+        packet_ms: 20,
+        max_frames_per_packet: 1,
+        telephone_event_payload: 0,
+    };
+    handle
+        .send_confirmed(Command::new(
+            device_id.clone(),
+            CommandAction::OpenOutboundMedia {
+                call_id,
+                source: None,
+                endpoint,
+                codec: Codec::Pcmu,
+                packet_ms: 20,
+                max_frames_per_packet: 1,
+                dtmf_mode: DtmfMode::Skinny,
+                audio_processing: AudioProcessingPolicy::default(),
+                traffic_class: MediaTrafficClass::default(),
+            },
+        ))
+        .await
+        .unwrap();
+    let open = read_until_server_message(&mut phone, &mut decoder, protocol, |message| {
+        matches!(message, ServerMessage::StartMediaTransmission { .. })
+    })
+    .await;
+    let request = open
+        .iter()
+        .find_map(|message| match message {
+            ServerMessage::OpenReceiveChannel {
+                passthrough_party_id,
+                ..
+            } => Some(*passthrough_party_id),
+            _ => None,
+        })
+        .unwrap();
+
+    phone
+        .write_all(&ClientMessage::TimeDateRequest.encode(protocol).unwrap())
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::DEFINE_TIME_DATE).await;
+    tokio::time::advance(HANDSET_ACKNOWLEDGEMENT_TIMEOUT + Duration::from_millis(100)).await;
+    let rollback = read_until_server_message(&mut phone, &mut decoder, protocol, |message| {
+        matches!(message, ServerMessage::CloseReceiveChannel(_))
+    })
+    .await;
+    let stop = rollback
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                ServerMessage::StopMediaTransmission(control)
+                    if control.passthrough_party_id.get() == request
+            )
+        })
+        .unwrap();
+    let close = rollback
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                ServerMessage::CloseReceiveChannel(control)
+                    if control.passthrough_party_id.get() == request
+            )
+        })
+        .unwrap();
+    assert!(stop < close);
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::HandsetAcknowledgementTimedOut {
+                call_id: actual_call_id,
+                acknowledgement: HandsetAcknowledgement::OpenReceiveChannel,
+            },
+            ..
+        })) if session_generation == generation && actual_call_id == call_id
+    ));
+    phone
+        .write_all(&ClientMessage::KeepAlive.encode(protocol).unwrap())
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::KEEP_ALIVE_ACK).await;
+    assert!(events.try_recv().is_err());
+
+    handle
+        .send_confirmed(Command::new(
+            device_id,
+            CommandAction::OpenOutboundMedia {
+                call_id,
+                source: None,
+                endpoint,
+                codec: Codec::Pcmu,
+                packet_ms: 20,
+                max_frames_per_packet: 1,
+                dtmf_mode: DtmfMode::Skinny,
+                audio_processing: AudioProcessingPolicy::default(),
+                traffic_class: MediaTrafficClass::default(),
+            },
+        ))
+        .await
+        .unwrap();
+    let open = read_until_server_message(&mut phone, &mut decoder, protocol, |message| {
+        matches!(message, ServerMessage::StartMediaTransmission { .. })
+    })
+    .await;
+    let request = open
+        .iter()
+        .find_map(|message| match message {
+            ServerMessage::OpenReceiveChannel {
+                passthrough_party_id,
+                ..
+            } => Some(*passthrough_party_id),
+            _ => None,
+        })
+        .unwrap();
+
+    tokio::time::advance(HANDSET_ACKNOWLEDGEMENT_TIMEOUT + Duration::from_millis(100)).await;
+    let rollback = read_until_server_message(&mut phone, &mut decoder, protocol, |message| {
+        matches!(message, ServerMessage::CloseReceiveChannel(_))
+    })
+    .await;
+    let stop = rollback
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                ServerMessage::StopMediaTransmission(control)
+                    if control.passthrough_party_id.get() == request
+            )
+        })
+        .unwrap();
+    let close = rollback
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                ServerMessage::CloseReceiveChannel(control)
+                    if control.passthrough_party_id.get() == request
+            )
+        })
+        .unwrap();
+    assert!(stop < close);
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::HandsetAcknowledgementTimedOut {
+                call_id: actual_call_id,
+                acknowledgement: HandsetAcknowledgement::OpenReceiveChannel,
+            },
+            ..
+        })) if session_generation == generation && actual_call_id == call_id
+    ));
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::Disconnected {},
+            ..
+        })) if session_generation == generation
+    ));
 
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
@@ -4369,6 +4622,7 @@ fn handset_acknowledgement_deadlines_are_bounded_ordered_and_exactly_once() {
             },
             ExpiredHandsetAcknowledgement::Receive {
                 call_id: CallId(20),
+                activity_generation: 0,
             },
         ]
     );
@@ -4378,16 +4632,29 @@ fn handset_acknowledgement_deadlines_are_bounded_ordered_and_exactly_once() {
     );
     assert_eq!(
         calls[&CallId(20)].media.receive.state,
-        MediaChannelState::Closed
+        MediaChannelState::Opening
     );
     assert_eq!(
         calls[&CallId(20)].media.transmit.state,
-        MediaChannelState::Closed
+        MediaChannelState::Open
     );
-    assert!(calls[&CallId(20)].media.coupled_transmit_endpoint.is_none());
+    assert!(calls[&CallId(20)].media.receive.deadline.is_none());
+    assert!(calls[&CallId(20)].media.coupled_transmit_endpoint.is_some());
     assert!(expire_handset_acknowledgements(&mut calls, now).is_empty());
     assert!(expire_handset_acknowledgements(&mut calls, now + Duration::from_millis(1)).is_empty());
     assert!(expire_handset_acknowledgements(&mut calls, now + Duration::from_secs(1)).is_empty());
+}
+
+#[test]
+fn receive_timeout_retires_only_a_silent_station_session() {
+    assert_eq!(
+        receive_timeout_disposition(7, 7),
+        SessionDisposition::Terminate
+    );
+    assert_eq!(
+        receive_timeout_disposition(8, 7),
+        SessionDisposition::Continue
+    );
 }
 
 #[test]
@@ -4536,7 +4803,7 @@ async fn capability_snapshots_replace_atomically_and_remain_session_scoped() {
         .write_all(
             &ClientMessage::CapabilitiesResponse(vec![MediaCapability {
                 codec: Codec::Pcma,
-                max_frames_per_packet: 2,
+                max_packet_ms: 40,
                 codec_parameters: [0; 8],
             }])
             .encode(protocol)

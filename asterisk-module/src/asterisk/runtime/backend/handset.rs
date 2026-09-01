@@ -372,14 +372,14 @@ pub async fn execute_handset_effect(access: &Access, effect: HandsetEffect) -> R
             call_id,
             mut endpoint,
         } => {
-            let (packet_ms, max_frames_per_packet) =
-                audio_framing(access, &device_id, call_id, endpoint.codec);
+            let framing = audio_framing(access, &device_id, call_id, endpoint.codec)
+                .map_err(|error| error.to_string())?;
             let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
             let audio_processing = configured_audio_processing(access, &device_id, call_id);
             let traffic_class = configured_audio_traffic_class(access, &device_id)
                 .ok_or_else(|| format!("invalid audio traffic class for {device_id}"))?;
-            endpoint.packet_ms = packet_ms;
-            endpoint.max_frames_per_packet = max_frames_per_packet;
+            endpoint.packet_ms = framing.packet_ms;
+            endpoint.max_frames_per_packet = framing.max_frames_per_packet;
             access
                 .phone
                 .send_confirmed(PhoneCommand::new(
@@ -426,8 +426,8 @@ pub async fn execute_handset_effect(access: &Access, effect: HandsetEffect) -> R
                 .await
                 .map_err(|error| error.to_string())?;
             if answer {
-                let (packet_ms, max_frames_per_packet) =
-                    audio_framing(access, &device_id, call_id, codec);
+                let framing = audio_framing(access, &device_id, call_id, codec)
+                    .map_err(|error| error.to_string())?;
                 // The RTP instance remains anchored on the Asterisk channel.
                 // Do not constrain the handset's receive channel to the
                 // advertised server endpoint: SCCP's wildcard source is
@@ -459,8 +459,8 @@ pub async fn execute_handset_effect(access: &Access, effect: HandsetEffect) -> R
                             purpose: ReceiveChannelPurpose::Media,
                             source: None,
                             codec,
-                            packet_ms,
-                            max_frames_per_packet,
+                            packet_ms: framing.packet_ms,
+                            max_frames_per_packet: framing.max_frames_per_packet,
                             dtmf_mode,
                             audio_processing,
                         },

@@ -228,7 +228,7 @@ impl Default for RegistrationWireLayout {
 /// One audio codec capability advertised by a station.
 pub struct MediaCapability {
     pub codec: Codec,
-    pub max_frames_per_packet: u32,
+    pub max_packet_ms: u32,
     /// Fixed codec-specific parameter area retained byte-for-byte.
     pub codec_parameters: [u8; 8],
 }

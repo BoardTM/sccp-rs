@@ -190,8 +190,7 @@ impl Controller {
             effects.push(PbxEffect::Answer { call_id: pbx_id }.into());
         }
         if presentation.state == CallState::Connected
-            && (presentation.info.direction == CallDirection::Inbound
-                || (presentation.info.direction == CallDirection::Outbound && outbound_hole_punch))
+            && presentation.info.direction == CallDirection::Inbound
         {
             effects.push(appearance_state_effect(
                 &presentation,

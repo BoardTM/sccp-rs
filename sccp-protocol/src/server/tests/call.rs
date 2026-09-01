@@ -2161,6 +2161,7 @@ async fn exact_session_offer_receipts_distinguish_stale_and_missing_sessions() {
             generation: SessionGeneration::new(2).unwrap(),
             anonymous_hotline: false,
             tx: session_tx,
+            admission: Arc::new(SessionAdmission::new()),
         },
     );
     let task = tokio::spawn(server.run());
@@ -2206,6 +2207,164 @@ async fn exact_session_offer_receipts_distinguish_stale_and_missing_sessions() {
     assert_eq!(
         missing.wait().await.unwrap(),
         IncomingOfferDelivery::SessionMissing
+    );
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn retirement_rejects_a_command_that_reserved_queue_capacity_first() {
+    let device_id = definition().id;
+    let (tx, mut rx) = mpsc::channel(1);
+    let session = SessionSender {
+        generation: SessionGeneration::new(1).unwrap(),
+        anonymous_hotline: false,
+        tx,
+        admission: Arc::new(SessionAdmission::new()),
+    };
+    let tx = session.tx.clone();
+    let permit = tx.reserve().await.unwrap();
+    session.retire();
+    assert!(
+        session
+            .admission
+            .commit(
+                permit,
+                SessionCommand::Public(Box::new(Command::new(
+                    device_id,
+                    CommandAction::SetMicrophoneMode { enabled: true },
+                )))
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn replacement_resolves_an_admitted_exact_offer_as_stale() {
+    let config = ServerConfig {
+        advertised_address: Ipv4Addr::LOCALHOST,
+        ..ServerConfig::default()
+    };
+    let (server, handle, mut events, ingress) =
+        Server::with_ingress(config, [definition()]).unwrap();
+    let task = tokio::spawn(server.run());
+    let (inner, mut phone) = tokio::io::duplex(8_192);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waker = Arc::new(std::sync::Mutex::new(None));
+    ingress
+        .accept(
+            FinalPromptGate {
+                inner,
+                armed: Arc::clone(&armed),
+                blocked: Arc::clone(&blocked),
+                released: Arc::clone(&released),
+                fail,
+                waker: Arc::clone(&waker),
+            },
+            SocketAddr::from(([127, 0, 0, 1], 40_082)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    let protocol = ProtocolVersion::V22;
+    let device_id = definition().id;
+    let mut decoder = FrameDecoder::new();
+    phone.write_all(&register_bytes(protocol)).await.unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+    let generation = match events.recv().await {
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::Registered(_),
+            ..
+        })) => session_generation,
+        event => panic!("expected registration, got {event:?}"),
+    };
+    let info = CallInfo {
+        direction: crate::types::CallDirection::Inbound,
+        ..CallInfo::default()
+    };
+
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let presenting = handle
+        .try_offer_incoming_call_for_session(
+            StationSessionTarget::new(device_id.clone(), generation),
+            LineInstance::new(1),
+            CallId(60),
+            info.clone(),
+            IncomingPresentation::RingIn,
+            Some(IncomingRing::default()),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !blocked.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let queued = handle
+        .try_offer_incoming_call_for_session(
+            StationSessionTarget::new(device_id, generation),
+            LineInstance::new(1),
+            CallId(61),
+            info,
+            IncomingPresentation::CallWaiting,
+            Some(IncomingRing::default()),
+        )
+        .unwrap();
+
+    let (replacement_stream, mut replacement) = tokio::io::duplex(8_192);
+    ingress
+        .accept(
+            replacement_stream,
+            SocketAddr::from(([127, 0, 0, 1], 40_083)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    let mut replacement_decoder = FrameDecoder::new();
+    replacement
+        .write_all(&register_bytes(protocol))
+        .await
+        .unwrap();
+    read_until_message(
+        &mut replacement,
+        &mut replacement_decoder,
+        wire_id::CAPABILITIES_REQ,
+    )
+    .await;
+    let replacement_generation = match events.recv().await {
+        Some(Event::Device(DeviceEvent {
+            session_generation,
+            event: DeviceEventKind::Registered(_),
+            ..
+        })) => session_generation,
+        event => panic!("expected replacement registration, got {event:?}"),
+    };
+
+    released.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(waker) = waker.lock().unwrap().take() {
+        waker.wake();
+    }
+    assert_eq!(
+        presenting.wait().await.unwrap(),
+        IncomingOfferDelivery::Presented
+    );
+    assert_eq!(
+        queued.wait().await.unwrap(),
+        IncomingOfferDelivery::SessionStale {
+            actual_generation: replacement_generation,
+        }
     );
 
     handle.shutdown().await.unwrap();
@@ -2326,7 +2485,7 @@ async fn incoming_offer_receipt_waits_for_final_prompt_and_reports_tombstones() 
     fail.store(true, std::sync::atomic::Ordering::SeqCst);
     let failed = handle
         .try_offer_incoming_call_for_session(
-            StationSessionTarget::new(device_id, generation),
+            StationSessionTarget::new(device_id.clone(), generation),
             LineInstance::new(1),
             CallId(52),
             CallInfo {
@@ -2341,6 +2500,18 @@ async fn incoming_offer_receipt_waits_for_final_prompt_and_reports_tombstones() 
         failed.wait().await.unwrap(),
         IncomingOfferDelivery::WriteFailed
     );
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            device_id: actual_device_id,
+            session_generation,
+            event: DeviceEventKind::Disconnected {},
+        })) if actual_device_id == device_id && session_generation == generation
+    ));
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::SessionError { .. })
+    ));
 
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
@@ -2510,6 +2681,7 @@ async fn expired_confirmed_commands_are_retired_at_both_queue_boundaries() {
             generation: SessionGeneration::new(1).unwrap(),
             anonymous_hotline: false,
             tx: session_tx,
+            admission: Arc::new(SessionAdmission::new()),
         },
     );
 

@@ -136,13 +136,14 @@ pub use management::{
     RuntimeRegistrationContexts, RuntimeServiceProvider, RuntimeServiceRequest, Shared,
     execute_forwarding_mutation,
 };
+pub(super) use media::audio_framing;
 pub use media::{
-    MediaFailureDisposition, audio_framing, configured_audio_processing,
-    configured_audio_traffic_class, configured_dtmf_mode, configured_early_media,
-    configured_video_traffic_class, direct_media_call, direct_media_policy, enqueue_media_retarget,
-    local_media_endpoint, local_video_endpoint, normalize_phone_media_endpoint,
-    normalize_phone_video_endpoint, outbound_media_mode, recover_failed_media_transmission,
-    set_remote_video_endpoint, station_nat_active,
+    MediaFailureDisposition, configured_audio_processing, configured_audio_traffic_class,
+    configured_dtmf_mode, configured_early_media, configured_video_traffic_class,
+    direct_media_call, direct_media_policy, enqueue_media_retarget, local_media_endpoint,
+    local_video_endpoint, normalize_phone_media_endpoint, normalize_phone_video_endpoint,
+    outbound_media_mode, recover_failed_media_transmission, set_remote_video_endpoint,
+    station_nat_active,
 };
 pub use native_support::{
     anonymous_hotline_definition, ast_log, c_string, dial_terminator_digit, format_for,
