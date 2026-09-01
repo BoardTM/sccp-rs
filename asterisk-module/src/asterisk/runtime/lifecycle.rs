@@ -7,12 +7,13 @@ use super::{
     Instant, LineBinding, LineInstance, LogLevel, MODULE, MediaAnchorRegistry, MediaAnchorRestores,
     MediaEndpoint, MobilityRegistry, Module, ModuleConfig, Mutex, MutexExt as _,
     NoAnswerTimerRegistry, ParkingRegistry, PbxCallId, PhoneCommand, PhoneCommandAction,
-    RegistrationFallback, RegistrationRegistryError, RegistrationTokenPolicy, ReloadPlan,
-    ReloadSelection, RuntimeCallSignal, RuntimeCallSignalDeliveryResult, RuntimeCallSignalKind,
-    RuntimeCallSignalQueue, RuntimeCalledPartyProvider, RuntimeChannelQueryProvider,
-    RuntimeCodecPreferenceProvider, RuntimeControlProvider, RuntimeDeviceQueryProvider,
-    RuntimeDirectoryProvider, RuntimeFeatureControlProvider, RuntimeHandsetMessageProvider,
-    RuntimeInventoryProvider, RuntimeLineQueryProvider, RuntimeRegistrationContexts,
+    RECORDING_TRIGGER_WAKE_CAPACITY, RegistrationFallback, RegistrationRegistryError,
+    RegistrationTokenPolicy, ReloadPlan, ReloadSelection, RuntimeCallSignal,
+    RuntimeCallSignalDeliveryResult, RuntimeCallSignalKind, RuntimeCallSignalQueue,
+    RuntimeCalledPartyProvider, RuntimeChannelQueryProvider, RuntimeCodecPreferenceProvider,
+    RuntimeControlProvider, RuntimeDeviceQueryProvider, RuntimeDirectoryProvider,
+    RuntimeFeatureControlProvider, RuntimeHandsetMessageProvider, RuntimeInventoryProvider,
+    RuntimeLineQueryProvider, RuntimeRecordingTriggerQueue, RuntimeRegistrationContexts,
     RuntimeServiceProvider, RwLock, RwLockExt as _, Semaphore, Server, ServerConfig, ServerIngress,
     Shared, SignalingQos, SignalingSocket, StagedMwiSubscriptions, StationIo, StationTransport,
     SystemHostResolver, adapters, anonymous_hotline_definition, ast_log,
@@ -455,6 +456,8 @@ impl Module {
         let (control_requests_tx, control_requests) = mpsc::unbounded_channel();
         let (service_requests_tx, service_requests) = mpsc::unbounded_channel();
         let (call_signals_tx, call_signals) = mpsc::unbounded_channel();
+        let (recording_trigger_wake, recording_triggers) =
+            mpsc::channel(RECORDING_TRIGGER_WAKE_CAPACITY);
         let parking_subscription = AsteriskParking::new()
             .subscribe(move |event| {
                 let _ = parking_events_tx.send(event);
@@ -545,6 +548,8 @@ impl Module {
                 next_sequence: 1,
                 sender: call_signals_tx,
             }),
+            recording_trigger_wake,
+            pending_recording_triggers: Mutex::new(RuntimeRecordingTriggerQueue::default()),
             ami_events: AmiEventPublisher::new(AsteriskManager::new()),
             manager_registrations: Mutex::new(Vec::new()),
             dialplan_registrations: Mutex::new(Vec::new()),
@@ -713,6 +718,7 @@ impl Module {
                     parking_events,
                     control_requests,
                     service_requests,
+                    recording_triggers,
                 ),
                 run_call_signals(signal_access, call_signals),
             );

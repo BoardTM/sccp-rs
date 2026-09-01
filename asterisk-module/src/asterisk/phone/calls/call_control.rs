@@ -14,9 +14,9 @@ use super::super::{
     handle_conference_soft_key, handle_dnd_button, handle_feature_button, handle_feature_soft_key,
     handle_forwarding_backspace, handle_forwarding_digit, handle_hold_or_resume,
     handle_join_soft_key, handle_mobility_button, handle_mobility_response, handle_park_request,
-    handle_parking_lot_button, handle_pickup_soft_key, handle_voicemail_soft_key, preferred_codec,
-    replace_and_commit_forwarding_entry, replace_forwarding_entry, show_conference_list,
-    toggle_monitor_recording, with_channel,
+    handle_parking_lot_button, handle_pickup_soft_key, handle_recording_button,
+    handle_voicemail_soft_key, preferred_codec, replace_and_commit_forwarding_entry,
+    replace_forwarding_entry, show_conference_list, toggle_monitor_recording, with_channel,
 };
 use super::handle_handset_hangup;
 
@@ -164,6 +164,10 @@ pub(super) async fn handle_call_control_event(
         }
         PhoneDeviceEventKind::DoNotDisturbButton { instance } => {
             handle_dnd_button(access, device_id, instance.get());
+            Vec::new()
+        }
+        PhoneDeviceEventKind::RecordingButton { instance } => {
+            handle_recording_button(access, recordings, device_id, instance.get()).await;
             Vec::new()
         }
         PhoneDeviceEventKind::MobilityButton { instance } => {

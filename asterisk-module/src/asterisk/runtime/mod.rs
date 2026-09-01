@@ -1,6 +1,5 @@
 //! Asterisk runtime composition support.
 
-use crate::ami::services::OwnedRecordingSessions;
 use crate::asterisk::boundary::{MutexExt, RwLockExt};
 use crate::asterisk::phone::{
     RuntimeDndMutation, RuntimeDndMutationError, begin_parking_retrieval, cancel_no_answer_timer,
@@ -60,20 +59,20 @@ use crate::asterisk::{
     PbxBridgeId, PbxCallId, PbxEffect, PbxServiceCapabilities, PbxVideoFormat, PhoneCallState,
     PhoneCommand, PhoneCommandAction, PhoneEvent, PickupOperation, PickupOutcome, Presentation,
     ProtocolVersion, REMOTE_HANGUP_PRESENTATION_TIME, REQUESTED_CHANNEL_UNAVAILABLE,
-    ReceiveChannelPurpose, ReceiveTransmit, RecordingCallback, RecordingDirection, RecordingError,
-    RecordingEvent, RecordingProvider, RecordingRegistryError, RecordingSession,
-    RecordingSessionControl, RecordingState, RecordingTogglePlan, RecordingToggleRejection,
-    RedirectReasonCode, RedirectingUpdate, RegisteredDeviceSummary, RegistrationContextRegistry,
-    RegistrationFallback, RegistrationRegistryError, RegistrationTokenPolicy, ReloadPlan,
-    ReloadSelection, RemoteHangupPlan, ResetMode, ResetTarget, ResetType,
-    ResolvedExternalAddresses, Runtime, RuntimeStatusProvider, RuntimeStatusProviderError,
-    RuntimeStatusSnapshot, RwLock, Semaphore, Server, ServerConfig, ServerHandle, ServerIngress,
-    ServiceControlProvider, ServiceOperation, ServiceOutcome, ServiceProviderError,
-    SharedNoAnswerRoute, SignalingQos, SignalingSocket, StationIo, StationMediaCapabilities,
-    StationTransport, SupplementaryBackend, SystemHostResolver, Tone, TransactionId,
-    TransferCompletion, VideoMode, VoicemailOperation, Weak, adapters,
-    allocate_announcement_generation, announcement_generation_is_current, call_event,
-    canonical_ip_address, compose_channel_metadata, configured_inventory,
+    ReceiveChannelPurpose, ReceiveTransmit, RecordingButtonState, RecordingCallback,
+    RecordingDirection, RecordingError, RecordingEvent, RecordingProvider, RecordingRegistryError,
+    RecordingSession, RecordingSessionControl, RecordingState, RecordingTarget,
+    RecordingTogglePlan, RecordingToggleRejection, RedirectReasonCode, RedirectingUpdate,
+    RegisteredDeviceSummary, RegistrationContextRegistry, RegistrationFallback,
+    RegistrationRegistryError, RegistrationTokenPolicy, ReloadPlan, ReloadSelection,
+    RemoteHangupPlan, ResetMode, ResetTarget, ResetType, ResolvedExternalAddresses, Runtime,
+    RuntimeStatusProvider, RuntimeStatusProviderError, RuntimeStatusSnapshot, RwLock, Semaphore,
+    Server, ServerConfig, ServerHandle, ServerIngress, ServiceControlProvider, ServiceOperation,
+    ServiceOutcome, ServiceProviderError, SharedNoAnswerRoute, SignalingQos, SignalingSocket,
+    StationIo, StationMediaCapabilities, StationTransport, SupplementaryBackend,
+    SystemHostResolver, Tone, TransactionId, TransferCompletion, VideoMode, VoicemailOperation,
+    Weak, adapters, allocate_announcement_generation, announcement_generation_is_current,
+    call_event, canonical_ip_address, compose_channel_metadata, configured_inventory,
     configured_registration_appearances, controller_step, execute_backend_cleanup_effects,
     forwarding_ui_line_instances, mpsc, native_bridging, native_channel, native_pickup_result,
     negotiate_audio, ordered_recording_start, ordered_recording_stop, parse_requestor_mode,
@@ -97,6 +96,7 @@ mod management;
 mod media;
 mod native_support;
 mod presence;
+mod recording;
 mod services;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,15 +200,23 @@ pub use presence::{
     publish_device_lines, publish_line, retry_blf, uninstall_blf, uninstall_device_blf,
     uninstall_mwi,
 };
+pub(super) use recording::RuntimeRecordings;
+use recording::{
+    RECORDING_TRIGGER_WAKE_CAPACITY, RuntimeRecordingOwner, RuntimeRecordingSession,
+    RuntimeRecordingTrigger, RuntimeRecordingTriggerQueue,
+};
 pub use services::{
     conference_participant_service_error, execute_service_effects, handle_runtime_hangup_signal,
     parking_service_error, prune_recording_sessions, restore_system_message, run_call_signals,
     run_events, send_confirmed_service, toggle_monitor_recording,
 };
 
-#[derive(Default)]
-pub(super) struct RuntimeRecordings {
-    sessions: OwnedRecordingSessions<backend::AnchoredRecordingSession>,
+pub(super) fn publish_recording_button_state(
+    access: &Access,
+    recordings: &RuntimeRecordings,
+    device_id: &DeviceId,
+) {
+    services::publish_recording_button_state(access, recordings, device_id);
 }
 
 pub(super) fn retarget_station_to_anchor(access: &Access, call: &DirectMediaCall) -> bool {

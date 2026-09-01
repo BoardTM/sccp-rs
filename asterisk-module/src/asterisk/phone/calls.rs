@@ -100,6 +100,7 @@ fn phone_event_family(event: &PhoneDeviceEventKind) -> PhoneEventFamily {
         | PhoneDeviceEventKind::HookFlash { .. }
         | PhoneDeviceEventKind::FeatureButton { .. }
         | PhoneDeviceEventKind::DoNotDisturbButton { .. }
+        | PhoneDeviceEventKind::RecordingButton { .. }
         | PhoneDeviceEventKind::MobilityButton { .. }
         | PhoneDeviceEventKind::VoicemailButton { .. }
         | PhoneDeviceEventKind::ParkingLotButton { .. }

@@ -5936,6 +5936,7 @@ fn device_features_are_independent_of_registration_and_calls() {
         Some(&DeviceFeatureState {
             dnd: DndMode::Silent,
             privacy: true,
+            recording_armed: false,
             forwarding: ForwardingState {
                 all: Some(forwarding("2000")),
                 busy: None,

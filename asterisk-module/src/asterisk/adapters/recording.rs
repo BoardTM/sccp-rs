@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::asterisk::raw::recording::{NativeRecordingSession, start_recording};
 use crate::media::recording::{
     RecordingDirection, RecordingError, RecordingEvent, RecordingSessionControl, RecordingState,
-    validate_filename, validate_text,
+    RecordingTarget, validate_filename, validate_text,
 };
 use crate::pbx::party::AsteriskChannel;
 
@@ -20,16 +20,18 @@ impl AsteriskRecording {
     pub fn start<F>(
         &self,
         channel: &AsteriskChannel<'_>,
-        filename: &str,
+        target: RecordingTarget,
         options: &str,
         callback: F,
     ) -> Result<RecordingSession, RecordingError>
     where
         F: Fn(RecordingEvent) + Send + Sync + 'static,
     {
-        validate_filename(filename)?;
+        if let RecordingTarget::ExplicitlyNamed(filename) = &target {
+            validate_filename(filename)?;
+        }
         validate_text("options", options)?;
-        let inner = start_recording(channel, filename, options, Arc::new(callback))?;
+        let inner = start_recording(channel, target, options, Arc::new(callback))?;
         Ok(RecordingSession { inner })
     }
 }

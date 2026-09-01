@@ -3,13 +3,54 @@
 use super::{
     Access, AmiRecordingCommand, AnchoredRecordingSession, Arc, AsteriskBackend, CallId, CallState,
     ConfirmedRecordingAnchor, DeviceId, LogLevel, MediaAnchorMutation, PbxServiceCapabilities as _,
-    PendingRecordingAnchor, PhoneCommand, PhoneCommandAction, RecordingCallback, RecordingEvent,
-    RecordingProvider as _, RecordingRegistryError, RecordingServiceRequest,
-    RecordingSessionControl as _, RecordingState, RecordingTogglePlan, RecordingToggleRejection,
-    RuntimeRecordings, ServiceOutcome, ServiceProviderError, ast_log, controller_step,
-    ordered_recording_start, ordered_recording_stop, plan_recording_toggle,
-    prepare_anchor_retarget, prepare_direct_retarget, send_confirmed_service,
+    PendingRecordingAnchor, PhoneCommand, PhoneCommandAction, RecordingButtonState,
+    RecordingCallback, RecordingEvent, RecordingProvider as _, RecordingRegistryError,
+    RecordingServiceRequest, RecordingSessionControl as _, RecordingState, RecordingTarget,
+    RecordingTogglePlan, RecordingToggleRejection, RuntimeRecordingSession,
+    RuntimeRecordingTrigger, RuntimeRecordings, ServiceOutcome, ServiceProviderError, ast_log,
+    controller_step, enqueue_recording_session_change, ordered_recording_start,
+    ordered_recording_stop, plan_recording_toggle, prepare_anchor_retarget,
+    prepare_direct_retarget, send_confirmed_service,
 };
+
+fn semantic_recording_button_state(armed: bool, active: bool) -> RecordingButtonState {
+    match (armed, active) {
+        (false, false) => RecordingButtonState::Off,
+        (true, false) => RecordingButtonState::Armed,
+        (false, true) => RecordingButtonState::Active,
+        (true, true) => RecordingButtonState::ArmedActive,
+    }
+}
+
+pub(in super::super) fn publish_recording_button_state(
+    access: &Access,
+    recordings: &RuntimeRecordings,
+    device_id: &DeviceId,
+) {
+    publish_recording_button_semantics(access, device_id, recordings.device_is_active(device_id));
+}
+
+fn publish_recording_button_semantics(access: &Access, device_id: &DeviceId, active: bool) {
+    if access
+        .config()
+        .recording_buttons_for_device(device_id)
+        .next()
+        .is_none()
+    {
+        return;
+    }
+    let armed = controller_step(&access.shared.controller, |controller| {
+        controller
+            .feature_state(device_id)
+            .is_some_and(|features| features.recording_armed)
+    });
+    access.spawn_phone(PhoneCommand::new(
+        device_id.clone(),
+        PhoneCommandAction::SetRecordingButtonStatus {
+            state: semantic_recording_button_state(armed, active),
+        },
+    ));
+}
 
 pub fn recording_registry_service_error<E>(
     error: RecordingRegistryError<E>,
@@ -29,21 +70,32 @@ pub async fn recording_service_operation(
     let RecordingServiceRequest {
         command,
         call_id,
-        filename,
+        target,
         append,
         bridged_only,
         direction,
     } = request;
-    let recordings = &mut recordings.sessions;
-    let (device_id, handset_call_id) = controller_step(&access.shared.controller, |controller| {
+    let current_owner = controller_step(&access.shared.controller, |controller| {
         controller
             .active_or_primary_call_by_pbx(call_id)
-            .map(|call| (call.device_id.clone(), call.sccp_id))
-    })
+            .map(|call| super::RuntimeRecordingOwner {
+                device_id: call.device_id.clone(),
+                handset_call_id: call.sccp_id,
+            })
+    });
+    let remembered_owner = recordings.owner(call_id).cloned();
+    let owner = match command {
+        AmiRecordingCommand::Start => current_owner,
+        AmiRecordingCommand::Stop | AmiRecordingCommand::Mute | AmiRecordingCommand::Unmute => {
+            remembered_owner.or(current_owner)
+        }
+    }
     .ok_or(ServiceProviderError::CallNotFound)?;
+    let device_id = owner.device_id.clone();
+    let handset_call_id = owner.handset_call_id;
     match command {
         AmiRecordingCommand::Start => {
-            if recordings.contains(call_id) {
+            if recordings.sessions.contains(call_id) {
                 return Err(ServiceProviderError::RecordingExists);
             }
             let mut options = String::new();
@@ -53,18 +105,14 @@ pub async fn recording_service_operation(
             if bridged_only {
                 options.push('b');
             }
-            let filename = filename.ok_or(ServiceProviderError::RecordingFailed)?;
-            let callback_access = access.clone();
-            let callback_device = device_id.clone();
+            let target = target.ok_or(ServiceProviderError::RecordingFailed)?;
+            let callback_shared = Arc::downgrade(&access.shared);
             let callback: RecordingCallback = Arc::new(move |event| {
                 if event == RecordingEvent::Stopped {
-                    callback_access.spawn_phone(PhoneCommand::new(
-                        callback_device.clone(),
-                        PhoneCommandAction::SetRecordingStatus {
-                            call_id: handset_call_id,
-                            active: false,
-                        },
-                    ));
+                    let Some(shared) = callback_shared.upgrade() else {
+                        return;
+                    };
+                    enqueue_recording_session_change(&shared, call_id);
                 }
             });
             let mutation = MediaAnchorMutation::acquire(access).await;
@@ -76,7 +124,7 @@ pub async fn recording_service_operation(
                 || {
                     AsteriskBackend::new(access)
                         .recordings()
-                        .start_recording(call_id, &filename, &options, callback)
+                        .start_recording(call_id, target, &options, callback)
                         .map_err(|_| ServiceProviderError::RecordingFailed)
                 },
                 |mut anchor| async move {
@@ -93,8 +141,12 @@ pub async fn recording_service_operation(
                 },
             )
             .await?;
-            let session = AnchoredRecordingSession::new(inner, anchor);
-            if let Err((error, mut session)) = recordings.insert_owned(call_id, session) {
+            let session = RuntimeRecordingSession::new(
+                AnchoredRecordingSession::new(inner, anchor),
+                owner.device_id,
+                owner.handset_call_id,
+            );
+            if let Err((error, mut session)) = recordings.sessions.insert_owned(call_id, session) {
                 let _ = session.stop_native();
                 let _ = restore_recording_session(access, session, &mutation).await;
                 return Err(recording_registry_service_error(error));
@@ -103,7 +155,7 @@ pub async fn recording_service_operation(
             if let Err(error) = send_confirmed_service(
                 access,
                 PhoneCommand::new(
-                    device_id,
+                    device_id.clone(),
                     PhoneCommandAction::SetRecordingStatus {
                         call_id: handset_call_id,
                         active: true,
@@ -112,16 +164,18 @@ pub async fn recording_service_operation(
             )
             .await
             {
-                if let Ok(session) = recordings.take(call_id) {
+                if let Ok(session) = recordings.sessions.take(call_id) {
                     let mutation = MediaAnchorMutation::acquire(access).await;
                     if let Err((_, session)) =
                         stop_and_restore_recording(access, session, &mutation).await
                     {
-                        let _ = recordings.insert(call_id, session);
+                        let _ = recordings.sessions.insert(call_id, session);
                     }
                 }
+                publish_recording_button_state(access, recordings, &device_id);
                 return Err(error);
             }
+            publish_recording_button_state(access, recordings, &device_id);
             Ok(ServiceOutcome::Recording {
                 command,
                 call_id,
@@ -132,8 +186,10 @@ pub async fn recording_service_operation(
         }
         AmiRecordingCommand::Stop => {
             let session = recordings
+                .sessions
                 .take(call_id)
                 .map_err(recording_registry_service_error)?;
+            recordings.suppress_automatic_start(call_id);
             if let Err(error) = send_confirmed_service(
                 access,
                 PhoneCommand::new(
@@ -146,21 +202,22 @@ pub async fn recording_service_operation(
             )
             .await
             {
-                let _ = recordings.insert(call_id, session);
+                let _ = recordings.sessions.insert(call_id, session);
                 return Err(error);
             }
+            publish_recording_button_state(access, recordings, &device_id);
             let mutation = MediaAnchorMutation::acquire(access).await;
             if let Err((error, session)) =
                 stop_and_restore_recording(access, session, &mutation).await
             {
                 let recording_still_active =
                     !matches!(session.state(), Ok(RecordingState::Stopped));
-                let _ = recordings.insert(call_id, session);
+                let _ = recordings.sessions.insert(call_id, session);
                 if recording_still_active {
                     let _ = send_confirmed_service(
                         access,
                         PhoneCommand::new(
-                            device_id,
+                            device_id.clone(),
                             PhoneCommandAction::SetRecordingStatus {
                                 call_id: handset_call_id,
                                 active: true,
@@ -169,8 +226,10 @@ pub async fn recording_service_operation(
                     )
                     .await;
                 }
+                publish_recording_button_state(access, recordings, &device_id);
                 return Err(error);
             }
+            publish_recording_button_state(access, recordings, &device_id);
             Ok(ServiceOutcome::Recording {
                 command,
                 call_id,
@@ -182,6 +241,7 @@ pub async fn recording_service_operation(
         AmiRecordingCommand::Mute | AmiRecordingCommand::Unmute => {
             let muted = command == AmiRecordingCommand::Mute;
             let affected = recordings
+                .sessions
                 .set_muted(
                     call_id,
                     direction.ok_or(ServiceProviderError::RecordingFailed)?,
@@ -237,9 +297,9 @@ async fn restore_recording_anchor(
 
 pub(super) async fn restore_recording_session(
     access: &Access,
-    mut session: AnchoredRecordingSession,
+    mut session: RuntimeRecordingSession,
     mutation: &MediaAnchorMutation<'_>,
-) -> Result<(), (ServiceProviderError, AnchoredRecordingSession)> {
+) -> Result<(), (ServiceProviderError, RuntimeRecordingSession)> {
     if let Err(error) = restore_recording_anchor(access, session.anchor_mut(), mutation).await {
         return Err((error, session));
     }
@@ -248,9 +308,9 @@ pub(super) async fn restore_recording_session(
 
 async fn stop_and_restore_recording(
     access: &Access,
-    session: AnchoredRecordingSession,
+    session: RuntimeRecordingSession,
     mutation: &MediaAnchorMutation<'_>,
-) -> Result<(), (ServiceProviderError, AnchoredRecordingSession)> {
+) -> Result<(), (ServiceProviderError, RuntimeRecordingSession)> {
     ordered_recording_stop(
         session,
         |session| {
@@ -261,6 +321,69 @@ async fn stop_and_restore_recording(
         |session| restore_recording_session(access, session, mutation),
     )
     .await
+}
+
+pub(super) async fn handle_recording_trigger(
+    access: &Access,
+    recordings: &mut RuntimeRecordings,
+    trigger: RuntimeRecordingTrigger,
+) {
+    let pbx_id = match trigger {
+        RuntimeRecordingTrigger::Eligible { pbx_id } => pbx_id,
+        RuntimeRecordingTrigger::SessionChanged { pbx_id } => {
+            super::prune_recording_session(access, recordings, pbx_id).await;
+            return;
+        }
+    };
+    let call = controller_step(&access.shared.controller, |controller| {
+        controller.active_or_primary_call_by_pbx(pbx_id)
+    });
+    let Some(call) = call.filter(|call| {
+        matches!(call.state, CallState::Connected | CallState::Barged)
+            && controller_step(&access.shared.controller, |controller| {
+                controller
+                    .feature_state(&call.device_id)
+                    .is_some_and(|features| features.recording_armed)
+            })
+    }) else {
+        return;
+    };
+    if !recordings.claim_automatic_start(pbx_id) || recordings.sessions.contains(pbx_id) {
+        return;
+    }
+    let device_id = call.device_id.clone();
+    let handset_call_id = call.sccp_id;
+    if let Err(error) = recording_service_operation(
+        access,
+        recordings,
+        RecordingServiceRequest {
+            command: AmiRecordingCommand::Start,
+            call_id: pbx_id,
+            target: Some(RecordingTarget::Automatic),
+            append: false,
+            bridged_only: false,
+            direction: None,
+        },
+    )
+    .await
+    {
+        ast_log(
+            LogLevel::Warning,
+            &format!("unable to start armed SCCP recording: {error}"),
+        );
+        publish_recording_button_state(access, recordings, &device_id);
+        let _ = access
+            .phone
+            .send(PhoneCommand::new(
+                device_id,
+                PhoneCommandAction::DisplayPrompt {
+                    call_id: handset_call_id,
+                    timeout_seconds: 4,
+                    text: "Recording unavailable".into(),
+                },
+            ))
+            .await;
+    }
 }
 
 pub async fn toggle_monitor_recording(
@@ -284,11 +407,10 @@ pub async fn toggle_monitor_recording(
         RecordingToggleRejection::Ownership => ServiceProviderError::CallOwnership,
         RecordingToggleRejection::CallState => ServiceProviderError::CallState,
     })?;
-    let (command, filename) = match plan {
-        RecordingTogglePlan::Start => (
-            AmiRecordingCommand::Start,
-            Some(format!("sccp-monitor-{}.wav", call.pbx_id.0)),
-        ),
+    let (command, target) = match plan {
+        RecordingTogglePlan::Start => {
+            (AmiRecordingCommand::Start, Some(RecordingTarget::Automatic))
+        }
         RecordingTogglePlan::Stop => (AmiRecordingCommand::Stop, None),
     };
     recording_service_operation(
@@ -297,11 +419,36 @@ pub async fn toggle_monitor_recording(
         RecordingServiceRequest {
             command,
             call_id: call.pbx_id,
-            filename,
+            target,
             append: false,
             bridged_only: false,
             direction: None,
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_button_state_covers_armed_and_active_independently() {
+        assert_eq!(
+            semantic_recording_button_state(false, false),
+            RecordingButtonState::Off
+        );
+        assert_eq!(
+            semantic_recording_button_state(true, false),
+            RecordingButtonState::Armed
+        );
+        assert_eq!(
+            semantic_recording_button_state(false, true),
+            RecordingButtonState::Active
+        );
+        assert_eq!(
+            semantic_recording_button_state(true, true),
+            RecordingButtonState::ArmedActive
+        );
+    }
 }

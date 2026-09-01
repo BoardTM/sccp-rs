@@ -45,6 +45,11 @@ pub mod state;
 #[cfg(any(feature = "asterisk-22", feature = "asterisk-23"))]
 mod asterisk;
 
+#[cfg(all(test, feature = "development", feature = "telemetry"))]
+#[allow(dead_code)]
+#[path = "asterisk/telemetry/capture.rs"]
+mod telemetry_capture_tests;
+
 #[cfg(all(feature = "asterisk-22", feature = "asterisk-23"))]
 compile_error!("select only one Asterisk ABI lane");
 

@@ -130,6 +130,20 @@ pub(in crate::config) fn parse_button(
         "feature" if fields.len() >= 3 => {
             let label = required_button_field(fields[1], raw)?;
             let feature_name = required_button_field(fields[2], raw)?;
+            if normalize_name(feature_name) == "monitor" {
+                if fields.len() != 3 {
+                    return Err(invalid_button(raw));
+                }
+                let instance = ButtonInstances::next(&mut instances.feature);
+                return Ok(ParsedButton {
+                    definition: ButtonDefinition::Recording(RecordingButtonDefinition {
+                        instance,
+                        label: label.to_owned(),
+                    }),
+                    feature_argument: None,
+                    blf_target: None,
+                });
+            }
             let feature = parse_feature(feature_name)?;
             let instance = ButtonInstances::next(&mut instances.feature);
             let feature_argument = if fields.len() > 3 {

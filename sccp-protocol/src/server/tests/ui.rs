@@ -83,6 +83,130 @@ fn do_not_disturb_defaults_to_off() {
     assert_eq!(DoNotDisturbMode::default(), DoNotDisturbMode::Off);
 }
 
+fn recording_button_definition() -> DeviceDefinition {
+    let mut device = definition();
+    device.buttons.extend([
+        ButtonDefinition::Recording(crate::types::RecordingButtonDefinition {
+            instance: 1,
+            label: "Record calls".into(),
+        }),
+        ButtonDefinition::Recording(crate::types::RecordingButtonDefinition {
+            instance: 2,
+            label: "Second recorder".into(),
+        }),
+    ]);
+    device
+}
+
+#[test]
+fn recording_button_template_follows_protocol_and_model_capabilities() {
+    let device = recording_button_definition();
+    let projected_types = |protocol, device_type| {
+        button_template_for_station(&device, protocol, device_type)
+            .into_iter()
+            .skip(1)
+            .map(|entry| entry.button_type)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        projected_types(ProtocolVersion::V15, DeviceType::Cisco7925),
+        vec![ButtonType::Feature; 2]
+    );
+    assert_eq!(
+        projected_types(ProtocolVersion::V16, DeviceType::Cisco7925),
+        vec![ButtonType::MultiblinkFeature; 2]
+    );
+    for device_type in [DeviceType::Cisco8941, DeviceType::Cisco8945] {
+        assert_eq!(
+            projected_types(ProtocolVersion::V22, device_type),
+            vec![ButtonType::Feature; 2]
+        );
+    }
+}
+
+#[test]
+fn recording_button_projects_exact_four_state_words_and_bounded_active_labels() {
+    let device = recording_button_definition();
+    let states = [
+        (RecordingButtonState::Off, 0, LampMode::Off),
+        (RecordingButtonState::Armed, 0x02_03_02, LampMode::On),
+        (RecordingButtonState::Active, 0x03_02_03, LampMode::Wink),
+        (
+            RecordingButtonState::ArmedActive,
+            0x03_02_05,
+            LampMode::Blink,
+        ),
+    ];
+    for (state, expected_word, expected_lamp) in states {
+        let [status, lamp] = recording_button_state_messages(
+            &device,
+            1,
+            state,
+            ProtocolVersion::V22,
+            DeviceType::Cisco7925,
+            PhoneFeatures::empty(),
+        )
+        .unwrap();
+        assert!(matches!(
+            status,
+            ServerMessage::FeatureStatus {
+                button_type: ButtonType::MultiblinkFeature,
+                state: actual_word,
+                ..
+            } if actual_word == expected_word
+        ));
+        assert!(matches!(
+            lamp,
+            ServerMessage::SetLamp { mode, .. } if mode == expected_lamp
+        ));
+    }
+
+    assert_eq!(
+        recording_button_label(
+            "1234567890123456789012345678",
+            RecordingButtonState::Active,
+            PhoneFeatures::empty(),
+        ),
+        "1234567890123456789012345678"
+    );
+    assert_eq!(
+        recording_button_label(
+            "1234567890123456789012345678",
+            RecordingButtonState::Active,
+            PhoneFeatures::DYNAMIC_MESSAGES,
+        ),
+        "1234567890123456789012345678 (Recording)"
+    );
+
+    let [legacy_status, legacy_lamp] = recording_button_state_messages(
+        &device,
+        1,
+        RecordingButtonState::ArmedActive,
+        ProtocolVersion::V22,
+        DeviceType::Cisco8945,
+        PhoneFeatures::empty(),
+    )
+    .unwrap();
+    assert!(matches!(
+        legacy_status,
+        ServerMessage::FeatureStatus {
+            button_type: ButtonType::Feature,
+            state: 1,
+            ref label,
+            ..
+        } if label == "Record calls (Recording)"
+    ));
+    assert!(matches!(
+        legacy_lamp,
+        ServerMessage::SetLamp {
+            stimulus: ButtonType::Feature,
+            mode: LampMode::Blink,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn button_template_uses_ordered_semantic_device_buttons() {
     let device = mixed_definition();
@@ -563,6 +687,124 @@ async fn generic_feature_button_emits_only_for_the_configured_instance() {
             instance: LineInstance(1),
         } })) if device_id == DeviceId::new("SEP001122334455").unwrap()
     ));
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn recording_buttons_accept_both_stimuli_and_mirror_device_wide_state() {
+    let protocol = ProtocolVersion::V22;
+    let device_id = DeviceId::new("SEP001122334455").unwrap();
+    let config = ServerConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        advertised_address: Ipv4Addr::LOCALHOST,
+        ..ServerConfig::default()
+    };
+    let (server, handle, mut events) = Server::bind(config, [recording_button_definition()])
+        .await
+        .unwrap();
+    let address = server.local_addr().unwrap();
+    let task = tokio::spawn(server.run());
+    let mut phone = TcpStream::connect(address).await.unwrap();
+    let mut decoder = FrameDecoder::new();
+    phone
+        .write_all(&register_bytes_for_device_type(
+            protocol,
+            DeviceType::Cisco7925.wire_value(),
+        ))
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::REGISTER_ACK).await;
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            event: DeviceEventKind::Registered(_),
+            ..
+        }))
+    ));
+
+    for (stimulus, instance) in [(Stimulus::Privacy, 1), (Stimulus::MultiblinkFeature, 2)] {
+        phone
+            .write_all(
+                &ClientMessage::Stimulus {
+                    stimulus,
+                    instance,
+                    call_reference: 0,
+                    status: 0,
+                }
+                .encode(protocol)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Device(DeviceEvent {
+                event: DeviceEventKind::RecordingButton { instance: actual },
+                ..
+            })) if actual == LineInstance(instance)
+        ));
+    }
+
+    handle
+        .send(Command::new(
+            device_id,
+            CommandAction::SetRecordingButtonStatus {
+                state: RecordingButtonState::ArmedActive,
+            },
+        ))
+        .await
+        .unwrap();
+    let statuses = read_until_server_message(&mut phone, &mut decoder, protocol, |message| {
+        matches!(
+            message,
+            ServerMessage::SetLamp {
+                instance: 2,
+                stimulus: ButtonType::MultiblinkFeature,
+                ..
+            }
+        )
+    })
+    .await;
+    let mirrored = statuses
+        .iter()
+        .filter_map(|message| match message {
+            ServerMessage::FeatureStatus {
+                instance,
+                button_type: ButtonType::MultiblinkFeature,
+                label,
+                state: 0x03_02_05,
+            } => Some((*instance, label.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mirrored,
+        vec![
+            (1, "Record calls (Recording)"),
+            (2, "Second recorder (Recording)")
+        ]
+    );
+
+    phone
+        .write_all(
+            &ClientMessage::Stimulus {
+                stimulus: Stimulus::MultiblinkFeature,
+                instance: 99,
+                call_reference: 0,
+                status: 0,
+            }
+            .encode(protocol)
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), events.recv())
+            .await
+            .is_err()
+    );
 
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();

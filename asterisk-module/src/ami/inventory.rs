@@ -288,6 +288,12 @@ fn inventory_button(
                 feature.feature.wire_value().to_string(),
             )),
         ),
+        ButtonDefinition::Recording(recording) => (
+            InventoryButtonKind::Feature,
+            Some(recording.instance),
+            recording.label.clone(),
+            Some(InventoryValue::Public("monitor".into())),
+        ),
         ButtonDefinition::Service(service) => (
             InventoryButtonKind::Service,
             Some(service.instance),

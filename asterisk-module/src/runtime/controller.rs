@@ -1100,6 +1100,11 @@ pub struct ForwardingState {
 pub struct DeviceFeatureState {
     pub dnd: DndMode,
     pub privacy: bool,
+    /// Device-wide opt-in for recording the next eligible owned call.
+    ///
+    /// Active recording state is deliberately kept out of persisted feature
+    /// state and lives only in the runtime recording registry.
+    pub recording_armed: bool,
     pub forwarding: ForwardingState,
     pub buttons: HashMap<u32, bool>,
 }

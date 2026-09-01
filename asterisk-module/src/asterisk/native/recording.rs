@@ -9,14 +9,23 @@ use std::ffi::{CStr, CString, c_int};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sha2::{Digest as _, Sha256};
+
+use crate::asterisk::boundary::required_c_text;
 use crate::asterisk::raw::handles::{Ao2Object, ChannelRef};
 use crate::asterisk::sys;
 use crate::media::recording::{
     RecordingCallback, RecordingDirection, RecordingError, RecordingEvent, RecordingState,
+    RecordingTarget,
 };
 use crate::pbx::party::AsteriskChannel;
 
 const MIXMONITOR_SOURCE: &CStr = c"MixMonitor";
+const AUTOMATIC_RECORDING_PREFIX: &str = "sccp-";
+const AUTOMATIC_RECORDING_EXTENSION: &str = ".wav";
+const MAX_AUTOMATIC_RECORDING_BASENAME_BYTES: usize = 128;
+const MAX_CHANNEL_UNIQUE_ID_BYTES: usize = 149;
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 static NEXT_RECORDING_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -222,19 +231,69 @@ fn native_text(value: &str) -> Result<CString, RecordingError> {
     CString::new(value).map_err(|_| RecordingError::StartFailed)
 }
 
+fn automatic_recording_basename(unique_id: &[u8]) -> Result<String, RecordingError> {
+    if unique_id.is_empty() {
+        return Err(RecordingError::StartFailed);
+    }
+
+    // The readable portion is intentionally conservative enough to remain one
+    // path component on every supported host. The fingerprint prevents two
+    // distinct unique IDs from collapsing to the same name after replacement
+    // or truncation.
+    let fingerprint = Sha256::digest(unique_id);
+    let mut suffix = String::with_capacity(1 + fingerprint.len() * 2 + 4);
+    suffix.push('-');
+    for byte in fingerprint {
+        suffix.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        suffix.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
+    suffix.push_str(AUTOMATIC_RECORDING_EXTENSION);
+    let stem_limit = MAX_AUTOMATIC_RECORDING_BASENAME_BYTES
+        .saturating_sub(AUTOMATIC_RECORDING_PREFIX.len() + suffix.len());
+    let stem: String = unique_id
+        .iter()
+        .take(stem_limit)
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => char::from(*byte),
+            _ => '_',
+        })
+        .collect();
+    Ok(format!("{AUTOMATIC_RECORDING_PREFIX}{stem}{suffix}"))
+}
+
+fn recording_filename(
+    channel: *mut sys::ast_channel,
+    target: RecordingTarget,
+) -> Result<CString, RecordingError> {
+    match target {
+        RecordingTarget::Automatic => {
+            let unique_id = unsafe { sys::ast_channel_uniqueid(channel) };
+            // SAFETY: `channel` is retained by `ChannelRef`; Asterisk owns its
+            // NUL-terminated unique ID for the retained channel's lifetime.
+            let unique_id = unsafe { required_c_text(unique_id, MAX_CHANNEL_UNIQUE_ID_BYTES) }
+                .map_err(|_| RecordingError::StartFailed)?;
+            native_text(&automatic_recording_basename(unique_id.as_bytes())?)
+        }
+        RecordingTarget::ExplicitlyNamed(filename) => native_text(&filename),
+    }
+}
+
 /// Start a MixMonitor session and retain all callback/channel ownership in Rust.
 pub fn start_recording(
     channel: &AsteriskChannel<'_>,
-    filename: &str,
+    target: RecordingTarget,
     options: &str,
     callback: RecordingCallback,
 ) -> Result<NativeRecordingSession, RecordingError> {
     let callback = CallbackOwner::new(callback);
-    let filename = native_text(filename)?;
     let id_variable = id_variable()?;
     let options = combined_options(options, &id_variable)?;
     let channel = unsafe { ChannelRef::acquire(channel.as_raw().cast()) }
         .ok_or(RecordingError::StartFailed)?;
+    // MixMonitor resolves relative filenames beneath ast_config_AST_MONITOR_DIR.
+    // Automatic targets are always a single relative WAV basename; explicit
+    // administrative targets retain the adapter's established behavior.
+    let filename = recording_filename(channel.as_ptr(), target)?;
 
     unsafe {
         sys::pbx_builtin_setvar_helper(channel.as_ptr(), id_variable.as_ptr(), ptr::null());
@@ -396,6 +455,44 @@ mod tests {
         assert_eq!(
             combined_options("bW", variable).unwrap().to_str().unwrap(),
             "bWi(SCCP_RECORDING_ID_0000000000000001)"
+        );
+    }
+
+    #[test]
+    fn automatic_filename_is_a_bounded_relative_wav_basename() {
+        let unique_id = [b'a'; 512];
+        let filename = automatic_recording_basename(&unique_id).unwrap();
+
+        assert!(filename.len() <= MAX_AUTOMATIC_RECORDING_BASENAME_BYTES);
+        assert!(filename.ends_with(AUTOMATIC_RECORDING_EXTENSION));
+        assert!(!filename.contains('/'));
+        assert!(!filename.contains('\\'));
+        assert_eq!(
+            std::path::Path::new(&filename).file_name().unwrap(),
+            filename.as_str()
+        );
+    }
+
+    #[test]
+    fn automatic_filename_sanitizes_unique_id_bytes_and_resists_collisions() {
+        let slash = automatic_recording_basename(b"1700000000.1/leg").unwrap();
+        let question = automatic_recording_basename(b"1700000000.1?leg").unwrap();
+
+        assert_ne!(slash, question);
+        assert!(slash.starts_with("sccp-1700000000_1_leg-"));
+        assert!(question.starts_with("sccp-1700000000_1_leg-"));
+        assert!(
+            slash
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        );
+    }
+
+    #[test]
+    fn automatic_filename_requires_a_channel_unique_id() {
+        assert_eq!(
+            automatic_recording_basename(b""),
+            Err(RecordingError::StartFailed)
         );
     }
 }

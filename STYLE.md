@@ -12,6 +12,7 @@ guide:
   version-specific structs.
 - Do not add comments that merely restate obvious code.
 - Do not keep around old structs / enums when refactoring, we don't want "BlaLegacy" for "compatibility purposes"
+- Do not write tests for the sake of tests, we are writing rust, we should express thigns in such a way that we can trust the compiler.
 
 ## Design priorities
 

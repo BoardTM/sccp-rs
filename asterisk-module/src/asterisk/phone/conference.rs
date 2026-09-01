@@ -9,7 +9,8 @@ use super::{
     Duration, EffectExecutionError, Instant, LogLevel, PbxAudioFormat, PbxEffect, PhoneCommand,
     PhoneCommandAction, ServiceProviderError, ast_log, cancel_conference_announcement,
     conference_participant_service_error, controller_step, execute_cleanup_effects,
-    execute_effects, execute_handset_effect, execute_one_effect, preferred_codec, remove_channel,
+    execute_effects, execute_effects_confirmed, execute_handset_effect, execute_one_effect,
+    preferred_codec, remove_channel,
 };
 
 pub(super) fn conference_mutation_is_active(
@@ -51,7 +52,15 @@ pub(super) async fn handle_barge_soft_key(
         controller.barge(call_id, binding, codec, mode)
     });
     match result {
-        Ok(effects) => execute_effects(access, effects).await,
+        Ok(effects) => {
+            if execute_effects_confirmed(access, effects).await.is_ok()
+                && let Some(pbx_id) = controller_step(&access.shared.controller, |controller| {
+                    controller.call(call_id).map(|call| call.pbx_id)
+                })
+            {
+                access.enqueue_recording_eligibility(pbx_id);
+            }
+        }
         Err(rejection) => {
             let text = match rejection {
                 BargeRejection::Private => "Private call",

@@ -3250,6 +3250,121 @@ fn parses_ordered_mixed_button_layout() {
 }
 
 #[test]
+fn parses_canonical_recording_buttons_as_typed_mirrored_controls() {
+    let input = CONFIG.replace(
+        "line = 1001",
+        "line = 1001\n        button = feature, Record calls, monitor\n        button = feature, Record backup, monitor",
+    );
+
+    let config = ModuleConfig::parse(&input).unwrap();
+    let device_id = DeviceId::new("SEP001122334455").unwrap();
+    let device = &config.devices[&device_id];
+
+    assert!(matches!(
+        &device.buttons[1],
+        ButtonDefinition::Recording(recording)
+            if recording.instance == 1 && recording.label == "Record calls"
+    ));
+    assert!(matches!(
+        &device.buttons[2],
+        ButtonDefinition::Recording(recording)
+            if recording.instance == 2 && recording.label == "Record backup"
+    ));
+    assert_eq!(config.device_definitions()[0].buttons, device.buttons);
+    assert!(!device.feature_arguments.contains_key(&1));
+    assert!(!device.feature_arguments.contains_key(&2));
+    assert_eq!(
+        config
+            .recording_buttons_for_device(&device_id)
+            .map(|recording| recording.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Record calls", "Record backup"]
+    );
+}
+
+#[test]
+fn recording_button_rejects_missing_or_extra_arguments() {
+    for button in [
+        "button = feature, , monitor",
+        "button = feature, Record calls, monitor, armed",
+        "button = feature, Record calls, monitor, ",
+    ] {
+        let input = CONFIG.replace("line = 1001", &format!("line = 1001\n        {button}"));
+        assert!(
+            matches!(
+                ModuleConfig::parse(&input),
+                Err(ConfigError::InvalidValue { ref key, .. }) if key.ends_with(".button")
+            ),
+            "accepted {button}"
+        );
+    }
+}
+
+#[test]
+fn recording_buttons_follow_ordered_device_template_inheritance() {
+    let input = CONFIG.replace(
+        "[SEP001122334455]",
+        r#"[recording-device](!)
+        type = device
+        button = feature, Record calls, monitor
+
+        [SEP001122334455](recording-device)"#,
+    );
+
+    let config = ModuleConfig::parse(&input).unwrap();
+    let device = &config.devices[&DeviceId::new("SEP001122334455").unwrap()];
+    assert!(matches!(
+        &device.buttons[0],
+        ButtonDefinition::Recording(recording)
+            if recording.instance == 1 && recording.label == "Record calls"
+    ));
+    assert!(matches!(
+        &device.buttons[1],
+        ButtonDefinition::Line(line) if line.instance == 1 && line.number == "1001"
+    ));
+}
+
+#[test]
+fn recording_soft_key_remains_opt_in_to_connected_modes() {
+    let default = ModuleConfig::parse(CONFIG).unwrap();
+    let default_profile = default.soft_key_profile(DEFAULT_SOFT_KEY_PROFILE).unwrap();
+    for mode in [
+        KeyMode::Connected,
+        KeyMode::ConnectedTransfer,
+        KeyMode::ConnectedConference,
+    ] {
+        assert!(!default_profile.actions(mode).contains(&SoftKey::Monitor));
+    }
+
+    let input = CONFIG
+        .replace(
+            "[SEP001122334455]",
+            r#"[recording-keys]
+        type = softkey_profile
+        connected = hold, monitor, end_call
+        connected_transfer = monitor, transfer
+        connected_conference = conference_list, monitor
+
+        [SEP001122334455]"#,
+        )
+        .replace(
+            "description = Reception",
+            "description = Reception\n        softkey_profile = recording-keys",
+        );
+    let config = ModuleConfig::parse(&input).unwrap();
+    let profile = config
+        .soft_key_profile_for_device(&DeviceId::new("SEP001122334455").unwrap())
+        .unwrap();
+    for mode in [
+        KeyMode::Connected,
+        KeyMode::ConnectedTransfer,
+        KeyMode::ConnectedConference,
+    ] {
+        assert!(profile.actions(mode).contains(&SoftKey::Monitor));
+    }
+}
+
+#[test]
 fn speed_dial_hint_builds_a_blf_button() {
     let input = CONFIG.replace(
         "line = 1001",

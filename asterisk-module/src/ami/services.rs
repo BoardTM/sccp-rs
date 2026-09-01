@@ -290,9 +290,8 @@ impl<S: RecordingSessionControl> OwnedRecordingSessions<S> {
         mut predicate: impl FnMut(PbxCallId, &S) -> bool,
     ) -> Vec<(PbxCallId, S)> {
         let call_ids = self
-            .sessions
             .iter()
-            .filter_map(|(call_id, session)| predicate(*call_id, session).then_some(*call_id))
+            .filter_map(|(call_id, session)| predicate(call_id, session).then_some(call_id))
             .collect::<Vec<_>>();
         call_ids
             .into_iter()
@@ -329,7 +328,17 @@ impl<S: RecordingSessionControl> OwnedRecordingSessions<S> {
     }
 
     pub fn contains(&self, call_id: PbxCallId) -> bool {
-        self.sessions.contains_key(&call_id)
+        self.get(call_id).is_some()
+    }
+
+    pub(crate) fn get(&self, call_id: PbxCallId) -> Option<&S> {
+        self.sessions.get(&call_id)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (PbxCallId, &S)> {
+        self.sessions
+            .iter()
+            .map(|(call_id, session)| (*call_id, session))
     }
 }
 

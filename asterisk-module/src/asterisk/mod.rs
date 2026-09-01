@@ -72,10 +72,11 @@ use sccp_protocol::{
     MultimediaTransmitControl, MultimediaTransmitDescriptor, PARKING_MENU_MAX_ITEMS,
     ParkingMenuEntry, ParticipantId, PhoneAlarmTelemetry, PhoneLocationTelemetry,
     PhoneServiceEvent, PhoneServicePayload, PhoneServicePriority, ProtocolVersion,
-    ReceiveChannelPurpose, ReceiveTransmit, RegistrationFallback, RegistrationTokenPolicy,
-    ResetType, RingDuration, RingerMode, Server, ServerConfig, ServerHandle, ServerIngress,
-    SignalingQos, SignalingSocket, SoftKey, StationIo, StationMediaCapabilities,
-    StationSessionTarget, StationTransport, Tone, TransactionId, TransmitOpenOutcome,
+    ReceiveChannelPurpose, ReceiveTransmit, RecordingButtonState, RegistrationFallback,
+    RegistrationTokenPolicy, ResetType, RingDuration, RingerMode, Server, ServerConfig,
+    ServerHandle, ServerIngress, SignalingQos, SignalingSocket, SoftKey, StationIo,
+    StationMediaCapabilities, StationSessionTarget, StationTransport, Tone, TransactionId,
+    TransmitOpenOutcome,
 };
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
@@ -181,8 +182,9 @@ use crate::media::formats::{
 };
 use crate::media::recording::{
     RecordingCallback, RecordingDirection, RecordingError, RecordingEvent, RecordingProvider,
-    RecordingSessionControl, RecordingState, RecordingTogglePlan, RecordingToggleRejection,
-    ordered_recording_start, ordered_recording_stop, plan_recording_toggle,
+    RecordingSessionControl, RecordingState, RecordingTarget, RecordingTogglePlan,
+    RecordingToggleRejection, ordered_recording_start, ordered_recording_stop,
+    plan_recording_toggle,
 };
 use crate::pbx::channel_metadata::{ChannelMetadataError, validate_native_channel_metadata};
 use crate::pbx::handset_message::{

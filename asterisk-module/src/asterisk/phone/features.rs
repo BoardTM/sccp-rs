@@ -7,12 +7,13 @@ use super::{
     ForwardingDigitOutcome, ForwardingEntryTiming, ForwardingExpiryOutcome, ForwardingKind,
     ForwardingRejection, ForwardingWriteOutcome, Instant, LineInstance, LogLevel,
     MANAGER_CONTROL_DELIVERY_TIMEOUT, ManagementEvent, ModuleConfig, MutexExt as _, PbxAudioFormat,
-    PbxEffect, PhoneCommand, PhoneCommandAction, PhoneDndButtonMode, PhoneDndMode, SoftKey,
-    VoicemailNativeOutcome, VoicemailPlan, VoicemailTarget, ast_log, configure_pickup_policy,
-    configured_feature_state, controller_step, default_button_mode, dial_terminator_digit,
-    execute_effects, execute_forwarding_mutation, feature_changes, feature_event,
-    forwarding_ui_line_instances, handset_status_message, preferred_codec, publish_device_lines,
-    publish_line, with_channel,
+    PbxEffect, PhoneCommand, PhoneCommandAction, PhoneDndButtonMode, PhoneDndMode,
+    RuntimeRecordings, SoftKey, VoicemailNativeOutcome, VoicemailPlan, VoicemailTarget, ast_log,
+    configure_pickup_policy, configured_feature_state, controller_step, default_button_mode,
+    dial_terminator_digit, execute_effects, execute_forwarding_mutation, feature_changes,
+    feature_event, forwarding_ui_line_instances, handset_status_message, preferred_codec,
+    publish_device_lines, publish_line, publish_recording_button_state, toggle_monitor_recording,
+    with_channel,
 };
 use crate::runtime::backend::SupplementaryBackend as _;
 
@@ -908,6 +909,71 @@ pub(super) fn handle_dnd_button(access: &Access, device_id: DeviceId, instance: 
         execute_dnd_mutation(access, &device_id, RuntimeDndMutation::Button(instance))
     {
         log_feature_store_error("persist handset DND mutation", Some(&device_id), &error);
+    }
+}
+
+pub(super) async fn handle_recording_button(
+    access: &Access,
+    recordings: &mut RuntimeRecordings,
+    device_id: DeviceId,
+    instance: u32,
+) {
+    let config = access.config();
+    if !config
+        .recording_buttons_for_device(&device_id)
+        .any(|button| button.instance == instance)
+    {
+        return;
+    }
+    let current_call = controller_step(&access.shared.controller, |controller| {
+        let call_id = controller.registered_device(&device_id)?.active_call()?;
+        let call = controller.call(call_id)?;
+        (&call.device_id == &device_id
+            && (recordings.is_active_call(call.pbx_id)
+                || matches!(
+                    call.state,
+                    crate::runtime::controller::CallState::Connected
+                        | crate::runtime::controller::CallState::Barged
+                )))
+        .then_some(call_id)
+    });
+    if let Some(call_id) = current_call {
+        if let Err(error) = toggle_monitor_recording(access, recordings, &device_id, call_id).await
+        {
+            ast_log(
+                LogLevel::Warning,
+                &format!("unable to change SCCP recording state: {error}"),
+            );
+            let _ = access
+                .phone
+                .send(PhoneCommand::new(
+                    device_id,
+                    PhoneCommandAction::DisplayPrompt {
+                        call_id,
+                        timeout_seconds: 4,
+                        text: "Recording unavailable".into(),
+                    },
+                ))
+                .await;
+        }
+        return;
+    }
+
+    let result = {
+        let _feature_guard = access.shared.feature_mutations.lock_unpoisoned();
+        update_device_features_locked(access, &config, &device_id, |state| {
+            state.recording_armed = !state.recording_armed;
+        })
+    };
+    match result {
+        Ok(Some((_previous, _current))) => {
+            publish_recording_button_state(access, recordings, &device_id);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            log_feature_store_error("persist recording armed state", Some(&device_id), &error);
+            publish_recording_button_state(access, recordings, &device_id);
+        }
     }
 }
 

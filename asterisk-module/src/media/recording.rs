@@ -6,6 +6,7 @@
 //! successful stop or unload closes the owned native session before releasing
 //! it. This module contains no Asterisk ABI records or callback trampolines.
 
+use std::fmt;
 use std::sync::Arc;
 
 use sccp_protocol::DeviceId;
@@ -56,6 +57,26 @@ pub enum RecordingToggleRejection {
     CallState,
 }
 
+/// Selection of the file target for a new recording session.
+///
+/// Automatic targets are resolved by the native adapter from PBX-owned channel
+/// identity. Explicit names come from administrative interfaces and remain
+/// subject to their existing ingress validation before reaching this port.
+#[derive(Clone, Eq, PartialEq)]
+pub enum RecordingTarget {
+    Automatic,
+    ExplicitlyNamed(String),
+}
+
+impl fmt::Debug for RecordingTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Automatic => formatter.write_str("Automatic"),
+            Self::ExplicitlyNamed(_) => formatter.write_str("ExplicitlyNamed(<redacted>)"),
+        }
+    }
+}
+
 /// Authorize a recording toggle without coupling the policy to a native session.
 pub fn plan_recording_toggle(
     requested_device: &DeviceId,
@@ -98,7 +119,7 @@ pub trait RecordingProvider {
     fn start_recording(
         &self,
         call_id: PbxCallId,
-        filename: &str,
+        target: RecordingTarget,
         options: &str,
         callback: RecordingCallback,
     ) -> Result<Self::Session, Self::StartError>;
@@ -204,6 +225,15 @@ mod tests {
             validate_text("options", "b\0W"),
             Err(RecordingError::InvalidText { field: "options" })
         );
+    }
+
+    #[test]
+    fn explicitly_named_recording_targets_redact_filenames_from_debug() {
+        let target = RecordingTarget::ExplicitlyNamed("private-call.wav".into());
+
+        let debug = format!("{target:?}");
+        assert_eq!(debug, "ExplicitlyNamed(<redacted>)");
+        assert!(!debug.contains("private-call.wav"));
     }
 
     #[test]

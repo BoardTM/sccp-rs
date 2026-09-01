@@ -115,6 +115,32 @@ pub struct ServerObservation {
     pub kind: ServerObservationKind,
 }
 
+/// Why an admitted station connection stopped.
+///
+/// This classification deliberately stays independent of error text so
+/// telemetry consumers can aggregate connection outcomes without retaining
+/// transport- or protocol-specific details.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum StationDisconnectReason {
+    /// The station closed its side of the transport cleanly.
+    PeerClosure,
+    /// Reading from or writing to the station transport failed.
+    IoFailure,
+    /// The station sent no valid traffic before its keepalive deadline.
+    KeepaliveExpiry,
+    /// The server deliberately retired the session.
+    ServerRetirement,
+    /// The station explicitly requested that its session end.
+    StationRequest,
+    /// The server rejected the station during registration.
+    RegistrationRejected,
+    /// Malformed framing or another protocol error ended the session.
+    ProtocolFailure,
+    /// A non-I/O server failure ended the session.
+    ServerFailure,
+}
+
 /// Connection lifecycle and signaling records emitted by the server.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -133,6 +159,7 @@ pub enum ServerObservationKind {
     },
     Disconnected {
         connection_id: ObservationConnectionId,
+        reason: StationDisconnectReason,
     },
 }
 
@@ -805,6 +832,7 @@ mod observation_tests {
         let sink = ObservationSink::new(sender);
         let disconnected = || ServerObservationKind::Disconnected {
             connection_id: ObservationConnectionId::new(1).unwrap(),
+            reason: StationDisconnectReason::PeerClosure,
         };
         sink.observe(disconnected());
         sink.observe(disconnected());

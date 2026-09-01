@@ -12,7 +12,7 @@ use crate::asterisk::StaticDescriptor;
 
 const MODULE_NAME: &[u8] = b"chan_sccp2\0";
 const DESCRIPTION: &[u8] = b"Rust SCCP Channel Driver\0";
-const OPTIONAL_MODULES: &[u8] = b"res_sorcery_astdb\0";
+const OPTIONAL_MODULES: &[u8] = b"res_sorcery_astdb,app_mixmonitor\0";
 const GPL_KEY: &[u8] = b"This paragraph is copyright (c) 2006 by Digium, Inc. In order for your module to load, it must return this key via a function called \"key\".  Any code which includes this paragraph must be licensed under the GNU General Public License version 2 or later (at your option).  In addition to Digium's general reservations of rights, Digium expressly reserves the right to allow other parties to license this paragraph under different terms. Any use of Digium, Inc. trademarks or logos (including \"Asterisk\" or \"Digium\") without express written permission of Digium, Inc. is prohibited.\n\0";
 
 static MODULE_INFO: StaticDescriptor<sys::ast_module_info> = StaticDescriptor::uninit();

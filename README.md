@@ -75,7 +75,7 @@ in progress
 | --- | --- | --- |
 | Platform | Asterisk 22+ on Linux x86-64 and ARM64/aarch64; currently tested with 22 and 23 | You're kinda on your own with ARM32 and other stuff LOL |
 | Signaling and network | SCCP over TCP or TLS, IPv4/IPv6, NAT address selection, DSCP/COS, registration failover, and per-device transport policy | Configured network/hostname ACL admission |
-| Calling features | Inbound/outbound calls, hold, call waiting, auto-answer, shared lines, transfer, forwarding, pickup, park, barge, DND/privacy, voicemail/MWI, BLF/hints, mobility, call completion, recording, and conferencing | Phone firmware/TFTP provisioning and a built-in PBX or SIP stack |
+| Calling features | Inbound/outbound calls, hold, call waiting, auto-answer, shared lines, transfer, forwarding, pickup, park, barge, DND/privacy, voicemail/MWI, BLF/hints, mobility, call completion, [one-touch, armed, and AMI MixMonitor recording](docs/RECORDING.md), and conferencing | Phone firmware/TFTP provisioning and a built-in PBX or SIP stack |
 | Audio media | Native RTP, early media, jitter buffer, direct RTP, DTMF, and mapped G.711/G.722/G.723/G.729/G.726, GSM, iLBC, Siren7, SLIN16, and Opus | Protected/SRTP media and SCCP codecs with no Asterisk format mapping |
 | Video media | Anchored RTP and handset control for H.261, H.263/H.263+, and H.264, including fast-picture updates | Direct video RTP, H.265 stream setup, H.264 SVC/FEC/UC, and encrypted video |
 | Configuration and control | File, realtime, or Sorcery/AstDB config; ARI dynamic objects; transactional reloads; device state/hints; CLI; AMI actions/events; dialplan functions/apps; and an HTTP phone directory | The phone-authentication HTTP route (API only; no credential backend is installed) |

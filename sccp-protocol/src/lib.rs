@@ -180,15 +180,15 @@ pub use server::{
     IncomingRing, MAX_REGISTRATION_BACKOFF, MIN_REGISTRATION_BACKOFF, MediaStatisticsSnapshot,
     MulticastMediaRoute, MultimediaReceiveDescriptor, MultimediaTransmitControl,
     MultimediaTransmitDescriptor, PARKING_MENU_MAX_ITEMS, ParkingMenuEntry, ReceiveChannelPurpose,
-    ReconfigureResult, RegistrationFallback, RegistrationTokenPolicy, Server, ServerConfig,
-    ServerError, ServerHandle, ServerIngress, SignalingServerRoute, SignalingSocket,
+    ReconfigureResult, RecordingButtonState, RegistrationFallback, RegistrationTokenPolicy, Server,
+    ServerConfig, ServerError, ServerHandle, ServerIngress, SignalingServerRoute, SignalingSocket,
     SocketQosFailure, SocketQosMark, SocketQosPolicy, SocketQosReport, StationIo,
     StationSessionTarget, StationSocketQos, TransmitOpenOutcome, VideoPictureReference,
     VideoPictureReferences, apply_socket_qos,
 };
 pub use server::{
     ObservationConnectionId, ServerObservation, ServerObservationKind, SignalingDirection,
-    SignalingFidelity, SignalingObservation,
+    SignalingFidelity, SignalingObservation, StationDisconnectReason,
 };
 pub use types::{
     AddonModuleDefinition, AppearanceId, AppearanceRingMode, ApplicationId, AudioProcessingPolicy,
@@ -196,7 +196,7 @@ pub use types::{
     CallInfo, CallReference, CallerIdOverride, ConferenceId, DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET,
     DEFAULT_AUDIO_PACKET_MS, DateTemplate, DeviceDefinition, DeviceId, DeviceRegistration,
     FeatureDefinition, LegacyCodePage, LineAppearance, LineDefinition, LineInstance, MediaEndpoint,
-    MediaTrafficClass, ParticipantId, PassthroughPartyId, ServiceDefinition, SessionGeneration,
-    SignalingQos, SoftKeyProfile, SpeedDialDefinition, StationTransport,
-    StationTransportRequirement, StationUiPolicy, TransactionId,
+    MediaTrafficClass, ParticipantId, PassthroughPartyId, RecordingButtonDefinition,
+    ServiceDefinition, SessionGeneration, SignalingQos, SoftKeyProfile, SpeedDialDefinition,
+    StationTransport, StationTransportRequirement, StationUiPolicy, TransactionId,
 };

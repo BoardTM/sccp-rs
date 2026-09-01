@@ -10,10 +10,11 @@ use crate::asterisk::runtime::{
     PendingParkingNotification, PendingRetrieval, RuntimeRecordings, ast_log,
     cancel_conference_announcement, conference_participant_service_error, configure_pickup_policy,
     dial_terminator_digit, execute_answer_call_transition, execute_call_transition,
-    execute_cleanup_effects, execute_effects, execute_forwarding_mutation, execute_handset_effect,
-    execute_one_effect, execute_service_effects, handset_effects, install_blf,
-    normalize_phone_media_endpoint, normalize_phone_video_endpoint, parking_service_error,
-    preferred_codec, prune_recording_sessions, publish_device_lines, publish_line,
+    execute_cleanup_effects, execute_effects, execute_effects_confirmed,
+    execute_forwarding_mutation, execute_handset_effect, execute_one_effect,
+    execute_service_effects, handset_effects, install_blf, normalize_phone_media_endpoint,
+    normalize_phone_video_endpoint, parking_service_error, preferred_codec,
+    prune_recording_sessions, publish_device_lines, publish_line, publish_recording_button_state,
     recover_failed_media_transmission, registered_device_ids, remove_channel,
     restore_system_message, retain_two_channels, send_confirmed_service, set_remote_video_endpoint,
     toggle_monitor_recording, uninstall_device_blf, with_channel,
@@ -79,8 +80,8 @@ pub use features::{
 use features::{
     cancel_forwarding_entry_for_call, cancel_forwarding_entry_for_device, commit_forwarding_entry,
     forwarding_entry_exists, handle_dnd_button, handle_feature_button, handle_feature_soft_key,
-    handle_forwarding_backspace, handle_forwarding_digit, handle_voicemail_soft_key,
-    replace_and_commit_forwarding_entry, replace_forwarding_entry,
+    handle_forwarding_backspace, handle_forwarding_digit, handle_recording_button,
+    handle_voicemail_soft_key, replace_and_commit_forwarding_entry, replace_forwarding_entry,
 };
 pub use forwarding::{cancel_no_answer_timer, clear_no_answer_route, expire_no_answer_routes};
 pub use mobility::{configured_mobility_button, mobility_device_registered};

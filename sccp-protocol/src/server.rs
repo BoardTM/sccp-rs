@@ -47,7 +47,7 @@ pub use qos::{
 };
 pub use transport::{
     ObservationConnectionId, ServerObservation, ServerObservationKind, SignalingDirection,
-    SignalingFidelity, SignalingObservation,
+    SignalingFidelity, SignalingObservation, StationDisconnectReason,
 };
 pub use transport::{ServerIngress, StationIo};
 
@@ -262,6 +262,26 @@ pub enum DoNotDisturbButtonMode {
     Cycle,
     Silent,
     Reject,
+}
+
+/// Semantic state shared by every recording button configured on a device.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecordingButtonState {
+    #[default]
+    Off,
+    Armed,
+    Active,
+    ArmedActive,
+}
+
+impl RecordingButtonState {
+    const fn is_armed(self) -> bool {
+        matches!(self, Self::Armed | Self::ArmedActive)
+    }
+
+    const fn is_active(self) -> bool {
+        matches!(self, Self::Active | Self::ArmedActive)
+    }
 }
 
 impl Default for IncomingRing {
@@ -788,6 +808,9 @@ pub enum DeviceEventKind {
     /// Reports activation of a configured do-not-disturb feature button.
     /// The instance identifies which station feature definition was pressed.
     DoNotDisturbButton { instance: LineInstance },
+    /// Reports activation of a configured recording feature button.
+    /// The instance identifies the exact physical button that was pressed.
+    RecordingButton { instance: LineInstance },
     /// Reports activation of a configured mobility feature button.
     /// The instance identifies the owner of any temporary mobility appearance.
     MobilityButton { instance: LineInstance },
@@ -1091,6 +1114,8 @@ pub enum CommandAction {
         mode: DoNotDisturbMode,
         button_mode: DoNotDisturbButtonMode,
     },
+    /// Mirrors one semantic recording state to every recording button.
+    SetRecordingButtonStatus { state: RecordingButtonState },
     /// Installs or removes the temporary line owned by a mobility button.
     /// Rebuilds the button template and line status as one validated change.
     SetMobilityAppearance {
@@ -2582,11 +2607,14 @@ impl Server {
         let error_tx = self.event_tx.clone();
         let observation_sink = self.observation_sink.clone();
         tokio::spawn(async move {
-            let result = run_session(stream, context).await;
+            let outcome = run_session(stream, context).await;
             if let Some(connection_id) = observation_connection_id {
-                observation_sink.observe(ServerObservationKind::Disconnected { connection_id });
+                observation_sink.observe(ServerObservationKind::Disconnected {
+                    connection_id,
+                    reason: outcome.reason,
+                });
             }
-            match result {
+            match outcome.result {
                 Ok(()) => debug!(%peer, "SCCP session ended cleanly"),
                 Err(error) => {
                     warn!(%peer, %error, "SCCP session ended with an error");
@@ -2848,6 +2876,7 @@ fn command_call_id(command: &Command) -> Option<CallId> {
         | CommandAction::SetForwardStatus { .. }
         | CommandAction::SetFeatureStatus { .. }
         | CommandAction::SetDoNotDisturbStatus { .. }
+        | CommandAction::SetRecordingButtonStatus { .. }
         | CommandAction::SetMobilityAppearance { .. }
         | CommandAction::SetBlfStatus { .. }
         | CommandAction::ShowParkingMenu { .. }
@@ -3106,9 +3135,10 @@ impl SessionState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionFeatureState {
     button_type: ButtonType,
+    label: String,
     state: u32,
 }
 
@@ -3141,10 +3171,7 @@ struct SessionForwarding {
     no_answer: Option<String>,
 }
 
-async fn run_session(
-    mut stream: Box<dyn StationIo>,
-    context: SessionContext,
-) -> Result<(), ServerError> {
+async fn run_session(mut stream: Box<dyn StationIo>, context: SessionContext) -> SessionOutcome {
     let (session_tx, mut session_rx) = mpsc::channel(SESSION_COMMAND_CAPACITY);
     let admission = Arc::new(SessionAdmission::new());
     let mut retirement = admission.subscribe();
@@ -3163,17 +3190,19 @@ async fn run_session(
     let keepalive_timeout = Duration::from_secs(u64::from(keepalive_seconds) * 3);
 
     let result = async {
-        'session: loop {
+        let reason = 'session: loop {
             if *retirement.borrow() == SessionAdmissionState::Retired {
-                break;
+                break StationDisconnectReason::ServerRetirement;
             }
             tokio::select! {
                 read = stream.read(&mut read_buffer) => {
-                    let count = read?;
                     if *retirement.borrow() == SessionAdmissionState::Retired {
-                        break;
+                        break StationDisconnectReason::ServerRetirement;
                     }
-                    if count == 0 { break; }
+                    let count = read?;
+                    if count == 0 {
+                        break StationDisconnectReason::PeerClosure;
+                    }
                     let frames = match decoder.push(&read_buffer[..count]) {
                         Ok(frames) => frames,
                         Err(error) if state.is_none() => {
@@ -3182,13 +3211,13 @@ async fn run_session(
                                 %error,
                                 "discarding malformed pre-registration SCCP stream"
                             );
-                            break;
+                            break StationDisconnectReason::ProtocolFailure;
                         }
                         Err(error) => return Err(error.into()),
                     };
                     for frame in frames {
                         if *retirement.borrow() == SessionAdmissionState::Retired {
-                            break 'session;
+                            break 'session StationDisconnectReason::ServerRetirement;
                         }
                         let decode_protocol = state
                             .as_ref()
@@ -3230,41 +3259,43 @@ async fn run_session(
                                         .expect("registered session state was installed");
                                     info!(device_id = %state.device.id, protocol = %state.registration.protocol, peer = %context.peer, "SCCP device registered");
                                 }
-                                None => break 'session,
+                                None => break 'session StationDisconnectReason::RegistrationRejected,
                             }
                         } else if let Some(state) = state.as_mut() {
                             last_station_activity = Instant::now();
                             if handle_registered_message(&mut stream, state, message, &context).await?
                                 == SessionDisposition::Terminate
                             {
-                                break 'session;
+                                break 'session StationDisconnectReason::StationRequest;
                             }
                         } else if handle_pre_registration_message(&mut stream, message, &context).await?
                             == SessionDisposition::Terminate
                         {
-                            break 'session;
+                            break 'session StationDisconnectReason::RegistrationRejected;
                         }
                     }
                 }
                 command = session_rx.recv() => {
-                    let Some(command) = command else { break };
+                    let Some(command) = command else {
+                        break StationDisconnectReason::ServerRetirement;
+                    };
                     if *retirement.borrow() == SessionAdmissionState::Retired {
                         unhandled_command = Some(command);
-                        break;
+                        break StationDisconnectReason::ServerRetirement;
                     }
                     let Some(state) = state.as_mut() else { continue };
                     if handle_session_command_result(&mut stream, state, command, &context).await? {
-                        break;
+                        break StationDisconnectReason::ServerRetirement;
                     }
                 }
                 changed = retirement.changed(), if state.is_some() => {
                     if changed.is_err() || *retirement.borrow() == SessionAdmissionState::Retired {
-                        break;
+                        break StationDisconnectReason::ServerRetirement;
                     }
                 }
                 _ = session_deadlines.tick(), if state.is_some() => {
                     if *retirement.borrow() == SessionAdmissionState::Retired {
-                        break;
+                        break StationDisconnectReason::ServerRetirement;
                     }
                     if let Some(state) = state.as_mut() {
                         handle_session_deadlines(&mut stream, state, &context, Instant::now()).await?;
@@ -3272,13 +3303,18 @@ async fn run_session(
                 }
                 _ = tokio::time::sleep_until(last_station_activity + keepalive_timeout), if state.is_some() => {
                     warn!(peer = %context.peer, "SCCP station activity timeout");
-                    break;
+                    break StationDisconnectReason::KeepaliveExpiry;
                 }
             }
-        }
-        Ok(())
+        };
+        Ok::<_, ServerError>(reason)
     }
     .await;
+
+    let (reason, result) = match result {
+        Ok(reason) => (reason, Ok(())),
+        Err(error) => (disconnect_reason_for_error(&error), Err(error)),
+    };
 
     admission.retire();
     if let Some(state) = state.as_ref() {
@@ -3287,7 +3323,23 @@ async fn run_session(
     if let Some(mut state) = state {
         finalize_session(&mut stream, &mut state, &context).await;
     }
-    result
+    SessionOutcome { reason, result }
+}
+
+#[derive(Debug)]
+struct SessionOutcome {
+    reason: StationDisconnectReason,
+    result: Result<(), ServerError>,
+}
+
+const fn disconnect_reason_for_error(error: &ServerError) -> StationDisconnectReason {
+    match error {
+        ServerError::Io(_) => StationDisconnectReason::IoFailure,
+        ServerError::Protocol(_) | ServerError::PhoneXml(_) => {
+            StationDisconnectReason::ProtocolFailure
+        }
+        _ => StationDisconnectReason::ServerFailure,
+    }
 }
 
 async fn reject_pending_session_commands(
@@ -4132,7 +4184,13 @@ async fn handle_client_message(
             }
         }
         ClientMessage::ButtonTemplateRequest => {
-            send_button_template(stream, &state.device, protocol).await?;
+            send_button_template(
+                stream,
+                &state.device,
+                protocol,
+                state.registration.device_type,
+            )
+            .await?;
         }
         ClientMessage::VersionRequest => {
             send_message(
@@ -4214,7 +4272,14 @@ async fn handle_client_message(
             index,
             capabilities,
         } => {
-            if let Some(mut message) = feature_status(&state.device, index, capabilities) {
+            if let Some(mut message) = feature_status_for_station(
+                &state.device,
+                index,
+                capabilities,
+                protocol,
+                state.registration.device_type,
+                state.features,
+            ) {
                 apply_cached_feature_projection(&state.feature_states, index, &mut message);
                 send_station_ui_message(stream, state, &message).await?;
             }
@@ -4798,6 +4863,27 @@ async fn handle_client_message(
                     ))
                     .await
                     .map_err(|_| ServerError::Stopped)?;
+            } else if matches!(stimulus, Stimulus::Privacy | Stimulus::MultiblinkFeature)
+                && state.device.recording_button(instance).is_some()
+            {
+                context
+                    .event_tx
+                    .send(Event::device(
+                        state.device.id.clone(),
+                        state.generation,
+                        DeviceEventKind::RecordingButton {
+                            instance: LineInstance::new(instance),
+                        },
+                    ))
+                    .await
+                    .map_err(|_| ServerError::Stopped)?;
+            } else if stimulus == Stimulus::MultiblinkFeature {
+                debug!(
+                    device_id = %state.device.id,
+                    instance,
+                    "ignoring unconfigured recording-button stimulus"
+                );
+                return Ok(());
             } else if stimulus == Stimulus::Privacy {
                 let configured = state.device.buttons.iter().any(|button| {
                     matches!(
@@ -5807,7 +5893,21 @@ async fn complete_on_hook(
     Ok(())
 }
 
+#[cfg(test)]
 fn button_template(device: &DeviceDefinition) -> Vec<ButtonTemplateEntry> {
+    button_template_for_station(device, ProtocolVersion::V15, DeviceType::Undefined)
+}
+
+fn recording_uses_multiblink(protocol: ProtocolVersion, device_type: DeviceType) -> bool {
+    protocol > ProtocolVersion::V15
+        && !matches!(device_type, DeviceType::Cisco8941 | DeviceType::Cisco8945)
+}
+
+fn button_template_for_station(
+    device: &DeviceDefinition,
+    protocol: ProtocolVersion,
+    device_type: DeviceType,
+) -> Vec<ButtonTemplateEntry> {
     let mut buttons = Vec::with_capacity(56);
     let mut addon_buttons_remaining = None;
     for button in &device.buttons {
@@ -5839,6 +5939,14 @@ fn button_template(device: &DeviceDefinition) -> Vec<ButtonTemplateEntry> {
                 instance: feature.instance,
                 button_type: ButtonType::from(feature.feature.wire_value()),
             },
+            ButtonDefinition::Recording(recording) => ButtonTemplateEntry {
+                instance: recording.instance,
+                button_type: if recording_uses_multiblink(protocol, device_type) {
+                    ButtonType::MultiblinkFeature
+                } else {
+                    ButtonType::Feature
+                },
+            },
             ButtonDefinition::Service(service) => ButtonTemplateEntry {
                 instance: service.instance,
                 button_type: ButtonType::ServiceUrl,
@@ -5867,16 +5975,26 @@ async fn send_button_template(
     stream: &mut dyn StationIo,
     device: &DeviceDefinition,
     session: impl Into<StationSessionContext>,
+    device_type: DeviceType,
 ) -> Result<(), ServerError> {
     let session = session.into();
-    for message in button_template_messages(device)? {
+    for message in button_template_messages_for_station(device, session.protocol, device_type)? {
         send_message(stream, &message, session).await?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn button_template_messages(device: &DeviceDefinition) -> Result<Vec<ServerMessage>, CodecError> {
-    let buttons = button_template(device);
+    button_template_messages_for_station(device, ProtocolVersion::V15, DeviceType::Undefined)
+}
+
+fn button_template_messages_for_station(
+    device: &DeviceDefinition,
+    protocol: ProtocolVersion,
+    device_type: DeviceType,
+) -> Result<Vec<ServerMessage>, CodecError> {
+    let buttons = button_template_for_station(device, protocol, device_type);
     let total = u32::try_from(buttons.len()).map_err(|_| {
         CodecError::InvalidDefinition(format!(
             "device {} button template is too large for SCCP",
@@ -5988,10 +6106,29 @@ fn speed_dial_status(device: &DeviceDefinition, instance: u32) -> ServerMessage 
     }
 }
 
+#[cfg(test)]
 fn feature_status(
     device: &DeviceDefinition,
     instance: u32,
+    capabilities: u32,
+) -> Option<ServerMessage> {
+    feature_status_for_station(
+        device,
+        instance,
+        capabilities,
+        ProtocolVersion::V15,
+        DeviceType::Undefined,
+        PhoneFeatures::empty(),
+    )
+}
+
+fn feature_status_for_station(
+    device: &DeviceDefinition,
+    instance: u32,
     _capabilities: u32,
+    protocol: ProtocolVersion,
+    device_type: DeviceType,
+    features: PhoneFeatures,
 ) -> Option<ServerMessage> {
     if let Some(speed_dial) = device.blf_button(instance) {
         return Some(ServerMessage::FeatureStatus {
@@ -5999,6 +6136,18 @@ fn feature_status(
             button_type: ButtonType::BlfSpeedDial,
             label: speed_dial.display_name.clone(),
             state: BusyLampFieldState::UnknownState.wire_value(),
+        });
+    }
+    if let Some(recording) = device.recording_button(instance) {
+        return Some(ServerMessage::FeatureStatus {
+            instance,
+            button_type: if recording_uses_multiblink(protocol, device_type) {
+                ButtonType::MultiblinkFeature
+            } else {
+                ButtonType::Feature
+            },
+            label: recording_button_label(&recording.label, RecordingButtonState::Off, features),
+            state: recording_button_status_word(RecordingButtonState::Off, protocol, device_type),
         });
     }
     device
@@ -6038,7 +6187,10 @@ fn cache_feature_projection(
     message: &ServerMessage,
 ) {
     let ServerMessage::FeatureStatus {
-        button_type, state, ..
+        button_type,
+        label,
+        state,
+        ..
     } = message
     else {
         debug_assert!(false, "feature projection cache requires FeatureStatus");
@@ -6048,6 +6200,7 @@ fn cache_feature_projection(
         instance,
         SessionFeatureState {
             button_type: *button_type,
+            label: label.clone(),
             state: *state,
         },
     );
@@ -6062,12 +6215,100 @@ fn apply_cached_feature_projection(
         return;
     };
     if let ServerMessage::FeatureStatus {
-        button_type, state, ..
+        button_type,
+        label,
+        state,
+        ..
     } = message
     {
         *button_type = cached.button_type;
+        label.clone_from(&cached.label);
         *state = cached.state;
     }
+}
+
+fn recording_button_status_word(
+    state: RecordingButtonState,
+    protocol: ProtocolVersion,
+    device_type: DeviceType,
+) -> u32 {
+    const ARMED_STATUS_WORD: u32 = 0x02_03_02;
+    const ACTIVE_STATUS_WORD: u32 = 0x03_02_03;
+    const ARMED_ACTIVE_STATUS_WORD: u32 = 0x03_02_05;
+
+    if !recording_uses_multiblink(protocol, device_type) {
+        return (state.is_armed() || state.is_active()) as u32;
+    }
+    match state {
+        RecordingButtonState::Off => 0,
+        RecordingButtonState::Armed => ARMED_STATUS_WORD,
+        RecordingButtonState::Active => ACTIVE_STATUS_WORD,
+        RecordingButtonState::ArmedActive => ARMED_ACTIVE_STATUS_WORD,
+    }
+}
+
+fn recording_button_label(
+    configured: &str,
+    state: RecordingButtonState,
+    features: PhoneFeatures,
+) -> String {
+    const ACTIVE_SUFFIX: &str = " (Recording)";
+    const MAX_DYNAMIC_FEATURE_LABEL_BYTES: usize = 120;
+    if !state.is_active() {
+        return configured.to_owned();
+    }
+    let capacity = if features.contains(PhoneFeatures::DYNAMIC_MESSAGES) {
+        MAX_DYNAMIC_FEATURE_LABEL_BYTES
+    } else {
+        crate::types::MAX_STATION_FEATURE_LABEL_BYTES
+    };
+    let encoded_len = |text: &str| {
+        if features.contains(PhoneFeatures::UTF8) {
+            text.len()
+        } else {
+            text.chars().count()
+        }
+    };
+    if encoded_len(configured) + ACTIVE_SUFFIX.len() <= capacity {
+        format!("{configured}{ACTIVE_SUFFIX}")
+    } else {
+        configured.to_owned()
+    }
+}
+
+fn recording_button_state_messages(
+    device: &DeviceDefinition,
+    instance: u32,
+    state: RecordingButtonState,
+    protocol: ProtocolVersion,
+    device_type: DeviceType,
+    features: PhoneFeatures,
+) -> Option<[ServerMessage; 2]> {
+    let recording = device.recording_button(instance)?;
+    let button_type = if recording_uses_multiblink(protocol, device_type) {
+        ButtonType::MultiblinkFeature
+    } else {
+        ButtonType::Feature
+    };
+    let lamp_mode = match state {
+        RecordingButtonState::Off => LampMode::Off,
+        RecordingButtonState::Armed => LampMode::On,
+        RecordingButtonState::Active => LampMode::Wink,
+        RecordingButtonState::ArmedActive => LampMode::Blink,
+    };
+    Some([
+        ServerMessage::FeatureStatus {
+            instance,
+            button_type,
+            label: recording_button_label(&recording.label, state, features),
+            state: recording_button_status_word(state, protocol, device_type),
+        },
+        ServerMessage::SetLamp {
+            stimulus: button_type,
+            instance,
+            mode: lamp_mode,
+        },
+    ])
 }
 
 /// Pack the three DND multiblink selectors used by v16+ stations.
@@ -7119,6 +7360,35 @@ async fn handle_session_command(
                         }
                     }
                 }
+                CommandAction::SetRecordingButtonStatus {
+                    state: recording_state,
+                } => {
+                    let instances = state
+                        .device
+                        .buttons
+                        .iter()
+                        .filter_map(|button| match button {
+                            ButtonDefinition::Recording(recording) => Some(recording.instance),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    for instance in instances {
+                        let Some(messages) = recording_button_state_messages(
+                            &state.device,
+                            instance,
+                            recording_state,
+                            protocol,
+                            state.registration.device_type,
+                            state.features,
+                        ) else {
+                            continue;
+                        };
+                        cache_feature_projection(&mut state.feature_states, instance, &messages[0]);
+                        for message in messages {
+                            send_station_ui_message(stream, state, &message).await?;
+                        }
+                    }
+                }
                 CommandAction::SetMobilityAppearance {
                     mobility_instance,
                     appearance,
@@ -7156,7 +7426,13 @@ async fn handle_session_command(
                         &next_appearances,
                     )?;
 
-                    send_button_template(stream, &candidate, protocol).await?;
+                    send_button_template(
+                        stream,
+                        &candidate,
+                        protocol,
+                        state.registration.device_type,
+                    )
+                    .await?;
                     if let Some(appearance) = &appearance {
                         if let Some(message) = line_status(&candidate, appearance.instance) {
                             send_station_ui_message(stream, state, &message).await?;

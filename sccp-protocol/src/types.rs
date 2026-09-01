@@ -489,6 +489,16 @@ pub struct FeatureDefinition {
     pub feature: crate::message::values::ButtonType,
 }
 
+pub(crate) const MAX_STATION_FEATURE_LABEL_BYTES: usize = 39;
+
+/// A programmable feature button that controls handset-scoped call recording.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordingButtonDefinition {
+    pub instance: u32,
+    /// Station-visible label used while recording is inactive.
+    pub label: String,
+}
+
 /// A programmable button that opens a phone-hosted HTTP service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceDefinition {
@@ -537,6 +547,7 @@ pub enum ButtonDefinition {
     SpeedDial(SpeedDialDefinition),
     BlfSpeedDial(BlfSpeedDialDefinition),
     Feature(FeatureDefinition),
+    Recording(RecordingButtonDefinition),
     Service(ServiceDefinition),
     AddonModule(AddonModuleDefinition),
     Unused,
@@ -911,22 +922,28 @@ impl DeviceDefinition {
                     self.id
                 )));
             }
-            if let ButtonDefinition::Line(appearance) = button {
-                if appearance.id.get() == 0 {
-                    return Err(CodecError::InvalidDefinition(format!(
-                        "device {} has a line appearance with identifier zero",
-                        self.id
-                    )));
+            match button {
+                ButtonDefinition::Line(appearance) => {
+                    if appearance.id.get() == 0 {
+                        return Err(CodecError::InvalidDefinition(format!(
+                            "device {} has a line appearance with identifier zero",
+                            self.id
+                        )));
+                    }
+                    if !appearance_ids.insert(appearance.id) {
+                        return Err(CodecError::InvalidDefinition(format!(
+                            "device {} repeats line appearance identifier {}",
+                            self.id, appearance.id
+                        )));
+                    }
                 }
-                if !appearance_ids.insert(appearance.id) {
-                    return Err(CodecError::InvalidDefinition(format!(
-                        "device {} repeats line appearance identifier {}",
-                        self.id, appearance.id
-                    )));
+                ButtonDefinition::Recording(recording) => {
+                    validate_recording_button_definition(&self.id, recording)?;
                 }
-            }
-            if let ButtonDefinition::Service(service) = button {
-                validate_service_definition(&self.id, service)?;
+                ButtonDefinition::Service(service) => {
+                    validate_service_definition(&self.id, service)?;
+                }
+                _ => {}
             }
         }
 
@@ -990,6 +1007,15 @@ impl DeviceDefinition {
         })
     }
 
+    pub(crate) fn recording_button(&self, instance: u32) -> Option<&RecordingButtonDefinition> {
+        self.buttons.iter().find_map(|button| match button {
+            ButtonDefinition::Recording(recording) if recording.instance == instance => {
+                Some(recording)
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn blf_button(&self, instance: u32) -> Option<&BlfSpeedDialDefinition> {
         self.buttons.iter().find_map(|button| match button {
             ButtonDefinition::BlfSpeedDial(blf) if blf.instance == instance => Some(blf),
@@ -998,17 +1024,31 @@ impl DeviceDefinition {
     }
 }
 
+fn validate_recording_button_definition(
+    device: &DeviceId,
+    recording: &RecordingButtonDefinition,
+) -> Result<(), CodecError> {
+    if recording.label.is_empty()
+        || recording.label.len() > MAX_STATION_FEATURE_LABEL_BYTES
+        || recording.label.chars().any(char::is_control)
+    {
+        return Err(CodecError::InvalidDefinition(format!(
+            "device {device} has an invalid recording-button label"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_service_definition(
     device: &DeviceId,
     service: &ServiceDefinition,
 ) -> Result<(), CodecError> {
     const MAX_SERVICE_URL_BYTES: usize = 255;
-    const MAX_SERVICE_LABEL_BYTES: usize = 39;
     const MAX_SERVICE_PARAMETERS: usize = 32;
     const MAX_SERVICE_PARAMETER_BYTES: usize = 128;
 
     if service.label.is_empty()
-        || service.label.len() > MAX_SERVICE_LABEL_BYTES
+        || service.label.len() > MAX_STATION_FEATURE_LABEL_BYTES
         || service.label.chars().any(char::is_control)
     {
         return Err(CodecError::InvalidDefinition(format!(
@@ -1057,6 +1097,7 @@ impl ButtonDefinition {
             Self::SpeedDial(definition) => Some((ButtonNamespace::SpeedDial, definition.instance)),
             Self::BlfSpeedDial(definition) => Some((ButtonNamespace::Feature, definition.instance)),
             Self::Feature(definition) => Some((ButtonNamespace::Feature, definition.instance)),
+            Self::Recording(definition) => Some((ButtonNamespace::Feature, definition.instance)),
             Self::Service(definition) => Some((ButtonNamespace::Service, definition.instance)),
             Self::AddonModule(definition) => Some((ButtonNamespace::AddonModule, definition.slot)),
             Self::Unused => None,
@@ -1487,6 +1528,10 @@ mod tests {
                     label: "DND".into(),
                     feature: crate::message::values::ButtonType::DoNotDisturb,
                 }),
+                ButtonDefinition::Recording(RecordingButtonDefinition {
+                    instance,
+                    label: "Record calls".into(),
+                }),
                 ButtonDefinition::Service(ServiceDefinition {
                     instance,
                     label: "Directory".into(),
@@ -1527,6 +1572,37 @@ mod tests {
             Err(CodecError::InvalidDefinition(message))
                 if message.contains("maximum wire instance is 255")
         ));
+    }
+
+    #[test]
+    fn station_definition_rejects_recording_labels_that_cannot_fit_legacy_status() {
+        let definition_with_label = |label: String| DeviceDefinition {
+            id: DeviceId::new("SEP001122334455").unwrap(),
+            description: "Desk".into(),
+            transport: StationTransportRequirement::Either,
+            signaling_qos: None,
+            buttons: vec![
+                line_button(1, "1001"),
+                ButtonDefinition::Recording(RecordingButtonDefinition { instance: 1, label }),
+            ],
+            soft_keys: SoftKeyProfile::default(),
+            ui: StationUiPolicy::default(),
+        };
+
+        definition_with_label("R".repeat(MAX_STATION_FEATURE_LABEL_BYTES))
+            .validate()
+            .unwrap();
+        for label in [
+            String::new(),
+            "bad\nlabel".into(),
+            "R".repeat(MAX_STATION_FEATURE_LABEL_BYTES + 1),
+        ] {
+            assert!(matches!(
+                definition_with_label(label).validate(),
+                Err(CodecError::InvalidDefinition(message))
+                    if message.contains("invalid recording-button label")
+            ));
+        }
     }
 
     #[test]

@@ -67,10 +67,9 @@ pub(super) fn packet_body(capture: &PacketCaptureSnapshot, diagnostic_event_id: 
             "capture": bounded_capture,
         }))
         .unwrap_or_default();
-        if body.len() <= MAX_REPORT_BODY_BYTES || bounded_capture.packets.is_empty() {
+        if body.len() <= MAX_REPORT_BODY_BYTES || !bounded_capture.discard_oldest() {
             return body;
         }
-        bounded_capture.packets.remove(0);
     }
 }
 

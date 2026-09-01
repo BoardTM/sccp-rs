@@ -2673,6 +2673,8 @@ async fn secondary_sessions_use_the_secondary_keepalive_deadline() {
     };
     let (server, handle, mut events, ingress) =
         Server::with_ingress(config, [definition()]).unwrap();
+    let (observation_tx, mut observations) = mpsc::channel(64);
+    let server = server.with_observation_sender(observation_tx);
     let task = tokio::spawn(server.run());
     let (server_stream, mut phone) = tokio::io::duplex(8_192);
     ingress
@@ -2723,9 +2725,148 @@ async fn secondary_sessions_use_the_secondary_keepalive_deadline() {
             ..
         }))
     ));
+    assert_eq!(
+        observed_disconnect_reason(&mut observations, 1).await,
+        StationDisconnectReason::KeepaliveExpiry
+    );
 
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn observations_distinguish_peer_closure_from_io_failure() {
+    let (server, handle, _events, ingress) =
+        Server::with_ingress(ServerConfig::default(), [definition()]).unwrap();
+    let (observation_tx, mut observations) = mpsc::channel(16);
+    let server = server.with_observation_sender(observation_tx);
+    let task = tokio::spawn(server.run());
+
+    let (server_stream, phone) = tokio::io::duplex(64);
+    ingress
+        .accept(
+            server_stream,
+            SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    drop(phone);
+    assert_eq!(
+        observed_disconnect_reason(&mut observations, 1).await,
+        StationDisconnectReason::PeerClosure
+    );
+
+    ingress
+        .accept(
+            FailingStationIo,
+            SocketAddr::from(([127, 0, 0, 1], 40_001)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        observed_disconnect_reason(&mut observations, 2).await,
+        StationDisconnectReason::IoFailure
+    );
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn observation_reports_deliberate_server_retirement() {
+    let (server, handle, mut events, ingress) =
+        Server::with_ingress(ServerConfig::default(), [definition()]).unwrap();
+    let (observation_tx, mut observations) = mpsc::channel(64);
+    let server = server.with_observation_sender(observation_tx);
+    let task = tokio::spawn(server.run());
+    let (server_stream, mut phone) = tokio::io::duplex(8_192);
+    ingress
+        .accept(
+            server_stream,
+            SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            SocketAddr::from(([127, 0, 0, 1], 2_000)),
+            StationTransport::Clear,
+        )
+        .await
+        .unwrap();
+    let protocol = ProtocolVersion::V22;
+    phone.write_all(&register_bytes(protocol)).await.unwrap();
+    let mut decoder = FrameDecoder::new();
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            event: DeviceEventKind::Registered(_),
+            ..
+        }))
+    ));
+
+    handle.shutdown().await.unwrap();
+    assert_eq!(
+        observed_disconnect_reason(&mut observations, 1).await,
+        StationDisconnectReason::ServerRetirement
+    );
+    task.await.unwrap().unwrap();
+}
+
+async fn observed_disconnect_reason(
+    observations: &mut mpsc::Receiver<ServerObservation>,
+    expected_connection_id: u64,
+) -> StationDisconnectReason {
+    while let Some(observation) = observations.recv().await {
+        if let ServerObservationKind::Disconnected {
+            connection_id,
+            reason,
+        } = observation.kind
+            && connection_id.get() == expected_connection_id
+        {
+            return reason;
+        }
+    }
+    panic!("observation stream ended before connection {expected_connection_id} disconnected")
+}
+
+struct FailingStationIo;
+
+impl tokio::io::AsyncRead for FailingStationIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+        _buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "injected station read failure",
+        )))
+    }
+}
+
+impl tokio::io::AsyncWrite for FailingStationIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 #[tokio::test]

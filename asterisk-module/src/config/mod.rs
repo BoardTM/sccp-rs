@@ -65,9 +65,10 @@ use sccp_protocol::{
     AddonModuleDefinition, AppearanceRingMode, AudioProcessingPolicy, BlfSpeedDialDefinition,
     ButtonDefinition, ButtonType, Codec, CodecKind, DateTemplate, DeviceDefinition, DeviceId,
     DeviceType, DtmfMode, EchoCancellation, FeatureDefinition, KeyMode, LampMode, LegacyCodePage,
-    LineAppearance, LineDefinition, RingerMode, ServiceDefinition, SignalingQos,
-    SignalingServerRoute, SilenceSuppression, SoftKey, SoftKeyProfile as StationSoftKeyProfile,
-    SpeedDialDefinition, StationTransportRequirement, StationUiPolicy, Tone,
+    LineAppearance, LineDefinition, RecordingButtonDefinition, RingerMode, ServiceDefinition,
+    SignalingQos, SignalingServerRoute, SilenceSuppression, SoftKey,
+    SoftKeyProfile as StationSoftKeyProfile, SpeedDialDefinition, StationTransportRequirement,
+    StationUiPolicy, Tone,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1583,6 +1584,19 @@ impl ModuleConfig {
                         },
                     ))
                 }
+                _ => None,
+            })
+        })
+    }
+
+    /// Returns every physical recording control in station layout order.
+    pub fn recording_buttons_for_device<'a>(
+        &'a self,
+        device: &DeviceId,
+    ) -> impl Iterator<Item = &'a RecordingButtonDefinition> + 'a {
+        self.devices.get(device).into_iter().flat_map(|device| {
+            device.buttons.iter().filter_map(|button| match button {
+                ButtonDefinition::Recording(recording) => Some(recording),
                 _ => None,
             })
         })

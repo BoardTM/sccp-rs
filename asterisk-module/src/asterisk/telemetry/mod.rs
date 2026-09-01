@@ -240,9 +240,10 @@ fn handle_observation(observation: ServerObservation, packets: &mut PacketCaptur
             device_id.to_string(),
             session_generation.get(),
         ),
-        ServerObservationKind::Disconnected { connection_id } => {
-            packets.disconnected(connection_id)
-        }
+        ServerObservationKind::Disconnected {
+            connection_id,
+            reason,
+        } => packets.disconnected(observation_id, observed_at_unix_ms, connection_id, reason),
         _ => {}
     }
 }

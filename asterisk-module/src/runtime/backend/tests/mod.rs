@@ -11,7 +11,7 @@ use crate::config::HintTarget;
 use crate::config::LineConfig;
 use crate::media::recording::{
     RecordingCallback, RecordingDirection, RecordingEvent, RecordingProvider,
-    RecordingSessionControl, RecordingState,
+    RecordingSessionControl, RecordingState, RecordingTarget,
 };
 use crate::presence::blf::{HintCallback, HintSnapshot};
 use crate::presence::hints::HintProvider;
@@ -1475,7 +1475,7 @@ fn direct_capabilities_preserve_typed_requests_callbacks_and_sessions() {
         .recordings()
         .start_recording(
             PbxCallId(7),
-            "call.wav",
+            RecordingTarget::ExplicitlyNamed("call.wav".into()),
             "b",
             Arc::new(move |event| callback_events.lock().unwrap().push(event)),
         )
@@ -1499,7 +1499,11 @@ fn direct_capabilities_preserve_typed_requests_callbacks_and_sessions() {
             ServiceRequest::Delete("driver".into(), "device/dnd".into()),
             ServiceRequest::HintLookup("internal".into(), "1001".into()),
             ServiceRequest::HintSubscribe("internal".into(), "1001".into()),
-            ServiceRequest::RecordingStart(PbxCallId(7), "call.wav".into(), "b".into()),
+            ServiceRequest::RecordingStart(
+                PbxCallId(7),
+                RecordingTarget::ExplicitlyNamed("call.wav".into()),
+                "b".into()
+            ),
             ServiceRequest::RecordingId,
             ServiceRequest::RecordingState,
             ServiceRequest::RecordingMute(RecordingDirection::Both, true),
@@ -1552,7 +1556,12 @@ fn every_direct_capability_propagates_its_backend_error() {
     assert_eq!(
         backend
             .recordings()
-            .start_recording(PbxCallId(7), "call.wav", "", Arc::new(|_| {}))
+            .start_recording(
+                PbxCallId(7),
+                RecordingTarget::ExplicitlyNamed("call.wav".into()),
+                "",
+                Arc::new(|_| {}),
+            )
             .err(),
         Some(FakeError("recording:start"))
     );
@@ -1561,7 +1570,12 @@ fn every_direct_capability_propagates_its_backend_error() {
     let session_backend = backend_with_services(session_harness.clone());
     let mut recording = session_backend
         .recordings()
-        .start_recording(PbxCallId(8), "call.wav", "", Arc::new(|_| {}))
+        .start_recording(
+            PbxCallId(8),
+            RecordingTarget::ExplicitlyNamed("call.wav".into()),
+            "",
+            Arc::new(|_| {}),
+        )
         .unwrap();
     session_harness.fail("recording:id");
     assert_eq!(recording.id().unwrap_err(), FakeError("recording:id"));
@@ -1617,7 +1631,7 @@ fn direct_capabilities_run_after_controller_locks_are_released() {
         .recordings()
         .start_recording(
             PbxCallId(1),
-            "call.wav",
+            RecordingTarget::Automatic,
             "",
             Arc::new(move |_| {
                 assert!(

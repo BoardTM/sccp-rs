@@ -6,9 +6,9 @@ use super::super::{
     cancel_conference_announcement, cancel_forwarding_entry_for_device, configured_feature_state,
     controller_step, execute_cleanup_effects, install_blf, log_feature_store_error,
     prune_recording_sessions, publish_ami_event, publish_device_features, publish_device_lines,
-    registered_device_ids, registration_event, registration_state_or_fallback,
-    restore_mobility_appearances, restore_system_message, show_conference_list,
-    uninstall_device_blf,
+    publish_recording_button_state, registered_device_ids, registration_event,
+    registration_state_or_fallback, restore_mobility_appearances, restore_system_message,
+    show_conference_list, uninstall_device_blf,
 };
 
 pub(super) async fn handle_session_event(
@@ -150,6 +150,7 @@ pub(super) async fn handle_session_event(
                 install_blf(access, &device);
                 publish_device_lines(access, &device);
                 publish_device_features(access, &device, &features);
+                publish_recording_button_state(access, recordings, &device);
                 drop(feature_guard);
                 publish_ami_event(access, &registered_event);
                 restore_system_message(access, &device).await;

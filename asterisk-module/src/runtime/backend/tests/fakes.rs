@@ -34,7 +34,7 @@ pub(super) enum ServiceRequest {
     Delete(String, String),
     HintLookup(String, String),
     HintSubscribe(String, String),
-    RecordingStart(PbxCallId, String, String),
+    RecordingStart(PbxCallId, RecordingTarget, String),
     RecordingId,
     RecordingState,
     RecordingMute(RecordingDirection, bool),
@@ -210,13 +210,13 @@ impl RecordingProvider for FakeRecordings {
     fn start_recording(
         &self,
         call_id: PbxCallId,
-        filename: &str,
+        target: RecordingTarget,
         options: &str,
         callback: RecordingCallback,
     ) -> Result<Self::Session, Self::StartError> {
         self.harness.record(
             "recording:start",
-            ServiceRequest::RecordingStart(call_id, filename.into(), options.into()),
+            ServiceRequest::RecordingStart(call_id, target, options.into()),
         )?;
         callback(RecordingEvent::Started);
         Ok(FakeRecordingSession {

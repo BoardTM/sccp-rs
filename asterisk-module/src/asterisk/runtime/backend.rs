@@ -14,17 +14,17 @@ use super::{
     PARKING_NOTIFICATION_TIME, ParkingOperation, PartyUpdateError, PbxBackendError, PbxBridgeId,
     PbxCallId, PbxEffect, PbxServiceCapabilities, PendingParkingNotification, PhoneCallState,
     PhoneCommand, PhoneCommandAction, PickupOperation, ReceiveChannelPurpose, RecordingError,
-    RedirectReasonCode, RedirectingUpdate, RemoteHangupPlan, RuntimeCallSignalDeliveryError,
-    RuntimeCallSignalDeliveryResult, Shared, Weak, allocate_announcement_generation,
-    announcement_generation_is_current, ast_log, audio_framing, c_string, cancel_no_answer_timer,
-    channel_availability, configured_audio_processing, configured_audio_traffic_class,
-    configured_dtmf_mode, controller_step, direct_media_call, execute_backend_cleanup_effects,
-    handset_effect_call_id, local_media_endpoint, native_audio_format, native_bridging,
-    native_channel, pbx_audio_format, publish_ami_event, publish_line, redirected_call_update,
-    remove_channel, replacement_anchor_plan, restore_attempts_exhausted,
-    restore_redirecting_update, show_conference_list, start_announcement,
-    take_pending_retrieval_by_pbx, validate_native_channel_metadata, validate_redirecting_update,
-    with_channel,
+    RecordingTarget, RedirectReasonCode, RedirectingUpdate, RemoteHangupPlan,
+    RuntimeCallSignalDeliveryError, RuntimeCallSignalDeliveryResult, Shared, Weak,
+    allocate_announcement_generation, announcement_generation_is_current, ast_log, audio_framing,
+    c_string, cancel_no_answer_timer, channel_availability, configured_audio_processing,
+    configured_audio_traffic_class, configured_dtmf_mode, controller_step, direct_media_call,
+    execute_backend_cleanup_effects, handset_effect_call_id, local_media_endpoint,
+    native_audio_format, native_bridging, native_channel, pbx_audio_format, publish_ami_event,
+    publish_line, redirected_call_update, remove_channel, replacement_anchor_plan,
+    restore_attempts_exhausted, restore_redirecting_update, show_conference_list,
+    start_announcement, take_pending_retrieval_by_pbx, validate_native_channel_metadata,
+    validate_redirecting_update, with_channel,
 };
 use super::{
     AsteriskRecording, BridgeBackend, CString, CallDirection, CallInfo, CallServiceBackend,
@@ -111,6 +111,7 @@ pub async fn execute_answer_call_transition(access: &Access, transition: CallTra
     let committed = execute_call_transition(access, transition).await;
     if committed {
         cancel_no_answer_timer(access, pbx_id);
+        access.enqueue_recording_eligibility(pbx_id);
     }
     committed
 }

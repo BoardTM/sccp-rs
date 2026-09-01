@@ -2,6 +2,7 @@ use super::backend::{
     AnchoredRecordingSession, ConfirmedRecordingAnchor, MediaAnchorMutation, PendingRecordingAnchor,
 };
 use super::media::{prepare_anchor_retarget, prepare_direct_retarget};
+use super::recording::enqueue_recording_session_change;
 use super::{
     Access, AsteriskBackend, BlfEvent, CallId, CallState, ControlProviderError, DeviceId,
     DriverEffect, Duration, EffectExecutionError, HandsetEffect, HashMap, HashSet, Instant,
@@ -23,9 +24,10 @@ use super::{
     ConferenceEndRejection, ConferenceId, ConferenceParticipantRejection, ConferencePhase,
     ControlOperation, ControlOutcome, LineInstance, MessageTarget, PARKING_CONFIRM_TIMEOUT,
     ParkingRejection, ParticipantId, PbxAudioFormat, PbxServiceCapabilities, PendingPark,
-    RecordingCallback, RecordingDirection, RecordingEvent, RecordingProvider,
-    RecordingRegistryError, RecordingSessionControl, RecordingTogglePlan, RecordingToggleRejection,
-    ResetMode, ResetTarget, ResetType, RuntimeRecordings, begin_parking_retrieval,
+    RecordingButtonState, RecordingCallback, RecordingDirection, RecordingEvent, RecordingProvider,
+    RecordingRegistryError, RecordingSessionControl, RecordingTarget, RecordingTogglePlan,
+    RecordingToggleRejection, ResetMode, ResetTarget, ResetType, RuntimeRecordingOwner,
+    RuntimeRecordingSession, RuntimeRecordingTrigger, RuntimeRecordings, begin_parking_retrieval,
     execute_call_transition_result, ordered_recording_start, ordered_recording_stop,
     plan_recording_toggle, preferred_codec, registered_device_ids, remove_conference_participant,
     set_conference_participant_moderator, set_conference_participant_muted,
@@ -39,7 +41,7 @@ mod recording;
 struct RecordingServiceRequest {
     command: AmiRecordingCommand,
     call_id: PbxCallId,
-    filename: Option<String>,
+    target: Option<RecordingTarget>,
     append: bool,
     bridged_only: bool,
     direction: Option<RecordingDirection>,
@@ -48,8 +50,9 @@ struct RecordingServiceRequest {
 pub use conference::{conference_participant_service_error, conference_service_operation};
 pub use control::{handle_control_operation, restore_system_message};
 pub use parking::{parking_service_error, parking_service_operation};
+pub(super) use recording::publish_recording_button_state;
 pub use recording::toggle_monitor_recording;
-use recording::{recording_service_operation, restore_recording_session};
+use recording::{handle_recording_trigger, recording_service_operation, restore_recording_session};
 
 pub async fn run_events(
     access: Access,
@@ -58,6 +61,7 @@ pub async fn run_events(
     mut parking_events: mpsc::UnboundedReceiver<ParkingEvent>,
     mut control_requests: mpsc::UnboundedReceiver<RuntimeControlRequest>,
     mut service_requests: mpsc::UnboundedReceiver<RuntimeServiceRequest>,
+    mut recording_triggers: mpsc::Receiver<()>,
 ) {
     let mut recording_sessions = RuntimeRecordings::default();
     let mut deadlines = tokio::time::interval(Duration::from_millis(100));
@@ -90,6 +94,12 @@ pub async fn run_events(
                     request.operation,
                 ).await;
                 let _ = request.response.send(result);
+            }
+            wake = recording_triggers.recv() => {
+                let Some(()) = wake else { return; };
+                for trigger in access.take_recording_triggers() {
+                    handle_recording_trigger(&access, &mut recording_sessions, trigger).await;
+                }
             }
             _ = deadlines.tick() => {
                 retry_blf(&access, Instant::now());
@@ -185,6 +195,9 @@ pub async fn handle_runtime_call_signal(access: &Access, signal: RuntimeCallSign
                 cancel_no_answer_timer(access, signal.pbx_id);
             }
             let delivered = execute_effects_confirmed(access, actions).await;
+            if delivered.is_ok() {
+                access.enqueue_recording_eligibility(signal.pbx_id);
+            }
             let _ = completion.send(delivered);
         }
         RuntimeCallSignalKind::Hangup { handset_call_id } => {
@@ -330,27 +343,76 @@ pub async fn handle_runtime_hangup_signal(
 }
 
 pub async fn prune_recording_sessions(access: &Access, recordings: &mut RuntimeRecordings) {
-    let recordings = &mut recordings.sessions;
     let live = controller_step(&access.shared.controller, |controller| {
         controller
             .calls()
             .map(|call| call.pbx_id)
             .collect::<HashSet<_>>()
     });
-    let finished = recordings.extract_if(|call_id, session| {
+    recordings.retain_live_calls(&live);
+    let finished = recordings.sessions.extract_if(|call_id, session| {
         !live.contains(&call_id) || matches!(session.state(), Ok(RecordingState::Stopped))
     });
-    for (call_id, mut session) in finished {
-        if !live.contains(&call_id) {
-            let _ = session.stop_native();
-            session.release_anchor();
-            continue;
-        }
+    for (call_id, session) in finished {
+        finalize_recording_session(
+            access,
+            recordings,
+            call_id,
+            session,
+            live.contains(&call_id),
+        )
+        .await;
+    }
+}
+
+async fn prune_recording_session(
+    access: &Access,
+    recordings: &mut RuntimeRecordings,
+    call_id: PbxCallId,
+) {
+    let live = controller_step(&access.shared.controller, |controller| {
+        controller.calls().any(|call| call.pbx_id == call_id)
+    });
+    if !live {
+        recordings.forget_call(call_id);
+    }
+    let finished = recordings.sessions.extract_if(|candidate, session| {
+        candidate == call_id && (!live || matches!(session.state(), Ok(RecordingState::Stopped)))
+    });
+    for (call_id, session) in finished {
+        finalize_recording_session(access, recordings, call_id, session, live).await;
+    }
+}
+
+async fn finalize_recording_session(
+    access: &Access,
+    recordings: &mut RuntimeRecordings,
+    call_id: PbxCallId,
+    mut session: RuntimeRecordingSession,
+    live: bool,
+) {
+    let owner = session.owner().clone();
+    if !live {
+        let _ = session.stop_native();
+        session.release_anchor();
+        recordings.forget_call(call_id);
+    } else {
+        recordings.suppress_automatic_start(call_id);
         let mutation = MediaAnchorMutation::acquire(access).await;
         if let Err((_, session)) = restore_recording_session(access, session, &mutation).await {
-            let _ = recordings.insert(call_id, session);
+            let _ = recordings.sessions.insert(call_id, session);
+            publish_recording_button_state(access, recordings, &owner.device_id);
+            return;
         }
     }
+    access.spawn_phone(PhoneCommand::new(
+        owner.device_id.clone(),
+        PhoneCommandAction::SetRecordingStatus {
+            call_id: owner.handset_call_id,
+            active: false,
+        },
+    ));
+    publish_recording_button_state(access, recordings, &owner.device_id);
 }
 
 pub async fn handle_service_operation(
@@ -376,7 +438,7 @@ pub async fn handle_service_operation(
                 RecordingServiceRequest {
                     command,
                     call_id,
-                    filename,
+                    target: filename.map(RecordingTarget::ExplicitlyNamed),
                     append,
                     bridged_only,
                     direction,

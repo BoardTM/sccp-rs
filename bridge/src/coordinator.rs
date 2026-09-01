@@ -358,6 +358,7 @@ impl Coordinator {
             }
             DeviceEventKind::FeatureButton { .. }
             | DeviceEventKind::DoNotDisturbButton { .. }
+            | DeviceEventKind::RecordingButton { .. }
             | DeviceEventKind::MobilityButton { .. }
             | DeviceEventKind::VoicemailButton { .. } => {}
             DeviceEventKind::ParkingLotButton { .. }

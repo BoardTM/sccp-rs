@@ -57,7 +57,7 @@ impl<S: PersistentStore> FeatureStore<S> {
         device: &DeviceId,
     ) -> Result<Option<DeviceFeatureState>, FeatureStoreError> {
         configured_feature_state(config, device)
-            .map(|defaults| self.load(device, &defaults))
+            .map(|defaults| self.load_configured(config, device, &defaults))
             .transpose()
     }
 
@@ -74,7 +74,8 @@ impl<S: PersistentStore> FeatureStore<S> {
             .map(|device| {
                 let defaults = configured_feature_state(config, &device)
                     .expect("device came from the same configuration");
-                self.load(&device, &defaults).map(|state| (device, state))
+                self.load_configured(config, &device, &defaults)
+                    .map(|state| (device, state))
             })
             .collect()
     }
@@ -106,6 +107,25 @@ impl<S: PersistentStore> FeatureStore<S> {
         device: &DeviceId,
         defaults: &DeviceFeatureState,
     ) -> Result<DeviceFeatureState, FeatureStoreError> {
+        self.load_fields(device, defaults, true)
+    }
+
+    fn load_configured(
+        &self,
+        config: &ModuleConfig,
+        device: &DeviceId,
+        defaults: &DeviceFeatureState,
+    ) -> Result<DeviceFeatureState, FeatureStoreError> {
+        let recording_configured = config.recording_buttons_for_device(device).next().is_some();
+        self.load_fields(device, defaults, recording_configured)
+    }
+
+    fn load_fields(
+        &self,
+        device: &DeviceId,
+        defaults: &DeviceFeatureState,
+        recording_configured: bool,
+    ) -> Result<DeviceFeatureState, FeatureStoreError> {
         let mut state = defaults.clone();
 
         if let Some(value) = self.get(device, "dnd")? {
@@ -113,6 +133,9 @@ impl<S: PersistentStore> FeatureStore<S> {
         }
         if let Some(value) = self.get(device, "privacy")? {
             state.privacy = parse_bool(device, "privacy", &value)?;
+        }
+        if recording_configured && let Some(value) = self.get(device, "recording/armed")? {
+            state.recording_armed = parse_bool(device, "recording/armed", &value)?;
         }
         state.forwarding.all = self.load_forwarding(device, "forward/all", state.forwarding.all)?;
         state.forwarding.busy =
@@ -163,6 +186,12 @@ impl<S: PersistentStore> FeatureStore<S> {
                 "privacy",
                 state.privacy != defaults.privacy,
                 encode_bool(state.privacy),
+            ),
+            Self::scalar_write(
+                device,
+                "recording/armed",
+                state.recording_armed != defaults.recording_armed,
+                encode_bool(state.recording_armed),
             ),
             Self::forwarding_write(
                 device,
@@ -317,6 +346,7 @@ pub fn configured_feature_state(
             ConfigDndMode::Reject => DndMode::Reject,
         },
         privacy: defaults.privacy,
+        recording_armed: false,
         forwarding: ForwardingState {
             all: defaults.forwarding.all.clone(),
             busy: defaults.forwarding.busy.clone(),
@@ -510,6 +540,7 @@ mod tests {
         DeviceFeatureState {
             dnd: DndMode::Off,
             privacy: false,
+            recording_armed: false,
             forwarding: ForwardingState {
                 all: None,
                 busy: Some(forwarding("9000")),
@@ -579,6 +610,30 @@ mod tests {
         .unwrap()
     }
 
+    fn configured_recording_button(include_button: bool) -> ModuleConfig {
+        let button = if include_button {
+            "button = feature, Record calls, monitor"
+        } else {
+            ""
+        };
+        ModuleConfig::parse(&format!(
+            r#"
+            [general]
+            advertised_address = 192.0.2.10
+
+            [SEP001122334455]
+            type = device
+            {button}
+            line = 1001
+
+            [1001]
+            type = line
+            label = Desk
+            "#
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn round_trips_typed_overrides_with_stable_keys() {
         let repository = FeatureStore::new(MemoryStore::default());
@@ -586,6 +641,7 @@ mod tests {
         let state = DeviceFeatureState {
             dnd: DndMode::Reject,
             privacy: true,
+            recording_armed: true,
             forwarding: ForwardingState {
                 all: Some(forwarding("2000")),
                 busy: None,
@@ -608,6 +664,13 @@ mod tests {
                     (
                         FEATURE_FAMILY.into(),
                         "device/SEP001122334455/privacy".into()
+                    ),
+                    "true".into()
+                ),
+                (
+                    (
+                        FEATURE_FAMILY.into(),
+                        "device/SEP001122334455/recording/armed".into()
                     ),
                     "true".into()
                 ),
@@ -657,6 +720,7 @@ mod tests {
         let changed = DeviceFeatureState {
             dnd: DndMode::Silent,
             privacy: true,
+            recording_armed: true,
             forwarding: ForwardingState {
                 all: Some(forwarding("2000")),
                 busy: None,
@@ -687,6 +751,40 @@ mod tests {
     }
 
     #[test]
+    fn recording_armed_restores_semantically_and_removal_cleans_the_override() {
+        let storage = MemoryStore::default();
+        storage.insert(
+            FEATURE_FAMILY,
+            "device/SEP001122334455/recording/armed",
+            "true",
+        );
+        let repository = FeatureStore::new(storage);
+        let with_button = configured_recording_button(true);
+        let armed = repository
+            .load_configured_device(&with_button, &device())
+            .unwrap()
+            .unwrap();
+        assert!(armed.recording_armed);
+
+        repository.storage().insert(
+            FEATURE_FAMILY,
+            "device/SEP001122334455/recording/armed",
+            "stale-invalid-value",
+        );
+        let without_button = configured_recording_button(false);
+        let disarmed = repository.load_configuration(&without_button).unwrap();
+        assert!(!disarmed[&device()].recording_armed);
+        repository
+            .reconcile_configuration(&without_button, &disarmed)
+            .unwrap();
+
+        assert!(!repository.storage().snapshot().contains_key(&(
+            FEATURE_FAMILY.into(),
+            "device/SEP001122334455/recording/armed".into()
+        )));
+    }
+
+    #[test]
     fn failed_multi_key_mutation_restores_the_previous_persisted_state() {
         let storage = MemoryStore::default();
         storage.insert(FEATURE_FAMILY, "device/SEP001122334455/privacy", "true");
@@ -696,6 +794,7 @@ mod tests {
         let changed = DeviceFeatureState {
             dnd: DndMode::Reject,
             privacy: false,
+            recording_armed: true,
             forwarding: ForwardingState {
                 all: Some(forwarding("2000")),
                 busy: None,

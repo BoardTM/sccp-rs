@@ -1078,6 +1078,7 @@ mod tests {
         let current = DeviceFeatureState {
             dnd: DndMode::Silent,
             privacy: true,
+            recording_armed: false,
             forwarding: crate::runtime::controller::ForwardingState {
                 all: Some(
                     crate::call::forwarding::ForwardingDestination::new("private-forward").unwrap(),

@@ -578,6 +578,35 @@ mod tests {
     }
 
     #[test]
+    fn recording_button_changes_reconnect_only_the_owning_device() {
+        let previous = two_devices("", "");
+        let next = config(
+            "",
+            "",
+            r#"
+            [SEP001122334455]
+            type = device
+            line = 1001
+            button = feature, Record calls, monitor
+
+            [SEP112233445566]
+            type = device
+            line = 1002
+            "#,
+        );
+
+        for plan in [
+            ReloadPlan::build(&previous, &next),
+            ReloadPlan::build(&next, &previous),
+        ] {
+            assert_eq!(plan.changed, [DeviceId::new("SEP001122334455").unwrap()]);
+            assert!(plan.added.is_empty());
+            assert!(plan.removed.is_empty());
+            assert!(plan.restart_required.is_empty());
+        }
+    }
+
+    #[test]
     fn line_change_reconnects_only_appearances_of_that_logical_line() {
         let previous = two_devices("", "context = before");
         let next = two_devices("", "context = after");

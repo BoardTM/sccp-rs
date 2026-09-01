@@ -3,7 +3,8 @@
 use super::{
     Access, AsteriskChannel, AsteriskRecording, DirectMediaCall, MediaAnchorReason, MutexExt as _,
     NonNull, PbxCallId, RecordingCallback, RecordingDirection, RecordingError, RecordingProvider,
-    RecordingSession, RecordingSessionControl, RecordingState, direct_media_call, with_channel,
+    RecordingSession, RecordingSessionControl, RecordingState, RecordingTarget, direct_media_call,
+    with_channel,
 };
 use super::{MediaAnchorLease, MediaAnchorMutation};
 
@@ -151,7 +152,7 @@ impl RecordingProvider for AsteriskRecordingService<'_> {
     fn start_recording(
         &self,
         call_id: PbxCallId,
-        filename: &str,
+        target: RecordingTarget,
         options: &str,
         callback: RecordingCallback,
     ) -> Result<Self::Session, Self::StartError> {
@@ -159,7 +160,7 @@ impl RecordingProvider for AsteriskRecordingService<'_> {
             let channel = unsafe { AsteriskChannel::from_raw(channel.cast()) }
                 .map_err(|_| AsteriskRecordingServiceError::CallUnavailable(call_id))?;
             AsteriskRecording::new()
-                .start(&channel, filename, options, move |event| callback(event))
+                .start(&channel, target, options, move |event| callback(event))
                 .map_err(AsteriskRecordingServiceError::Recording)
         })
         .unwrap_or(Err(AsteriskRecordingServiceError::CallUnavailable(call_id)))
