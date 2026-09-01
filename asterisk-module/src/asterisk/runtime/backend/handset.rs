@@ -428,11 +428,7 @@ pub async fn execute_handset_effect(access: &Access, effect: HandsetEffect) -> R
             if answer {
                 let framing = audio_framing(access, &device_id, call_id, codec)
                     .map_err(|error| error.to_string())?;
-                // The RTP instance remains anchored on the Asterisk channel.
-                // Do not constrain the handset's receive channel to the
-                // advertised server endpoint: SCCP's wildcard source is
-                // required when the media path traverses NAT.
-                receive_media_source(access, &device_id, call_id, codec)?;
+                let source = receive_media_source(access, &device_id, call_id, codec)?;
                 let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
                 let audio_processing = configured_audio_processing(access, &device_id, call_id);
                 access
@@ -457,7 +453,7 @@ pub async fn execute_handset_effect(access: &Access, effect: HandsetEffect) -> R
                         PhoneCommandAction::OpenReceiveChannel {
                             call_id,
                             purpose: ReceiveChannelPurpose::Media,
-                            source: None,
+                            source: Some(source),
                             codec,
                             packet_ms: framing.packet_ms,
                             max_frames_per_packet: framing.max_frames_per_packet,

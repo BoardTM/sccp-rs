@@ -3672,7 +3672,7 @@ async fn outbound_media_writes_receive_then_transmit_without_an_ack_boundary() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn receive_acknowledgement_timeout_retires_only_a_silent_session() {
+async fn receive_acknowledgement_timeout_preserves_a_silent_session() {
     let device = definition();
     let device_id = device.id.clone();
     let config = ServerConfig {
@@ -3886,14 +3886,12 @@ async fn receive_acknowledgement_timeout_retires_only_a_silent_session() {
             ..
         })) if session_generation == generation && actual_call_id == call_id
     ));
-    assert!(matches!(
-        events.recv().await,
-        Some(Event::Device(DeviceEvent {
-            session_generation,
-            event: DeviceEventKind::Disconnected {},
-            ..
-        })) if session_generation == generation
-    ));
+    phone
+        .write_all(&ClientMessage::KeepAlive.encode(protocol).unwrap())
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::KEEP_ALIVE_ACK).await;
+    assert!(events.try_recv().is_err());
 
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
@@ -4622,7 +4620,6 @@ fn handset_acknowledgement_deadlines_are_bounded_ordered_and_exactly_once() {
             },
             ExpiredHandsetAcknowledgement::Receive {
                 call_id: CallId(20),
-                activity_generation: 0,
             },
         ]
     );
@@ -4643,18 +4640,6 @@ fn handset_acknowledgement_deadlines_are_bounded_ordered_and_exactly_once() {
     assert!(expire_handset_acknowledgements(&mut calls, now).is_empty());
     assert!(expire_handset_acknowledgements(&mut calls, now + Duration::from_millis(1)).is_empty());
     assert!(expire_handset_acknowledgements(&mut calls, now + Duration::from_secs(1)).is_empty());
-}
-
-#[test]
-fn receive_timeout_retires_only_a_silent_station_session() {
-    assert_eq!(
-        receive_timeout_disposition(7, 7),
-        SessionDisposition::Terminate
-    );
-    assert_eq!(
-        receive_timeout_disposition(8, 7),
-        SessionDisposition::Continue
-    );
 }
 
 #[test]

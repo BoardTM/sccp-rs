@@ -1326,9 +1326,7 @@ pub async fn begin_handset_media(
     admit_clear_audio_media(access, &device_id, call_id)?;
     let framing =
         audio_framing(access, &device_id, call_id, codec).map_err(|error| error.to_string())?;
-    // Validate that Asterisk has an RTP instance, but leave the SCCP source
-    // filter unrestricted so NAT does not prevent the phone opening media.
-    receive_media_source(access, &device_id, call_id, codec)?;
+    let source = receive_media_source(access, &device_id, call_id, codec)?;
     let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
     let audio_processing = configured_audio_processing(access, &device_id, call_id);
     if state != PhoneCallState::Connected {
@@ -1363,7 +1361,7 @@ pub async fn begin_handset_media(
             PhoneCommandAction::OpenReceiveChannel {
                 call_id,
                 purpose: ReceiveChannelPurpose::Media,
-                source: None,
+                source: Some(source),
                 codec,
                 packet_ms: framing.packet_ms,
                 max_frames_per_packet: framing.max_frames_per_packet,
@@ -1387,7 +1385,7 @@ pub async fn begin_answer_media(
     admit_clear_audio_media(access, &device_id, call_id)?;
     let framing =
         audio_framing(access, &device_id, call_id, codec).map_err(|error| error.to_string())?;
-    receive_media_source(access, &device_id, call_id, codec)?;
+    let source = receive_media_source(access, &device_id, call_id, codec)?;
     let dtmf_mode = configured_dtmf_mode(access, &device_id, call_id);
     let audio_processing = configured_audio_processing(access, &device_id, call_id);
     access
@@ -1405,7 +1403,7 @@ pub async fn begin_answer_media(
             PhoneCommandAction::OpenReceiveChannel {
                 call_id,
                 purpose: ReceiveChannelPurpose::InboundAnswer,
-                source: None,
+                source: Some(source),
                 codec,
                 packet_ms: framing.packet_ms,
                 max_frames_per_packet: framing.max_frames_per_packet,
@@ -1442,7 +1440,7 @@ pub async fn begin_outbound_media(
             device_id.clone(),
             PhoneCommandAction::OpenOutboundMedia {
                 call_id,
-                source: None,
+                source: Some(endpoint),
                 endpoint,
                 codec,
                 packet_ms: framing.packet_ms,

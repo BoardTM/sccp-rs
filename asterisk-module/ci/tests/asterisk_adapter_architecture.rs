@@ -664,6 +664,27 @@ fn native_call_indications_use_one_ordered_rust_queue() {
 }
 
 #[test]
+fn audio_receive_requests_use_the_selected_local_media_source() {
+    let backend = source("src/asterisk/runtime/backend.rs");
+    let begin_media = rust_item(&backend, "async fn begin_handset_media");
+    assert!(begin_media.contains("let source = receive_media_source"));
+    assert!(begin_media.contains("source: Some(source)"));
+
+    let begin_answer = rust_item(&backend, "async fn begin_answer_media");
+    assert!(begin_answer.contains("let source = receive_media_source"));
+    assert!(begin_answer.contains("source: Some(source)"));
+
+    let begin_outbound = rust_item(&backend, "async fn begin_outbound_media");
+    assert!(begin_outbound.contains("let mut endpoint = receive_media_source"));
+    assert!(begin_outbound.contains("source: Some(endpoint)"));
+
+    let handset = source("src/asterisk/runtime/backend/handset.rs");
+    let execute = rust_item(&handset, "async fn execute_handset_effect");
+    assert!(execute.contains("let source = receive_media_source"));
+    assert!(execute.contains("source: Some(source)"));
+}
+
+#[test]
 fn unload_keeps_active_calls_subscriptions_and_conferences_in_one_ordered_drain() {
     let lifecycle = source("src/asterisk/runtime/lifecycle.rs");
     let stop = rust_item(&lifecycle, "fn stop");

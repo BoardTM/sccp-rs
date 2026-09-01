@@ -94,7 +94,7 @@ impl Default for QosPolicy {
     fn default() -> Self {
         Self {
             signaling: QosClass {
-                dscp: Dscp(26),
+                dscp: Dscp(24),
                 cos: Cos(4),
             },
             audio: QosClass {

@@ -1291,6 +1291,13 @@ fn network_listener_and_qos_defaults_are_normalized() {
 
     assert_eq!(config.listener_policy(), &ListenerPolicy::default());
     assert_eq!(config.qos_policy(), &QosPolicy::default());
+    assert_eq!(
+        config.qos_policy().signaling,
+        QosClass {
+            dscp: Dscp(24),
+            cos: Cos(4),
+        }
+    );
     let mut expected_network = NetworkPolicy::default();
     expected_network.advertised.ipv4 = Some("192.0.2.10".parse().unwrap());
     assert_eq!(config.network_policy(), &expected_network);

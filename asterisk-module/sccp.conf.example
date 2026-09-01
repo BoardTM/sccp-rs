@@ -31,7 +31,7 @@ externhost = pbx.example.test
 externrefresh = 60
 nat = auto
 ; Signaling/audio/video DSCP are 0..63 or a standard name; COS is 0..7.
-sccp_dscp = AF31
+sccp_dscp = CS3
 sccp_cos = 4
 audio_dscp = EF
 audio_cos = 6
@@ -155,7 +155,7 @@ nat = auto
 ; clear, tls, or either. TLS requires complete general TLS credentials.
 transport = either
 ; Device QoS values override only the named traffic class.
-sccp_dscp = AF31
+sccp_dscp = CS3
 sccp_cos = 4
 audio_dscp = EF
 audio_cos = 6

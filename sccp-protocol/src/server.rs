@@ -2143,7 +2143,6 @@ impl CallMedia {
 #[derive(Clone, Debug, Default)]
 struct MediaLeg {
     request: Option<MediaRequestIdentity>,
-    activity_generation: u64,
     telephone_event_payload: u8,
     peer: Option<MediaEndpoint>,
     state: MediaChannelState,
@@ -2995,7 +2994,6 @@ struct SessionRuntimeState {
     media_path_states:
         HashMap<crate::message::values::MediaPathId, crate::message::values::MediaPathEvent>,
     pending_media_path_release: Option<PendingMediaPathRelease>,
-    station_activity_generation: u64,
     transport_writable: bool,
 }
 
@@ -3026,7 +3024,6 @@ impl Default for SessionRuntimeState {
             headset_enabled: false,
             media_path_states: HashMap::new(),
             pending_media_path_release: None,
-            station_activity_generation: 0,
             transport_writable: true,
         }
     }
@@ -3237,10 +3234,6 @@ async fn run_session(
                             }
                         } else if let Some(state) = state.as_mut() {
                             last_station_activity = Instant::now();
-                            state.station_activity_generation = state
-                                .station_activity_generation
-                                .checked_add(1)
-                                .unwrap_or_default();
                             if handle_registered_message(&mut stream, state, message, &context).await?
                                 == SessionDisposition::Terminate
                             {
@@ -3273,11 +3266,8 @@ async fn run_session(
                     if *retirement.borrow() == SessionAdmissionState::Retired {
                         break;
                     }
-                    if let Some(state) = state.as_mut()
-                        && handle_session_deadlines(&mut stream, state, &context, Instant::now()).await?
-                            == SessionDisposition::Terminate
-                    {
-                        break;
+                    if let Some(state) = state.as_mut() {
+                        handle_session_deadlines(&mut stream, state, &context, Instant::now()).await?;
                     }
                 }
                 _ = tokio::time::sleep_until(last_station_activity + keepalive_timeout), if state.is_some() => {
@@ -3611,23 +3601,11 @@ async fn handle_session_deadlines(
     state: &mut SessionState,
     context: &SessionContext,
     now: Instant,
-) -> Result<SessionDisposition, ServerError> {
-    let mut disposition = SessionDisposition::Continue;
+) -> Result<(), ServerError> {
     for expired in expire_handset_acknowledgements(&mut state.calls_by_id, now) {
         let (event, rollback_result) = match expired {
-            ExpiredHandsetAcknowledgement::Receive {
-                call_id,
-                activity_generation,
-            } => {
+            ExpiredHandsetAcknowledgement::Receive { call_id } => {
                 let rollback = prepare_audio_receive_rollback(state, call_id);
-                let station_responded = state.station_activity_generation != activity_generation;
-                if receive_timeout_disposition(
-                    state.station_activity_generation,
-                    activity_generation,
-                ) == SessionDisposition::Terminate
-                {
-                    disposition = SessionDisposition::Terminate;
-                }
                 let rollback_result = match rollback {
                     Some(rollback) => rollback_audio_receive(stream, state, rollback).await,
                     None => Ok(()),
@@ -3636,8 +3614,6 @@ async fn handle_session_deadlines(
                     device_id = %state.device.id,
                     session_generation = u64::from(state.generation),
                     ?call_id,
-                    station_responded,
-                    session_retired = !station_responded,
                     "SCCP receive-channel acknowledgement deadline expired"
                 );
                 (
@@ -3736,18 +3712,7 @@ async fn handle_session_deadlines(
         }
     }
     prune_connection_statistics(&mut state.pending_connection_statistics, now);
-    Ok(disposition)
-}
-
-const fn receive_timeout_disposition(
-    current_activity_generation: u64,
-    request_activity_generation: u64,
-) -> SessionDisposition {
-    if current_activity_generation == request_activity_generation {
-        SessionDisposition::Terminate
-    } else {
-        SessionDisposition::Continue
-    }
+    Ok(())
 }
 
 fn expire_handset_acknowledgements(
@@ -3769,10 +3734,7 @@ fn expire_handset_acknowledgements(
                 .is_some_and(|deadline| deadline <= now)
         {
             call.media.receive.deadline = None;
-            expired.push(ExpiredHandsetAcknowledgement::Receive {
-                call_id,
-                activity_generation: call.media.receive.activity_generation,
-            });
+            expired.push(ExpiredHandsetAcknowledgement::Receive { call_id });
             continue;
         }
         if matches!(
@@ -3792,7 +3754,6 @@ fn expire_handset_acknowledgements(
 enum ExpiredHandsetAcknowledgement {
     Receive {
         call_id: CallId,
-        activity_generation: u64,
     },
     Transmit {
         call_id: CallId,
@@ -7938,7 +7899,6 @@ async fn handle_session_command(
                         }
                     }
                     let telephone_event_payload = dtmf_mode.telephone_event_payload(state.features);
-                    let activity_generation = state.station_activity_generation;
                     let request = allocate_media_request_identity(state, call_id)?;
                     let call = require_call_mut(state, call_id)?;
                     call.media.requested = true;
@@ -7950,7 +7910,6 @@ async fn handle_session_command(
                     call.media.receive.state = MediaChannelState::Opening;
                     call.media.receive.deadline = None;
                     call.media.receive.request = Some(request);
-                    call.media.receive.activity_generation = activity_generation;
                     if call.media.transmit.state == MediaChannelState::Closed {
                         call.media.transmit.request = None;
                     }
@@ -8176,7 +8135,6 @@ async fn handle_session_command(
                         .map(|source| source.address)
                         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                     let source_port = source.map_or(0, |source| source.rtp_port);
-                    let activity_generation = state.station_activity_generation;
                     let request = allocate_media_request_identity(state, call_id)?;
                     let call = require_call_mut(state, call_id)?;
                     call.media.requested = true;
@@ -8188,7 +8146,6 @@ async fn handle_session_command(
                     call.media.receive.state = MediaChannelState::Opening;
                     call.media.receive.deadline = None;
                     call.media.receive.request = Some(request);
-                    call.media.receive.activity_generation = activity_generation;
                     endpoint.telephone_event_payload = telephone_event_payload;
                     call.media.transmit.telephone_event_payload = telephone_event_payload;
                     call.media.transmit.peer = Some(endpoint);
