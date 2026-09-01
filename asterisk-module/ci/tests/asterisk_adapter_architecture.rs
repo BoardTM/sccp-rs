@@ -871,35 +871,37 @@ fn binary_upgrade_checks_loaded_inode_and_requires_an_asterisk_restart() {
 }
 
 #[test]
-fn release_artifacts_are_named_for_the_oldest_compatible_abi_baseline() {
+fn release_artifacts_are_versioned_and_debug_builds_are_explicit() {
     let script = source("build-linux-x86_64.sh");
-    assert!(script.contains("asterisk_abi=${asterisk_version%%.*}"));
-    assert!(script.contains("chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"));
-    assert!(!script.contains("chan_sccp2-asterisk-${asterisk_version}-linux-x86_64.so"));
+    assert!(script.contains("module_version=$(sed"));
+    assert!(script.contains("MODULE_VERSION=v$module_version"));
+    assert!(script.contains("chan_sccp2-asterisk-linux-x86_64-v${module_version}.so"));
 
     let docker = source("ci/Dockerfile");
-    assert!(docker.contains("ASTERISK_ARTIFACT_LANE"));
-    assert!(docker.contains("artifact_lane=\"${ASTERISK_ARTIFACT_LANE:-"));
+    assert!(docker.contains("ARG ARTIFACT_VARIANT=normal"));
+    assert!(docker.contains("ARG MODULE_VERSION"));
     assert!(docker.contains("amd64) artifact_arch=x86_64"));
     assert!(docker.contains("arm64) artifact_arch=aarch64"));
-    assert!(docker.contains("chan_sccp2-asterisk-${artifact_lane}-linux-${artifact_arch}.so"));
-    assert!(!docker.contains("chan_sccp2-asterisk-${ASTERISK_VERSION}-linux-"));
+    assert!(docker.contains("artifact_prefix=chan_sccp2-asterisk;"));
+    assert!(docker.contains("artifact_prefix=chan_sccp2-asterisk-debug;"));
+    assert!(docker.contains("sccp.dbg.coral.works"));
+    assert!(docker.contains("${artifact_prefix}-linux-${artifact_arch}-${MODULE_VERSION}.so"));
 
     let release = workspace_source(".github/workflows/asterisk-module.yml");
     let compatibility = workspace_source(".github/workflows/asterisk-distro-compatibility.yml");
     for architecture in ["x86_64", "aarch64"] {
-        let artifact = format!("chan_sccp2-asterisk-22plus-linux-{architecture}");
-        assert!(release.contains(&artifact));
-        assert!(compatibility.contains(&artifact));
+        let normal = format!("chan_sccp2-asterisk-linux-{architecture}-");
+        let debug = format!("chan_sccp2-asterisk-debug-linux-{architecture}-");
+        assert!(release.contains(&normal));
+        assert!(release.contains(&debug));
     }
-
-    for lane in ["22", "23", "22.7.0", "23.4.1"] {
-        for architecture in ["x86_64", "aarch64"] {
-            let artifact = format!("chan_sccp2-asterisk-{lane}-linux-{architecture}");
-            assert!(!release.contains(&artifact));
-            assert!(!compatibility.contains(&artifact));
-        }
-    }
+    assert!(release.contains("--features ${{ matrix.feature }},telemetry"));
+    assert!(release.contains("cargo test --locked -p sccp-protocol --lib"));
+    let protocol_manifest = workspace_source("sccp-protocol/Cargo.toml");
+    assert!(!protocol_manifest.contains("telemetry ="));
+    assert!(release.contains("steps.module.outputs.version"));
+    assert!(compatibility.contains("steps.module.outputs.artifact"));
+    assert!(compatibility.contains("chan_sccp2-asterisk-linux-${{ matrix.architecture }}-v"));
 
     assert!(release.contains("runs-on: ubuntu-24.04-arm"));
     assert!(release.contains("--platform linux/arm64"));
@@ -912,6 +914,10 @@ fn release_artifacts_are_named_for_the_oldest_compatible_abi_baseline() {
     assert!(release.contains("release_tag=\"$GITHUB_REF_NAME\""));
     assert!(release.contains("expected_tag=\"v${manifest_version}\""));
     assert!(release.contains("--verify-tag"));
+    assert!(release.contains("gh release upload"));
+    assert!(release.contains("gh release delete-asset"));
+    assert!(release.contains("--clobber"));
+    assert!(release.contains("retention-days: 30"));
     assert!(!release.contains("release_tag=\"build-${GITHUB_SHA}\""));
 
     let manifest = source("Cargo.toml");

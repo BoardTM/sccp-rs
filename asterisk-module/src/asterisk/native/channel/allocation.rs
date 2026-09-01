@@ -195,39 +195,41 @@ pub struct ChannelPrivate {
 /// Returning early invokes the registered technology destructor through the
 /// normal native hangup path.
 struct UnpublishedChannel {
-    channel: Option<NonNull<sys::ast_channel>>,
+    channel: NonNull<sys::ast_channel>,
     lock: Option<BorrowedChannelLock>,
+    published: bool,
 }
 
 impl UnpublishedChannel {
     unsafe fn new(channel: NonNull<sys::ast_channel>) -> Self {
         Self {
-            channel: Some(channel),
+            channel,
             lock: Some(unsafe { BorrowedChannelLock::from_locked(channel) }),
+            published: false,
         }
     }
 
     fn channel(&self) -> NonNull<sys::ast_channel> {
-        self.channel.expect("unpublished channel remains owned")
+        self.channel
     }
 
     fn publish(mut self) -> NonNull<sys::ast_channel> {
-        let channel = self.channel.take().expect("channel published once");
+        self.published = true;
         drop(self.lock.take());
-        channel
+        self.channel
     }
 }
 
 impl Drop for UnpublishedChannel {
     fn drop(&mut self) {
-        let Some(channel) = self.channel.take() else {
+        if self.published {
             return;
-        };
-        if let Some(private) = unsafe { channel_private(channel.as_ptr()) } {
+        }
+        if let Some(private) = unsafe { channel_private(self.channel.as_ptr()) } {
             let _ = unsafe { take_private_identity(private) };
         }
         drop(self.lock.take());
-        unsafe { sys::ast_hangup(channel.as_ptr()) };
+        unsafe { sys::ast_hangup(self.channel.as_ptr()) };
     }
 }
 

@@ -177,17 +177,12 @@ impl ProvisionalMixMonitor {
         }
     }
 
-    fn id(&self) -> &CStr {
-        self.session
-            .as_ref()
-            .map(|(_, id)| id.as_c_str())
-            .expect("a provisional recorder owns its native session")
+    fn id(&self) -> Option<&CStr> {
+        self.session.as_ref().map(|(_, id)| id.as_c_str())
     }
 
-    fn commit(mut self) -> (ChannelRef, CString) {
-        self.session
-            .take()
-            .expect("a provisional recorder commits exactly once")
+    fn commit(mut self) -> Option<(ChannelRef, CString)> {
+        self.session.take()
     }
 }
 
@@ -266,10 +261,11 @@ pub fn start_recording(
     let provisional = ProvisionalMixMonitor::new(channel, native);
     let text = provisional
         .id()
+        .ok_or(RecordingError::StartFailed)?
         .to_str()
         .map_err(|_| RecordingError::StartFailed)?
         .to_owned();
-    let (channel, native) = provisional.commit();
+    let (channel, native) = provisional.commit().ok_or(RecordingError::StartFailed)?;
 
     let session = NativeRecordingSession {
         callback,

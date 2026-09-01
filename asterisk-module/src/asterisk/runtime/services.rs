@@ -35,11 +35,21 @@ mod conference;
 mod control;
 mod parking;
 mod recording;
+
+struct RecordingServiceRequest {
+    command: AmiRecordingCommand,
+    call_id: PbxCallId,
+    filename: Option<String>,
+    append: bool,
+    bridged_only: bool,
+    direction: Option<RecordingDirection>,
+}
+
 pub use conference::{conference_participant_service_error, conference_service_operation};
 pub use control::{handle_control_operation, restore_system_message};
 pub use parking::{parking_service_error, parking_service_operation};
-use recording::restore_recording_session;
-pub use recording::{recording_service_operation, toggle_monitor_recording};
+pub use recording::toggle_monitor_recording;
+use recording::{recording_service_operation, restore_recording_session};
 
 pub async fn run_events(
     access: Access,
@@ -147,7 +157,7 @@ pub async fn handle_runtime_call_signal(access: &Access, signal: RuntimeCallSign
     let line = controller_step(&access.shared.controller, |controller| {
         controller
             .active_or_primary_call_by_pbx(signal.pbx_id)
-            .map(|call| call.line.clone())
+            .map(|call| call.line)
     });
     match signal.kind {
         RuntimeCallSignalKind::StopTone => {
@@ -363,12 +373,14 @@ pub async fn handle_service_operation(
             recording_service_operation(
                 access,
                 recordings,
-                command,
-                call_id,
-                filename,
-                append,
-                bridged_only,
-                direction,
+                RecordingServiceRequest {
+                    command,
+                    call_id,
+                    filename,
+                    append,
+                    bridged_only,
+                    direction,
+                },
             )
             .await
         }

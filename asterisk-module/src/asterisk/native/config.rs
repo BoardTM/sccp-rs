@@ -135,7 +135,7 @@ fn load_effective_source(
         if !output.is_empty() {
             output.push('\n');
         }
-        writeln!(output, "[{name}]").expect("writing to a String cannot fail");
+        writeln!(output, "[{name}]").map_err(|error| native_failure(path, error.to_string()))?;
 
         let mut variable = unsafe { sys::ast_category_first(category) };
         while let Some(current) = unsafe { variable.as_ref() } {
@@ -144,7 +144,7 @@ fn load_effective_source(
             let value =
                 unsafe { copy_text(current.value) }.map_err(|error| native_failure(path, error))?;
             writeln!(output, "{name} = {}", quote_value(&value))
-                .expect("writing to a String cannot fail");
+                .map_err(|error| native_failure(path, error.to_string()))?;
             variable = current.next;
         }
     }

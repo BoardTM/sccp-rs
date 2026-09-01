@@ -568,17 +568,16 @@ pub async fn execute_handset_effect(access: &Access, effect: HandsetEffect) -> R
             {
                 first_error.get_or_insert_with(|| error.to_string());
             }
-            if state == PhoneCallState::OnHook {
-                if let Err(error) = access
+            if state == PhoneCallState::OnHook
+                && let Err(error) = access
                     .phone
                     .send_confirmed(PhoneCommand::new(
                         device_id,
                         PhoneCommandAction::CloseCall { call_id },
                     ))
                     .await
-                {
-                    first_error.get_or_insert_with(|| error.to_string());
-                }
+            {
+                first_error.get_or_insert_with(|| error.to_string());
             }
             first_error.map_or(Ok(()), Err)
         }

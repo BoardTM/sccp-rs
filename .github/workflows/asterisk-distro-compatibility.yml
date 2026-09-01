@@ -27,35 +27,30 @@ jobs:
             image: ubuntu:26.04
             package_family: deb
             asterisk_major: "22"
-            artifact: chan_sccp2-asterisk-22plus-linux-x86_64
           - distro: Debian testing
             architecture: x86_64
             runner: ubuntu-26.04
             image: debian:testing-slim
             package_family: deb
             asterisk_major: "22"
-            artifact: chan_sccp2-asterisk-22plus-linux-x86_64
           - distro: Fedora 45
             architecture: x86_64
             runner: ubuntu-26.04
             image: fedora:45
             package_family: rpm
             asterisk_major: "23"
-            artifact: chan_sccp2-asterisk-22plus-linux-x86_64
           - distro: Ubuntu 26.04
             architecture: aarch64
             runner: ubuntu-24.04-arm
             image: ubuntu:26.04
             package_family: deb
             asterisk_major: "22"
-            artifact: chan_sccp2-asterisk-22plus-linux-aarch64
           - distro: Fedora 45
             architecture: aarch64
             runner: ubuntu-24.04-arm
             image: fedora:45
             package_family: rpm
             asterisk_major: "23"
-            artifact: chan_sccp2-asterisk-22plus-linux-aarch64
 
     name: >-
       ${{ matrix.distro }} ${{ matrix.architecture }} /
@@ -66,9 +61,19 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve module version
+        id: module
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "asterisk-module") | .version')
+          printf 'artifact=chan_sccp2-asterisk-linux-${{ matrix.architecture }}-v%s\n' \
+            "$version" >> "$GITHUB_OUTPUT"
+
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ steps.module.outputs.artifact }}
           path: dist
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -76,7 +81,7 @@ jobs:
 
       - name: Load release artifact with packaged Asterisk
         env:
-          ARTIFACT: ${{ matrix.artifact }}.so
+          ARTIFACT: ${{ steps.module.outputs.artifact }}.so
           ASTERISK_MAJOR: ${{ matrix.asterisk_major }}
           DISTRO_IMAGE: ${{ matrix.image }}
           PACKAGE_FAMILY: ${{ matrix.package_family }}

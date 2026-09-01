@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package sccp.debug.v1;
+
+enum DiagnosticType {
+  DIAGNOSTIC_TYPE_UNSPECIFIED = 0;
+  DIAGNOSTIC_TYPE_WARNING = 1;
+  DIAGNOSTIC_TYPE_ERROR = 2;
+  DIAGNOSTIC_TYPE_PACKET_CAPTURE = 3;
+  DIAGNOSTIC_TYPE_OTHER = 4;
+}
+
+message DiagnosticEvent {
+  string event_id = 1;
+  string module_version = 2;
+  bytes host_hash = 3;
+  DiagnosticType type = 4;
+  string content_type = 5;
+  bytes body = 6;
+}
+
+message IngestAck {
+  string event_id = 1;
+  bool duplicate = 2;
+}
+
+enum IngestErrorCode {
+  INGEST_ERROR_CODE_UNSPECIFIED = 0;
+  INGEST_ERROR_CODE_INVALID_EVENT = 1;
+  INGEST_ERROR_CODE_PAYLOAD_TOO_LARGE = 2;
+  INGEST_ERROR_CODE_EVENT_ID_CONFLICT = 3;
+  INGEST_ERROR_CODE_TOO_MANY_IN_FLIGHT = 4;
+  INGEST_ERROR_CODE_STORAGE_UNAVAILABLE = 5;
+}
+
+message IngestError {
+  string event_id = 1;
+  IngestErrorCode code = 2;
+  string message = 3;
+  bool retryable = 4;
+}
+
+message IngestResponse {
+  oneof result {
+    IngestAck ack = 1;
+    IngestError error = 2;
+  }
+}

@@ -17,8 +17,8 @@ The published modules currently support:
 - 64-bit x86 Linux (`x86_64`) or 64-bit ARM Linux (`aarch64`)
 - A glibc-based Linux distribution
 
-There is one `.so` per CPU architecture for the current Asterisk 22+ ABI
-generation. It is built against Asterisk 22 and accepts newer Asterisk majors.
+There is one ordinary `.so` and one opt-in debug telemetry `.so` per CPU
+architecture. They are built against Asterisk 22 and accept newer Asterisk majors.
 If a future major introduces an incompatible ABI change, releases will add a
 new baseline-specific file at that point.
 
@@ -35,10 +35,10 @@ $ uname -m
 aarch64
 ```
 
-The Asterisk major must be 22 or newer. Use the `asterisk-22plus` file and
-match the architecture: `x86_64` systems use `linux-x86_64`, while `aarch64`
-systems use `linux-aarch64`. The module rejects Asterisk 21 and older, and Linux
-itself rejects a file built for the wrong CPU architecture.
+The Asterisk major must be 22 or newer. Match the architecture: `x86_64`
+systems use `linux-x86_64`, while `aarch64` systems use `linux-aarch64`. The
+module rejects Asterisk 21 and older, and Linux itself rejects a file built for
+the wrong CPU architecture.
 
 ## Before installation
 
@@ -64,8 +64,18 @@ latest release, and download one of these assets:
 
 | Installed Asterisk | `uname -m` | Release asset |
 | --- | --- | --- |
-| Asterisk 22 or newer | `x86_64` | `chan_sccp2-asterisk-22plus-linux-x86_64.so` |
-| Asterisk 22 or newer | `aarch64` | `chan_sccp2-asterisk-22plus-linux-aarch64.so` |
+| Asterisk 22 or newer | `x86_64` | `chan_sccp2-asterisk-linux-x86_64-v<version>.so` |
+| Asterisk 22 or newer | `aarch64` | `chan_sccp2-asterisk-linux-aarch64-v<version>.so` |
+
+Each release also contains `chan_sccp2-asterisk-debug-linux-<architecture>-v<version>.so`.
+That opt-in build sends warnings and errors with recent module logs, effective
+non-credential configuration, caller/called/dialed numbers, line names, raw
+device IDs, network and media endpoints, live call/device/media state, and
+bounded decrypted SCCP signaling to the project diagnostic backend. It also
+sends a stable hashed PBX installation identifier. It removes media keys and
+salts and never sends arbitrary channel-variable values, RTP payloads, or
+credential contents. Use the ordinary asset unless you explicitly want to
+provide this diagnostic data.
 
 Each release also contains `SHA256SUMS`. Download it beside the module and
 verify the download before installing it:
@@ -73,7 +83,7 @@ verify the download before installing it:
 ```console
 $ cd /tmp
 $ sha256sum --check --ignore-missing SHA256SUMS
-chan_sccp2-asterisk-22plus-linux-x86_64.so: OK
+chan_sccp2-asterisk-linux-x86_64-v0.4.13.so: OK
 ```
 
 The output must name your downloaded `.so` and end in `OK`. A missing filename,
@@ -85,8 +95,9 @@ other ARM64 system:
 
 ```sh
 cd /tmp
-curl -fLO https://github.com/coral/sccp-rs/releases/latest/download/chan_sccp2-asterisk-22plus-linux-x86_64.so
-curl -fLO https://github.com/coral/sccp-rs/releases/latest/download/SHA256SUMS
+version=0.4.13
+curl -fLO "https://github.com/coral/sccp-rs/releases/download/v${version}/chan_sccp2-asterisk-linux-x86_64-v${version}.so"
+curl -fLO "https://github.com/coral/sccp-rs/releases/download/v${version}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
@@ -123,7 +134,7 @@ Install the release asset under the exact name `chan_sccp2.so`:
 
 ```sh
 sudo install -o root -g root -m 0644 \
-  /tmp/chan_sccp2-asterisk-22plus-linux-x86_64.so \
+  /tmp/chan_sccp2-asterisk-linux-x86_64-v0.4.13.so \
   /usr/lib64/asterisk/modules/chan_sccp2.so
 ```
 
@@ -533,7 +544,7 @@ separately decided that the phones no longer need them.
 Check these in order:
 
 1. `asterisk -V` reports Asterisk 22 or newer.
-2. The release filename identifies the `asterisk-22plus` ABI generation.
+2. The release filename contains the expected architecture and module version.
 3. `uname -m` reports `x86_64` for a `linux-x86_64` asset or `aarch64` for a
    `linux-aarch64` asset.
 4. `ldd chan_sccp2.so` contains no `not found` entries.

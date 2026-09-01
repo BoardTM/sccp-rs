@@ -11,6 +11,7 @@
 
 use std::fmt;
 
+use super::values::ProtocolVersion;
 use super::wire::{HEADER_SIZE, MAX_FRAME_SIZE};
 
 /// The protocol roles between which a message is normally sent.
@@ -525,6 +526,55 @@ message_catalog! {
     (SpcpRegisterTokenRequest => SPCP_REGISTER_TOKEN_REQ, 0x8000, StationToControl, ContractMetadata { scope: ContractScope::Supplemental, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(36), payload_size_bounds: Some(PayloadSizeBounds { minimum: 36, maximum: 36 }), runtime_use: RuntimeUse::DeviceInput, field_fidelity: FieldFidelity::SemanticProjection("reserved station identifier word is not modeled"), response: ResponseExpectation::OneOf(&[MessageId::SpcpRegisterTokenAck, MessageId::SpcpRegisterTokenReject]), verification: ContractVerification::StructuralAndValidated }),
     (SpcpRegisterTokenAck => SPCP_REGISTER_TOKEN_ACK, 0x8100, ControlToStation, ContractMetadata { scope: ContractScope::Supplemental, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(4), payload_size_bounds: Some(PayloadSizeBounds { minimum: 4, maximum: 4 }), runtime_use: RuntimeUse::TypedButNotEmitted, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
     (SpcpRegisterTokenReject => SPCP_REGISTER_TOKEN_REJECT, 0x8101, ControlToStation, ContractMetadata { scope: ContractScope::Supplemental, codec: CodecSupport::Typed, payload_layout: PayloadLayout::Fixed, fixed_payload_bytes: Some(4), payload_size_bounds: Some(PayloadSizeBounds { minimum: 4, maximum: 4 }), runtime_use: RuntimeUse::TypedButNotEmitted, field_fidelity: FieldFidelity::Lossless, response: ResponseExpectation::None, verification: ContractVerification::Structural }),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObservationSanitization {
+    Preserve,
+    Redact { start: usize, end: usize },
+    SuppressPayload,
+}
+
+pub(crate) fn observation_sanitization(
+    message_id: Option<u32>,
+    protocol_header: Option<u32>,
+) -> ObservationSanitization {
+    let from_version_17 =
+        protocol_header.is_some_and(|version| version >= ProtocolVersion::V17.wire());
+    match (message_id.map(MessageId::from), from_version_17) {
+        (Some(MessageId::OpenReceiveChannel), _) => {
+            ObservationSanitization::Redact { start: 48, end: 80 }
+        }
+        (Some(MessageId::StartMediaTransmission), false) => {
+            ObservationSanitization::Redact { start: 64, end: 96 }
+        }
+        (Some(MessageId::StartMediaTransmission), true) => ObservationSanitization::Redact {
+            start: 80,
+            end: 112,
+        },
+        (Some(MessageId::OpenMultimediaChannel), _) => ObservationSanitization::Redact {
+            start: 128,
+            end: 160,
+        },
+        (Some(MessageId::StartMultimediaTransmission), false) => ObservationSanitization::Redact {
+            start: 132,
+            end: 164,
+        },
+        (Some(MessageId::StartMultimediaTransmission), true) => ObservationSanitization::Redact {
+            start: 148,
+            end: 180,
+        },
+        (
+            Some(
+                MessageId::DeviceToUserData
+                | MessageId::DeviceToUserDataResponse
+                | MessageId::DeviceToUserDataV1
+                | MessageId::DeviceToUserDataResponseV1,
+            ),
+            _,
+        ) => ObservationSanitization::SuppressPayload,
+        _ => ObservationSanitization::Preserve,
+    }
 }
 
 impl fmt::Display for MessageId {

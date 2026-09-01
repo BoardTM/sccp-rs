@@ -53,6 +53,8 @@ pub struct Module {
     pub event_task: JoinHandle<()>,
     pub parking_subscription: ParkingSubscription,
     pub sorcery_registration: Option<Arc<raw::sorcery::SorceryRegistration>>,
+    #[cfg(feature = "telemetry")]
+    pub(super) telemetry: Option<crate::asterisk::telemetry::TelemetryReporter>,
 }
 
 #[derive(Clone)]
@@ -148,7 +150,7 @@ pub enum RuntimeCallSignalKind {
     Hold,
     Unhold,
     VideoUpdate,
-    PartyUpdate(PartySnapshot),
+    PartyUpdate(Box<PartySnapshot>),
 }
 
 pub struct RuntimeRegistrationContexts {
@@ -353,14 +355,14 @@ pub fn execute_forwarding_mutation(
         kind,
     };
     let result =
-        update_device_features_locked(&access, &config, &device_id, |state| mutate.apply(state));
+        update_device_features_locked(access, &config, &device_id, |state| mutate.apply(state));
     let (previous, state) = match result {
         Ok(Some(states)) => states,
         Ok(None) => return Err(FeatureControlProviderError::DeviceNotFound),
         Err(error) => return Err(feature_control_store_error(&error)),
     };
-    publish_device_features(&access, &device_id, &state);
-    publish_feature_changes(&access, &device_id, &previous, &state);
+    publish_device_features(access, &device_id, &state);
+    publish_feature_changes(access, &device_id, &previous, &state);
     Ok(outcome.complete(previous != state, &state))
 }
 
@@ -704,7 +706,7 @@ impl DeviceQueryProvider for RuntimeDeviceQueryProvider {
                 controller_step(&shared.controller, |controller| {
                     controller
                         .active_or_primary_call_by_pbx(PbxCallId(pbx_id))
-                        .map(|call| call.device_id.clone())
+                        .map(|call| call.device_id)
                 })
                 .ok_or(DeviceQueryLookupError::CurrentDeviceUnavailable)?
             }
@@ -813,7 +815,7 @@ impl LineQueryProvider for RuntimeLineQueryProvider {
                 controller_step(&shared.controller, |controller| {
                     controller
                         .active_or_primary_call_by_pbx(PbxCallId(pbx_id))
-                        .map(|call| call.line.clone())
+                        .map(|call| call.line)
                 })
                 .ok_or(LineQueryLookupError::CurrentLineUnavailable)?
             }

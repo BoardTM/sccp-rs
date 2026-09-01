@@ -123,7 +123,7 @@ impl<T> CallbackRegistration<T> {
         let identity = self.identity();
         ACTIVE_CALLBACKS.with(|active| active.borrow_mut().push(identity));
         Ok(CallbackLease {
-            registration: self.clone(),
+            registration: Arc::clone(self),
             payload,
             identity,
             _not_send: PhantomData,
@@ -257,7 +257,7 @@ impl<T> Drop for CallbackLease<T> {
 /// [`acquire_from_native`] while the native registry guarantees that the
 /// userdata is still registered or is an already-admitted callback.
 pub fn retain_for_native<T>(registration: &Arc<CallbackRegistration<T>>) -> NonNull<c_void> {
-    let retained = Arc::into_raw(registration.clone())
+    let retained = Arc::into_raw(Arc::clone(registration))
         .cast_mut()
         .cast::<c_void>();
     // SAFETY: `Arc::into_raw` returns the address of a live allocation and can

@@ -32,8 +32,6 @@ case "${1:-}" in
 		;;
 esac
 
-asterisk_abi=${asterisk_version%%.*}
-
 if ! command -v docker >/dev/null 2>&1; then
 	printf 'error: Docker is required; install and start Docker Desktop first.\n' >&2
 	exit 1
@@ -51,6 +49,11 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
 output_dir=${2:-"$repo_dir/dist"}
 mkdir -p "$output_dir"
+module_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$script_dir/Cargo.toml" | head -n 1)
+if [ -z "$module_version" ]; then
+	printf 'error: unable to read the asterisk-module package version.\n' >&2
+	exit 1
+fi
 
 docker buildx build \
 	--pull \
@@ -58,10 +61,11 @@ docker buildx build \
 	--progress plain \
 	--build-arg "ASTERISK_VERSION=$asterisk_version" \
 	--build-arg "ASTERISK_FEATURE=$asterisk_feature" \
+	--build-arg "MODULE_VERSION=v$module_version" \
 	--target artifact \
 	--output "type=local,dest=$output_dir" \
 	--file "$script_dir/ci/Dockerfile" \
 	"$repo_dir"
 
-artifact="$output_dir/chan_sccp2-asterisk-${asterisk_abi}-linux-x86_64.so"
+artifact="$output_dir/chan_sccp2-asterisk-linux-x86_64-v${module_version}.so"
 printf 'Built %s\n' "$artifact"

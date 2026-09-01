@@ -87,7 +87,7 @@ impl AstBuffer {
         unsafe {
             (*value).len = capacity;
             (*value).used = 0;
-            (*value).ts = 1usize as *mut sys::ast_threadstorage;
+            (*value).ts = ptr::dangling_mut::<sys::ast_threadstorage>();
         }
         Ok(Self(value))
     }
@@ -168,8 +168,7 @@ unsafe fn hint_caller(info: &sys::ast_state_cb_info) -> Option<HintCaller> {
         // Count every raw causal channel before retaining or locking it. A
         // failed acquisition is still a cause and makes another identity
         // ambiguous.
-        candidates.push(None);
-        *candidates.last_mut().expect("raw cause was just counted") = resolve_causal_candidate(
+        let candidate = resolve_causal_candidate(
             || unsafe { ChannelRef::acquire(channel) },
             |channel| ChannelLock::acquire(channel).ok(),
             |channel| {
@@ -192,6 +191,7 @@ unsafe fn hint_caller(info: &sys::ast_state_cb_info) -> Option<HintCaller> {
                 visible_caller(pickup_private, caller)
             },
         );
+        candidates.push(candidate);
     }
     unsafe { sys::ao2_iterator_destroy(&mut iterator) };
     unambiguous_caller(candidates)

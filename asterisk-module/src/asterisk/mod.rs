@@ -42,6 +42,8 @@ mod raw;
 mod runtime;
 mod static_descriptor;
 mod sys;
+#[cfg(feature = "telemetry")]
+mod telemetry;
 use adapters::{
     AsteriskCallCompletion, AsteriskDialplan, AsteriskHttp, AsteriskManager, AsteriskRecording,
     DialplanRegistration, HttpRegistration, ManagerActionRegistration, RecordingSession,

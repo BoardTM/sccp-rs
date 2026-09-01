@@ -55,7 +55,7 @@ enum CliDisposition {
 fn cli_disposition_pointer(disposition: CliDisposition) -> *mut c_char {
     match disposition {
         CliDisposition::Complete => ptr::null_mut(),
-        CliDisposition::ShowUsage => 1usize as *mut c_char,
+        CliDisposition::ShowUsage => ptr::dangling_mut::<c_char>(),
     }
 }
 
@@ -156,8 +156,7 @@ impl<'a> CliArgs<'a> {
         accepts_previous_count: impl FnOnce(usize) -> bool,
         argument_bound: impl Fn(usize) -> Option<usize>,
     ) -> Result<CliCompletion, ()> {
-        let mut completion =
-            self.completion_cursor(command_words, |index| argument_bound(index))?;
+        let mut completion = self.completion_cursor(command_words, &argument_bound)?;
         let argument_count = completion.position - command_words;
         if !accepts_previous_count(argument_count)
             || (argument_count != 0 && self.raw.argv.is_null())

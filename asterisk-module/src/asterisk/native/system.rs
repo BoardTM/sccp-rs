@@ -2,12 +2,27 @@
 
 use std::ffi::{CStr, CString, c_char, c_int};
 
+#[cfg(feature = "telemetry")]
+use uuid::Uuid;
+
 use crate::asterisk::boundary::{DeviceState, LogLevel, native_c_string};
 use crate::asterisk::sys;
 
 const SOURCE_FILE: &CStr = c"asterisk/native/system.rs";
 const SOURCE_FUNCTION: &CStr = c"sccp_system";
 pub const CONFIG_STATUS_VARIABLE: &CStr = c"SCCP_CONFIG_STATUS";
+
+#[cfg(feature = "telemetry")]
+pub(super) fn pbx_uuid() -> Option<Uuid> {
+    let mut buffer = [0 as c_char; sys::AST_UUID_STR_LEN as usize];
+    let status =
+        unsafe { sys::ast_pbx_uuid_get(buffer.as_mut_ptr(), c_int::try_from(buffer.len()).ok()?) };
+    if status != 0 {
+        return None;
+    }
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+    Uuid::try_parse_ascii(bytes).ok()
+}
 
 pub fn log_message(level: LogLevel, message: &str) {
     let level = match level {

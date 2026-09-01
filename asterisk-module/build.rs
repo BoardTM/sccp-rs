@@ -72,6 +72,7 @@ impl BuildPaths {
 
 fn main() {
     emit_rerun_contract();
+    generate_telemetry_bindings();
 
     let Some(lane) = FeatureLane::selected() else {
         return;
@@ -89,6 +90,24 @@ fn main() {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,chan_sccp2.so");
     }
 }
+
+#[cfg(feature = "telemetry")]
+fn generate_telemetry_bindings() {
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let proto = manifest.join("proto/sccp/debug/v1/sccp_debug.proto");
+    let include = manifest.join("proto");
+    let protoc = protoc_bin_vendored::protoc_bin_path()
+        .expect("vendored protobuf compiler is unavailable for this build target");
+    let mut config = prost_build::Config::new();
+    config.protoc_executable(protoc);
+    config
+        .compile_protos(&[proto.as_path()], &[include.as_path()])
+        .expect("unable to generate debug telemetry protobuf bindings");
+    println!("cargo:rerun-if-changed={}", proto.display());
+}
+
+#[cfg(not(feature = "telemetry"))]
+fn generate_telemetry_bindings() {}
 
 fn emit_rerun_contract() {
     println!("cargo:rerun-if-env-changed=ASTERISK_SOURCE_DIR");

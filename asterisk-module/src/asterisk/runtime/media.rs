@@ -1,10 +1,11 @@
 use super::{
-    Access, AddressSelectionPolicy, AsteriskBackend, AudioProcessingPolicy, CallId, CallState,
-    Codec, DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET, DEFAULT_AUDIO_PACKET_MS, DeviceId, DirectMediaCall,
-    DirectMediaPolicy, DtmfMode, Instant, IpAddr, LogLevel, MediaEndpoint, MediaEndpointAddress,
-    MediaStreamState, MediaTrafficClass, ModuleConfig, MutexExt as _, NonNull, OutboundMediaMode,
-    PbxCallId, PhoneCommand, PhoneCommandAction, ResolvedExternalAddresses, ast_log,
-    canonical_ip_address, controller_step, native_channel, state_from_channel, sys, with_channel,
+    Access, AddressSelectionPolicy, AsteriskBackend, AudioFraming, AudioFramingError,
+    AudioProcessingPolicy, CallId, CallState, Codec, DEFAULT_AUDIO_MAX_FRAMES_PER_PACKET,
+    DEFAULT_AUDIO_PACKET_MS, DeviceId, DirectMediaCall, DirectMediaPolicy, DtmfMode, Instant,
+    IpAddr, LogLevel, MediaEndpoint, MediaEndpointAddress, MediaStreamState, MediaTrafficClass,
+    ModuleConfig, MutexExt as _, NonNull, OutboundMediaMode, PbxCallId, PhoneCommand,
+    PhoneCommandAction, ResolvedExternalAddresses, ast_log, canonical_ip_address, controller_step,
+    native_channel, state_from_channel, sys, with_channel,
 };
 use crate::media::direct::direct_failure_anchor;
 use crate::media::encryption::{AudioEncryptionAdmission, MediaEncryptionDecision};
@@ -16,29 +17,6 @@ enum StationPacketLimit {
     Pending,
     Maximum(u32),
     Unsupported,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::asterisk) struct AudioFraming {
-    pub packet_ms: u32,
-    pub max_frames_per_packet: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub(in crate::asterisk) enum AudioFramingError {
-    #[error("station is unavailable")]
-    StationUnavailable,
-    #[error("audio packet duration must be non-zero")]
-    InvalidRequestedPacketDuration,
-    #[error("codec {codec:?} is not advertised by the station")]
-    UnsupportedCodec { codec: Codec },
-    #[error(
-        "audio packet duration {requested_packet_ms} ms exceeds station maximum {maximum_packet_ms} ms"
-    )]
-    PacketDurationExceedsStationMaximum {
-        requested_packet_ms: u32,
-        maximum_packet_ms: u32,
-    },
 }
 
 fn audio_encryption_admission(
@@ -303,10 +281,7 @@ pub(super) fn prepare_anchor_retarget(
     access: &Access,
     call: &DirectMediaCall,
 ) -> Option<PendingMediaRetarget> {
-    let Some(mut endpoint) = local_media_endpoint(access, call.pbx_id, &call.device_id, call.codec)
-    else {
-        return None;
-    };
+    let mut endpoint = local_media_endpoint(access, call.pbx_id, &call.device_id, call.codec)?;
     let framing = audio_framing(access, &call.device_id, call.call_id, call.codec).ok()?;
     endpoint.packet_ms = framing.packet_ms;
     endpoint.max_frames_per_packet = framing.max_frames_per_packet;
@@ -473,7 +448,7 @@ pub fn enqueue_media_retarget(
     })
 }
 
-pub(in crate::asterisk) fn audio_framing(
+pub(super) fn audio_framing(
     access: &Access,
     device: &DeviceId,
     call_id: CallId,

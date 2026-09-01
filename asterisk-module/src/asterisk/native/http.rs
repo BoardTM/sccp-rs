@@ -352,7 +352,7 @@ unsafe fn ast_string(value: &CStr) -> *mut sys::ast_str {
     unsafe {
         (*output).len = bytes.len() + 1;
         (*output).used = bytes.len();
-        (*output).ts = 1usize as *mut sys::ast_threadstorage;
+        (*output).ts = ptr::dangling_mut::<sys::ast_threadstorage>();
         ptr::copy_nonoverlapping(
             bytes.as_ptr(),
             (*output).str_.as_mut_ptr().cast(),

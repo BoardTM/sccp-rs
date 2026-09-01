@@ -99,6 +99,42 @@ mod native_support;
 mod presence;
 mod services;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AudioFraming {
+    pub(super) packet_ms: u32,
+    pub(super) max_frames_per_packet: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(super) enum AudioFramingError {
+    #[error("station is unavailable")]
+    StationUnavailable,
+    #[error("audio packet duration must be non-zero")]
+    InvalidRequestedPacketDuration,
+    #[error("codec {codec:?} is not advertised by the station")]
+    UnsupportedCodec { codec: Codec },
+    #[error(
+        "audio packet duration {requested_packet_ms} ms exceeds station maximum {maximum_packet_ms} ms"
+    )]
+    PacketDurationExceedsStationMaximum {
+        requested_packet_ms: u32,
+        maximum_packet_ms: u32,
+    },
+}
+
+pub(super) struct ChannelAllocationRequest<'a> {
+    pub(super) sccp_id: CallId,
+    pub(super) pbx_id: PbxCallId,
+    pub(super) binding: &'a LineBinding,
+    pub(super) codec: Codec,
+    pub(super) pbx_video_formats: &'a [PbxVideoFormat],
+    pub(super) assigned_ids: *const sys::ast_assigned_ids,
+    pub(super) requestor: *const sys::ast_channel,
+    pub(super) metadata: Option<CallMetadata>,
+    pub(super) text: channel::ChannelAllocationText,
+    pub(super) owner: channel::ChannelAllocationOwner,
+}
+
 pub use backend::{
     ActiveConferenceAnnouncement, AsteriskBackend, AsteriskBackendError,
     cancel_conference_announcement, execute_answer_call_transition, execute_call_transition,
@@ -136,7 +172,6 @@ pub use management::{
     RuntimeRegistrationContexts, RuntimeServiceProvider, RuntimeServiceRequest, Shared,
     execute_forwarding_mutation,
 };
-pub(super) use media::audio_framing;
 pub use media::{
     MediaFailureDisposition, configured_audio_processing, configured_audio_traffic_class,
     configured_dtmf_mode, configured_early_media, configured_video_traffic_class,
@@ -145,6 +180,16 @@ pub use media::{
     outbound_media_mode, recover_failed_media_transmission, set_remote_video_endpoint,
     station_nat_active,
 };
+
+pub(super) fn audio_framing(
+    access: &Access,
+    device: &DeviceId,
+    call_id: CallId,
+    codec: Codec,
+) -> Result<AudioFraming, AudioFramingError> {
+    media::audio_framing(access, device, call_id, codec)
+}
+
 pub use native_support::{
     anonymous_hotline_definition, ast_log, c_string, dial_terminator_digit, format_for,
     native_audio_format, pbx_audio_format_from_native, read_channel_metadata, read_party_snapshot,

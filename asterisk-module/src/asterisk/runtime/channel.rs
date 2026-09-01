@@ -1,10 +1,10 @@
 use super::{
     Access, Arc, AsteriskCallCompletion, AsteriskCallFeatures, AsteriskChannel,
-    AsteriskChannelMetadata, CString, CallFeatureError, CallId, CallMetadata, ChannelBinding,
-    ChannelOperationPermit, ChannelState, Codec, ConferenceTaskCancellation,
-    ConfiguredChannelMetadata, DeviceId, HandsetEffect, LineBinding, LogLevel,
-    MediaEndpointAddress, ModuleConfig, MutexExt as _, NatMode, NonNull, PbxAudioFormat, PbxCallId,
-    PbxVideoFormat, PendingRetrieval, REQUESTED_CHANNEL_UNAVAILABLE, ReceiveTransmit,
+    AsteriskChannelMetadata, CString, CallFeatureError, CallId, CallMetadata,
+    ChannelAllocationRequest, ChannelBinding, ChannelOperationPermit, ChannelState, Codec,
+    ConferenceTaskCancellation, ConfiguredChannelMetadata, DeviceId, HandsetEffect, LineBinding,
+    LogLevel, MediaEndpointAddress, ModuleConfig, MutexExt as _, NatMode, NonNull, PbxAudioFormat,
+    PbxCallId, PbxVideoFormat, PendingRetrieval, REQUESTED_CHANNEL_UNAVAILABLE, ReceiveTransmit,
     StationMediaCapabilities, StationTransport, VideoMode, ast_log, c_string,
     clear_no_answer_route, compose_channel_metadata, controller_step, format_for,
     local_video_endpoint, native_audio_format, native_channel, negotiate_audio, pbx_audio_format,
@@ -126,7 +126,7 @@ enum VideoSelection {
         session_generation: SessionGeneration,
         reason: VideoFallbackReason,
     },
-    Ready(SelectedVideo),
+    Ready(Box<SelectedVideo>),
 }
 
 impl VideoSelection {
@@ -201,14 +201,14 @@ fn preferred_video(
             reason: VideoFallbackReason::DescriptorUnavailable,
         };
     };
-    VideoSelection::Ready(SelectedVideo {
+    VideoSelection::Ready(Box::new(SelectedVideo {
         session_generation,
         protocol,
         mode: media.video_mode,
         negotiated,
         payload_type,
         payload,
-    })
+    }))
 }
 
 fn video_endpoint_is_supported(selected: &SelectedVideo, endpoint: MediaEndpointAddress) -> bool {
@@ -358,17 +358,20 @@ pub fn prepare_channel_allocation_text(
 
 pub fn allocate_channel(
     access: &Access,
-    sccp_id: CallId,
-    pbx_id: PbxCallId,
-    binding: &LineBinding,
-    codec: Codec,
-    pbx_video_formats: &[PbxVideoFormat],
-    assigned_ids: *const sys::ast_assigned_ids,
-    requestor: *const sys::ast_channel,
-    metadata: Option<CallMetadata>,
-    text: ChannelAllocationText,
-    owner: ChannelAllocationOwner,
+    request: ChannelAllocationRequest<'_>,
 ) -> Result<(), ChannelAllocationError> {
+    let ChannelAllocationRequest {
+        sccp_id,
+        pbx_id,
+        binding,
+        codec,
+        pbx_video_formats,
+        assigned_ids,
+        requestor,
+        metadata,
+        text,
+        owner,
+    } = request;
     let Some(format) = format_for(codec) else {
         return Err(ChannelAllocationError::Failed);
     };
@@ -514,8 +517,8 @@ pub fn allocate_channel(
     }
     let media = config.media_for_binding(binding);
     let jitter = config.general.jitter_buffer;
-    if jitter.should_configure_channel(media.is_some_and(|media| media.direct_media)) {
-        if raw::bridge::configure_jitter_buffer(
+    if jitter.should_configure_channel(media.is_some_and(|media| media.direct_media))
+        && raw::bridge::configure_jitter_buffer(
             &channel_borrow,
             jitter.enabled,
             jitter.forced,
@@ -525,10 +528,9 @@ pub fn allocate_channel(
             jitter.implementation,
         )
         .is_err()
-        {
-            unsafe { queue_unavailable(channel) };
-            return Err(ChannelAllocationError::Failed);
-        }
+    {
+        unsafe { queue_unavailable(channel) };
+        return Err(ChannelAllocationError::Failed);
     }
     let private_call = controller_step(&access.shared.controller, |controller| {
         controller.call_privacy(sccp_id).unwrap_or(false)
@@ -541,11 +543,11 @@ pub fn allocate_channel(
         .config()
         .parking_for_line(&binding.line.number)
         .and_then(|parking| parking.lot.clone());
-    if let Some(parking_lot) = parking_lot {
-        if raw::bridge::set_channel_parking_lot(&channel_borrow, &parking_lot).is_err() {
-            unsafe { queue_unavailable(channel) };
-            return Err(ChannelAllocationError::Failed);
-        }
+    if let Some(parking_lot) = parking_lot
+        && raw::bridge::set_channel_parking_lot(&channel_borrow, &parking_lot).is_err()
+    {
+        unsafe { queue_unavailable(channel) };
+        return Err(ChannelAllocationError::Failed);
     }
     let Some(retained) = (unsafe { ChannelRef::acquire(channel) }) else {
         unsafe { queue_unavailable(channel) };
@@ -575,29 +577,25 @@ pub fn allocate_channel(
         VideoSelection::Ready(selected) => {
             let state = video_readiness.unwrap_or(Err(VideoFallbackReason::NativeRtpUnavailable));
             match state {
-                Ok(()) => local_video_endpoint(access, pbx_id, &binding.device_id)
-                    .filter(|endpoint| video_endpoint_is_supported(&selected, *endpoint))
-                    .map_or_else(
-                        || {
-                            (
-                                controller_step(&access.shared.controller, |controller| {
-                                    controller.set_video_audio_only_for_device(
-                                        &binding.device_id,
-                                        selected.session_generation,
-                                        sccp_id,
-                                        VideoFallbackReason::LocalEndpointUnavailable,
-                                    )
-                                }),
-                                false,
-                            )
-                        },
-                        |local_endpoint| {
+                Ok(()) => {
+                    let local_endpoint = local_video_endpoint(access, pbx_id, &binding.device_id)
+                        .filter(|endpoint| video_endpoint_is_supported(&selected, *endpoint));
+                    match local_endpoint {
+                        Some(local_endpoint) => {
+                            let SelectedVideo {
+                                session_generation,
+                                protocol,
+                                mode,
+                                negotiated,
+                                payload,
+                                ..
+                            } = *selected;
                             let plan = VideoPlan {
-                                session_generation: selected.session_generation,
-                                protocol: selected.protocol,
-                                mode: selected.mode,
-                                negotiated: selected.negotiated,
-                                payload: selected.payload,
+                                session_generation,
+                                protocol,
+                                mode,
+                                negotiated,
+                                payload,
                                 local_endpoint,
                             };
                             let installed =
@@ -610,8 +608,20 @@ pub fn allocate_channel(
                                     )
                                 });
                             (installed, installed)
-                        },
-                    ),
+                        }
+                        None => (
+                            controller_step(&access.shared.controller, |controller| {
+                                controller.set_video_audio_only_for_device(
+                                    &binding.device_id,
+                                    selected.session_generation,
+                                    sccp_id,
+                                    VideoFallbackReason::LocalEndpointUnavailable,
+                                )
+                            }),
+                            false,
+                        ),
+                    }
+                }
                 Err(reason) => (
                     controller_step(&access.shared.controller, |controller| {
                         controller.set_video_audio_only_for_device(

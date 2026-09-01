@@ -332,7 +332,7 @@ where
         if registry.contains_key(&key) {
             return Err(ManagerError::RegistrationFailed);
         }
-        registry.insert(key.clone(), registration.clone());
+        registry.insert(key.clone(), Arc::clone(&registration));
     }
 
     let Some(payload) = registration.payload_for_owner() else {

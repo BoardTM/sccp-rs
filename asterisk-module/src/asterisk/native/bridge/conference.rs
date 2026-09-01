@@ -71,7 +71,7 @@ unsafe fn bridge_create(
     }
     let bridge = unsafe {
         sys::ast_bridge_base_new(
-            (sys::AST_BRIDGE_CAPABILITY_1TO1MIX | sys::AST_BRIDGE_CAPABILITY_MULTIMIX) as u32,
+            sys::AST_BRIDGE_CAPABILITY_1TO1MIX | sys::AST_BRIDGE_CAPABILITY_MULTIMIX,
             sys::AST_BRIDGE_FLAG_SMART as c_uint,
             c"SCCP".as_ptr(),
             bridge_id.as_ptr(),
@@ -177,8 +177,7 @@ unsafe fn bridge_merge_channels(
         sources.push(source);
     }
 
-    let mut merged_count = 0usize;
-    for source in &sources {
+    for (merged_count, source) in sources.iter().enumerate() {
         if unsafe { sys::ast_bridge_merge(binding.bridge, source.0, 0, ptr::null_mut(), 0) } != 0 {
             if merged_count > 0 {
                 let _ = unsafe {
@@ -187,7 +186,6 @@ unsafe fn bridge_merge_channels(
             }
             return Err(CallFeatureError::NativeFailure { operation });
         }
-        merged_count += 1;
     }
     Ok(())
 }

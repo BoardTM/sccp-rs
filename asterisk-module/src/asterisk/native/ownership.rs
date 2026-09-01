@@ -56,14 +56,18 @@ impl ConfigLoad {
             0 => Self::Missing,
             -1 => Self::Unchanged,
             -2 => Self::Invalid,
-            _ => Self::Loaded(AstConfigOwner::with_destroy_or_production(value, destroy)),
+            _ => NonNull::new(value).map_or(Self::Missing, |pointer| {
+                Self::Loaded(AstConfigOwner::with_destroy_or_production(pointer, destroy))
+            }),
         }
     }
 }
 
 impl AstConfigOwner {
-    fn with_destroy_or_production(value: *mut sys::ast_config, destroy: ConfigDestroy) -> Self {
-        let pointer = NonNull::new(value).expect("non-sentinel configuration pointer is non-null");
+    fn with_destroy_or_production(
+        pointer: NonNull<sys::ast_config>,
+        destroy: ConfigDestroy,
+    ) -> Self {
         #[cfg(test)]
         {
             return Self::with_destroy(pointer, destroy);

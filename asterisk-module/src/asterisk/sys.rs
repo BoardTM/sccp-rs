@@ -6,6 +6,9 @@
 
 #![allow(
     dead_code,
+    clippy::ptr_offset_with_cast,
+    clippy::upper_case_acronyms,
+    clippy::useless_transmute,
     improper_ctypes,
     non_camel_case_types,
     non_snake_case,

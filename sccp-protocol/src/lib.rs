@@ -186,6 +186,10 @@ pub use server::{
     StationSessionTarget, StationSocketQos, TransmitOpenOutcome, VideoPictureReference,
     VideoPictureReferences, apply_socket_qos,
 };
+pub use server::{
+    ObservationConnectionId, ServerObservation, ServerObservationKind, SignalingDirection,
+    SignalingFidelity, SignalingObservation,
+};
 pub use types::{
     AddonModuleDefinition, AppearanceId, AppearanceRingMode, ApplicationId, AudioProcessingPolicy,
     BlfCallerInfo, BlfSpeedDialDefinition, BlfState, ButtonDefinition, CallDirection, CallId,

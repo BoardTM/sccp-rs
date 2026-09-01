@@ -18,6 +18,11 @@ pub mod registry;
 pub mod sorcery;
 pub mod system;
 
+#[cfg(feature = "telemetry")]
+pub(super) fn pbx_uuid() -> Option<uuid::Uuid> {
+    system::pbx_uuid()
+}
+
 #[cfg(feature = "live-asterisk-tests")]
 pub(super) fn live_bridge_cli_entry() -> crate::asterisk::sys::ast_cli_entry {
     live_bridge_tests::cli_entry()

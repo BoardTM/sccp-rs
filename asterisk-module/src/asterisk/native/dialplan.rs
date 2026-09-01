@@ -392,7 +392,7 @@ fn register(
             drop(generation);
             return Err(DialplanError::RegistrationFailed);
         }
-        *current = Some(generation.clone());
+        *current = Some(Arc::clone(&generation));
         drop(current);
         drop(registry);
         return Ok(NativeDialplanRegistration { slot, generation });
@@ -405,7 +405,7 @@ fn register(
         description,
         max_output_bytes: limits.max_output_bytes,
         function: UnsafeCell::new(unsafe { mem::zeroed() }),
-        current: Mutex::new(Some(generation.clone())),
+        current: Mutex::new(Some(Arc::clone(&generation))),
     });
     if unsafe { register_with_asterisk(&slot) } != 0 {
         drop(registry);
@@ -413,7 +413,7 @@ fn register(
         drop(generation);
         return Err(DialplanError::RegistrationFailed);
     }
-    registry.push(slot.clone());
+    registry.push(Arc::clone(&slot));
     drop(registry);
     Ok(NativeDialplanRegistration { slot, generation })
 }

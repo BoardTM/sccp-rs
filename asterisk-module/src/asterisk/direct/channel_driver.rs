@@ -207,7 +207,7 @@ unsafe extern "C" fn write(channel: *mut sys::ast_channel, frame: *mut sys::ast_
         let Some(private) = private(channel) else {
             return -1;
         };
-        let rtp = if (*frame).frametype as u32 == sys::AST_FRAME_VIDEO {
+        let rtp = if (*frame).frametype == sys::AST_FRAME_VIDEO {
             let Some(video) = private_video_rtp(private) else {
                 return 0;
             };

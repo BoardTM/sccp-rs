@@ -45,6 +45,10 @@ pub use qos::{
     SignalingSocket, SocketQosFailure, SocketQosMark, SocketQosPolicy, SocketQosReport,
     StationSocketQos, apply_socket_qos,
 };
+pub use transport::{
+    ObservationConnectionId, ServerObservation, ServerObservationKind, SignalingDirection,
+    SignalingFidelity, SignalingObservation,
+};
 pub use transport::{ServerIngress, StationIo};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -121,6 +125,7 @@ use crate::types::{
     StationTransportRequirement, TransactionId,
 };
 use transport::AcceptedStation;
+use transport::{ObservationSink, ObservedStationIo};
 
 const EVENT_CAPACITY: usize = 1024;
 const COMMAND_CAPACITY: usize = 1024;
@@ -1881,6 +1886,8 @@ pub struct Server {
     next_call_id: Arc<AtomicU64>,
     latest_media_statistics: Arc<RwLock<HashMap<DeviceId, MediaStatisticsSnapshot>>>,
     call_answer_order: Arc<RwLock<CallSelectionOrder>>,
+    observation_sink: ObservationSink,
+    next_observation_connection_id: AtomicU64,
 }
 
 type Sessions = Arc<Mutex<HashMap<DeviceId, SessionSender>>>;
@@ -2262,6 +2269,15 @@ fn validate_server_config(config: &ServerConfig) -> Result<(), ServerError> {
 }
 
 impl Server {
+    /// Attaches a bounded, nonblocking stream of sanitized signaling records.
+    ///
+    /// Queue saturation never delays phone traffic. Whole observations are
+    /// discarded and the next delivered item reports the loss count.
+    pub fn with_observation_sender(mut self, sender: mpsc::Sender<ServerObservation>) -> Self {
+        self.observation_sink = ObservationSink::new(sender);
+        self
+    }
+
     /// Bind the configured plain TCP endpoint and construct a server.
     ///
     /// The returned tuple contains the inert server, its cloneable command
@@ -2345,6 +2361,8 @@ impl Server {
                 next_call_id,
                 latest_media_statistics,
                 call_answer_order,
+                observation_sink: ObservationSink::default(),
+                next_observation_connection_id: AtomicU64::new(1),
             },
             handle,
             event_rx,
@@ -2515,6 +2533,34 @@ impl Server {
             transport,
             socket_qos,
         } = accepted;
+        let observation_connection_id = self
+            .next_observation_connection_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+            .and_then(ObservationConnectionId::new)
+            .filter(|_| self.observation_sink.is_active());
+        let stream: Box<dyn StationIo> = match observation_connection_id {
+            Some(connection_id) => {
+                self.observation_sink
+                    .observe(ServerObservationKind::Connected {
+                        connection_id,
+                        peer,
+                        local,
+                        transport,
+                    });
+                Box::new(ObservedStationIo::new(
+                    stream,
+                    self.observation_sink.clone(),
+                    connection_id,
+                    peer,
+                    local,
+                    transport,
+                ))
+            }
+            None => stream,
+        };
         let context = SessionContext {
             peer,
             local,
@@ -2531,10 +2577,17 @@ impl Server {
             next_call_id: Arc::clone(&self.next_call_id),
             latest_media_statistics: Arc::clone(&self.latest_media_statistics),
             call_answer_order: Arc::clone(&self.call_answer_order),
+            observation_sink: self.observation_sink.clone(),
+            observation_connection_id,
         };
         let error_tx = self.event_tx.clone();
+        let observation_sink = self.observation_sink.clone();
         tokio::spawn(async move {
-            match run_session(stream, context).await {
+            let result = run_session(stream, context).await;
+            if let Some(connection_id) = observation_connection_id {
+                observation_sink.observe(ServerObservationKind::Disconnected { connection_id });
+            }
+            match result {
                 Ok(()) => debug!(%peer, "SCCP session ended cleanly"),
                 Err(error) => {
                     warn!(%peer, %error, "SCCP session ended with an error");
@@ -2898,6 +2951,8 @@ struct SessionContext {
     next_call_id: Arc<AtomicU64>,
     latest_media_statistics: Arc<RwLock<HashMap<DeviceId, MediaStatisticsSnapshot>>>,
     call_answer_order: Arc<RwLock<CallSelectionOrder>>,
+    observation_sink: ObservationSink,
+    observation_connection_id: Option<ObservationConnectionId>,
 }
 
 #[derive(Debug)]
@@ -3462,6 +3517,15 @@ async fn handle_registration(
         state.generation,
         DeviceEventKind::Registered(state.registration.clone()),
     ));
+    if let Some(connection_id) = context.observation_connection_id {
+        context
+            .observation_sink
+            .observe(ServerObservationKind::Identified {
+                connection_id,
+                device_id: state.device.id.clone(),
+                session_generation: state.generation,
+            });
+    }
     Ok(Some(RegisteredSession { state }))
 }
 

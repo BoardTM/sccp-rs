@@ -98,11 +98,11 @@ jobs:
       matrix:
         include:
           - asterisk: 22.7.0
-            abi: 22plus
+            cache: asterisk22
             feature: asterisk-22
             publish: true
           - asterisk: 23.4.1
-            abi: "23"
+            cache: asterisk23
             feature: asterisk-23
             publish: false
 
@@ -112,6 +112,13 @@ jobs:
           submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve module version
+        id: module
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "asterisk-module") | .version')
+          printf 'version=v%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Asterisk header prerequisites
         run: >-
@@ -129,6 +136,10 @@ jobs:
 
       - name: Test Rust state and configuration
         run: cargo test --locked -p asterisk-module --lib
+
+      - name: Test protocol observation hook
+        if: matrix.publish
+        run: cargo test --locked -p sccp-protocol --lib
 
       - name: Build exact Asterisk module
         env:
@@ -151,15 +162,55 @@ jobs:
             printf 'legacy adapter symbols escaped the private Rust boundary\n' >&2
             exit 1
           fi
-          cp target/release/libchan_sccp2.so "chan_sccp2-asterisk-${{ matrix.abi }}-linux-x86_64.so"
+          if strings target/release/libchan_sccp2.so | grep -F 'sccp.dbg.coral.works' >/dev/null; then
+            printf 'telemetry client escaped into the ordinary artifact\n' >&2
+            exit 1
+          fi
+          cp target/release/libchan_sccp2.so \
+            "chan_sccp2-asterisk-linux-x86_64-${{ steps.module.outputs.version }}.so"
 
       - uses: actions/upload-artifact@v4
         if: matrix.publish
         with:
-          name: chan_sccp2-asterisk-${{ matrix.abi }}-linux-x86_64
-          path: chan_sccp2-asterisk-${{ matrix.abi }}-linux-x86_64.so
+          name: chan_sccp2-asterisk-linux-x86_64-${{ steps.module.outputs.version }}
+          path: chan_sccp2-asterisk-linux-x86_64-${{ steps.module.outputs.version }}.so
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
+
+      - name: Build debug telemetry module
+        if: matrix.publish
+        env:
+          ASTERISK_SOURCE_DIR: ${{ github.workspace }}/asterisk-module/asterisk
+          ASTERISK_BUILD_DIR: ${{ github.workspace }}/asterisk-module/asterisk
+          ASTERISK_VERSION: ${{ matrix.asterisk }}
+        run: >-
+          cargo build --locked --release -p asterisk-module --no-default-features
+          --features ${{ matrix.feature }},telemetry
+
+      - name: Package debug telemetry module
+        if: matrix.publish
+        run: |
+          readelf -h target/release/libchan_sccp2.so > /tmp/chan-sccp2-debug-elf-header
+          grep -q 'Machine:.*Advanced Micro Devices X86-64' /tmp/chan-sccp2-debug-elf-header
+          readelf -d target/release/libchan_sccp2.so > /tmp/chan-sccp2-debug-elf-dynamic
+          grep -q 'SONAME.*chan_sccp2.so' /tmp/chan-sccp2-debug-elf-dynamic
+          nm -D --defined-only target/release/libchan_sccp2.so > /tmp/chan-sccp2-debug-exported-symbols
+          grep -q ' T __internal_chan_sccp2_self$' /tmp/chan-sccp2-debug-exported-symbols
+          if grep -Eq ' [TDB] (rust_sccp_|sccp_ast_)' /tmp/chan-sccp2-debug-exported-symbols; then
+            printf 'legacy adapter symbols escaped the private Rust boundary\n' >&2
+            exit 1
+          fi
+          strings target/release/libchan_sccp2.so | grep -F 'sccp.dbg.coral.works' >/dev/null
+          cp target/release/libchan_sccp2.so \
+            "chan_sccp2-asterisk-debug-linux-x86_64-${{ steps.module.outputs.version }}.so"
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.publish
+        with:
+          name: chan_sccp2-asterisk-debug-linux-x86_64-${{ steps.module.outputs.version }}
+          path: chan_sccp2-asterisk-debug-linux-x86_64-${{ steps.module.outputs.version }}.so
+          if-no-files-found: error
+          retention-days: 30
 
   build-arm64:
     runs-on: ubuntu-24.04-arm
@@ -168,13 +219,22 @@ jobs:
       matrix:
         include:
           - asterisk: 22.7.0
-            abi: 22plus
+            cache: asterisk22
             feature: asterisk-22
 
     steps:
       - uses: actions/checkout@v7
 
       - uses: docker/setup-buildx-action@v3
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve module version
+        id: module
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "asterisk-module") | .version')
+          printf 'version=v%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Build and verify ARM64 ELF module
         run: |
@@ -184,9 +244,9 @@ jobs:
             --progress plain \
             --build-arg "ASTERISK_VERSION=${{ matrix.asterisk }}" \
             --build-arg "ASTERISK_FEATURE=${{ matrix.feature }}" \
-            --build-arg "ASTERISK_ARTIFACT_LANE=${{ matrix.abi }}" \
-            --cache-from "type=gha,scope=asterisk-arm64-${{ matrix.abi }}" \
-            --cache-to "type=gha,mode=max,scope=asterisk-arm64-${{ matrix.abi }}" \
+            --build-arg "MODULE_VERSION=${{ steps.module.outputs.version }}" \
+            --cache-from "type=gha,scope=asterisk-arm64-${{ matrix.cache }}" \
+            --cache-to "type=gha,mode=max,scope=asterisk-arm64-${{ matrix.cache }}" \
             --target artifact \
             --output type=local,dest=dist \
             --file asterisk-module/ci/Dockerfile \
@@ -194,10 +254,34 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: chan_sccp2-asterisk-${{ matrix.abi }}-linux-aarch64
-          path: dist/chan_sccp2-asterisk-${{ matrix.abi }}-linux-aarch64.so
+          name: chan_sccp2-asterisk-linux-aarch64-${{ steps.module.outputs.version }}
+          path: dist/chan_sccp2-asterisk-linux-aarch64-${{ steps.module.outputs.version }}.so
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
+
+      - name: Build and verify ARM64 debug telemetry module
+        run: |
+          docker buildx build \
+            --pull \
+            --platform linux/arm64 \
+            --progress plain \
+            --build-arg "ASTERISK_VERSION=${{ matrix.asterisk }}" \
+            --build-arg "ASTERISK_FEATURE=${{ matrix.feature }},telemetry" \
+            --build-arg "ARTIFACT_VARIANT=debug" \
+            --build-arg "MODULE_VERSION=${{ steps.module.outputs.version }}" \
+            --cache-from "type=gha,scope=asterisk-arm64-${{ matrix.cache }}-debug" \
+            --cache-to "type=gha,mode=max,scope=asterisk-arm64-${{ matrix.cache }}-debug" \
+            --target artifact \
+            --output type=local,dest=dist-debug \
+            --file asterisk-module/ci/Dockerfile \
+            .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chan_sccp2-asterisk-debug-linux-aarch64-${{ steps.module.outputs.version }}
+          path: dist-debug/chan_sccp2-asterisk-debug-linux-aarch64-${{ steps.module.outputs.version }}.so
+          if-no-files-found: error
+          retention-days: 30
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -243,18 +327,41 @@ jobs:
         run: |
           release_tag="$GITHUB_REF_NAME"
           release_version="${release_tag#v}"
-          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            printf 'Release %s already exists; nothing to publish\n' "$release_tag"
-            exit 0
+          assets=(
+            "dist/chan_sccp2-asterisk-linux-x86_64-v${release_version}.so"
+            "dist/chan_sccp2-asterisk-linux-aarch64-v${release_version}.so"
+            "dist/chan_sccp2-asterisk-debug-linux-x86_64-v${release_version}.so"
+            "dist/chan_sccp2-asterisk-debug-linux-aarch64-v${release_version}.so"
+            dist/SHA256SUMS
+          )
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+          done
+          if ! gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$release_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --verify-tag \
+              --title "chan_sccp2 v${release_version}" \
+              --notes "Precompiled normal and opt-in debug telemetry modules for Linux x86_64 and ARM64/aarch64. Built against Asterisk 22.7.0 and compatibility-tested with Asterisk 22 and 23." \
+              --generate-notes \
+              --latest
           fi
-          gh release create "$release_tag" \
-            dist/chan_sccp2-asterisk-22plus-linux-x86_64.so \
-            dist/chan_sccp2-asterisk-22plus-linux-aarch64.so \
-            dist/SHA256SUMS \
+          existing_assets=$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')
+          while IFS= read -r existing_asset; do
+            case "$existing_asset" in
+              "chan_sccp2-asterisk-linux-x86_64-v${release_version}.so" | \
+              "chan_sccp2-asterisk-linux-aarch64-v${release_version}.so" | \
+              "chan_sccp2-asterisk-debug-linux-x86_64-v${release_version}.so" | \
+              "chan_sccp2-asterisk-debug-linux-aarch64-v${release_version}.so")
+                ;;
+              chan_sccp2-asterisk-*.so)
+                gh release delete-asset "$release_tag" "$existing_asset" \
+                  --repo "$GITHUB_REPOSITORY" --yes
+                ;;
+            esac
+          done <<< "$existing_assets"
+          gh release upload "$release_tag" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --verify-tag \
-            --title "chan_sccp2 v${release_version}" \
-            --notes "Precompiled Linux x86_64 and ARM64/aarch64 modules for the Asterisk 22+ ABI generation. Built against Asterisk 22.7.0 and compatibility-tested with Asterisk 22 and 23." \
-            --generate-notes \
-            --latest
+            --clobber

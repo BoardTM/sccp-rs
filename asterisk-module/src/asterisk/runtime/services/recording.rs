@@ -2,12 +2,12 @@
 
 use super::{
     Access, AmiRecordingCommand, AnchoredRecordingSession, Arc, AsteriskBackend, CallId, CallState,
-    ConfirmedRecordingAnchor, DeviceId, LogLevel, MediaAnchorMutation, PbxCallId,
-    PbxServiceCapabilities as _, PendingRecordingAnchor, PhoneCommand, PhoneCommandAction,
-    RecordingCallback, RecordingDirection, RecordingEvent, RecordingProvider as _,
-    RecordingRegistryError, RecordingSessionControl as _, RecordingState, RecordingTogglePlan,
-    RecordingToggleRejection, RuntimeRecordings, ServiceOutcome, ServiceProviderError, ast_log,
-    controller_step, ordered_recording_start, ordered_recording_stop, plan_recording_toggle,
+    ConfirmedRecordingAnchor, DeviceId, LogLevel, MediaAnchorMutation, PbxServiceCapabilities as _,
+    PendingRecordingAnchor, PhoneCommand, PhoneCommandAction, RecordingCallback, RecordingEvent,
+    RecordingProvider as _, RecordingRegistryError, RecordingServiceRequest,
+    RecordingSessionControl as _, RecordingState, RecordingTogglePlan, RecordingToggleRejection,
+    RuntimeRecordings, ServiceOutcome, ServiceProviderError, ast_log, controller_step,
+    ordered_recording_start, ordered_recording_stop, plan_recording_toggle,
     prepare_anchor_retarget, prepare_direct_retarget, send_confirmed_service,
 };
 
@@ -24,13 +24,16 @@ pub fn recording_registry_service_error<E>(
 pub async fn recording_service_operation(
     access: &Access,
     recordings: &mut RuntimeRecordings,
-    command: AmiRecordingCommand,
-    call_id: PbxCallId,
-    filename: Option<String>,
-    append: bool,
-    bridged_only: bool,
-    direction: Option<RecordingDirection>,
+    request: RecordingServiceRequest,
 ) -> Result<ServiceOutcome, ServiceProviderError> {
+    let RecordingServiceRequest {
+        command,
+        call_id,
+        filename,
+        append,
+        bridged_only,
+        direction,
+    } = request;
     let recordings = &mut recordings.sessions;
     let (device_id, handset_call_id) = controller_step(&access.shared.controller, |controller| {
         controller
@@ -291,12 +294,14 @@ pub async fn toggle_monitor_recording(
     recording_service_operation(
         access,
         recordings,
-        command,
-        call.pbx_id,
-        filename,
-        false,
-        false,
-        None,
+        RecordingServiceRequest {
+            command,
+            call_id: call.pbx_id,
+            filename,
+            append: false,
+            bridged_only: false,
+            direction: None,
+        },
     )
     .await
 }

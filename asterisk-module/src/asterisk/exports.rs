@@ -3,8 +3,8 @@
 use super::boundary::MutexExt as _;
 use super::raw::handles::ChannelRef;
 use super::runtime::{
-    Access, AsteriskBackend, ChannelAllocationOwner, ChannelBinding, Module,
-    RuntimeCallSignalDeliveryError, RuntimeCallSignalDeliveryResult, RuntimeCallSignalKind,
+    Access, AsteriskBackend, ChannelAllocationOwner, ChannelAllocationRequest, ChannelBinding,
+    Module, RuntimeCallSignalDeliveryError, RuntimeCallSignalDeliveryResult, RuntimeCallSignalKind,
     RuntimeCliDiagnosticError, RuntimeCliInventoryError, allocate_channel, ast_log, audio_framing,
     channel_binding, complete_runtime_cli_diagnostics, complete_runtime_cli_inventory, config_path,
     configured_audio_processing, configured_dtmf_mode, device_state, direct_media_call,
@@ -470,14 +470,13 @@ pub fn start_module() -> Result<(), ModuleLifecycleError> {
             *module = Some(started);
             drop(module);
             install_mwi(&access);
-            if source == ConfigurationSource::Sorcery {
-                if let Err(error) = reload_sorcery(&access, ConfigReconciliationTrigger::startup())
-                {
-                    ast_log(
-                        LogLevel::Warning,
-                        &format!("initial SCCP Sorcery reconciliation failed: {error}"),
-                    );
-                }
+            if source == ConfigurationSource::Sorcery
+                && let Err(error) = reload_sorcery(&access, ConfigReconciliationTrigger::startup())
+            {
+                ast_log(
+                    LogLevel::Warning,
+                    &format!("initial SCCP Sorcery reconciliation failed: {error}"),
+                );
             }
             Ok(())
         }
@@ -767,16 +766,14 @@ pub unsafe fn request_channel(
             cause: Some(REQUESTED_CHANNEL_UNAVAILABLE),
         });
     }
-    if !forwarded {
-        if let Some(snapshot) = requestor_party.as_ref() {
-            // These appearances have not been offered yet; store the
-            // typed seed and let `place_call` perform the first send.
-            let _ = controller_step(&access.shared.controller, |controller| {
-                controller.update_call_info_by_pbx(pbx_id, |current| {
-                    snapshot.apply_initial_inbound_to_call_info(current)
-                })
-            });
-        }
+    if !forwarded && let Some(snapshot) = requestor_party.as_ref() {
+        // These appearances have not been offered yet; store the
+        // typed seed and let `place_call` perform the first send.
+        let _ = controller_step(&access.shared.controller, |controller| {
+            controller.update_call_info_by_pbx(pbx_id, |current| {
+                snapshot.apply_initial_inbound_to_call_info(current)
+            })
+        });
     }
     let directly_requested = pbx_audio_format(primary_codec)
         .ok()
@@ -803,16 +800,18 @@ pub unsafe fn request_channel(
     }
     if allocate_channel(
         &access,
-        primary_call_id,
-        pbx_id,
-        &primary_binding,
-        primary_codec,
-        &request_video_formats,
-        assigned_ids,
-        requestor,
-        Some(metadata),
-        allocation_text,
-        ChannelAllocationOwner::Asterisk,
+        ChannelAllocationRequest {
+            sccp_id: primary_call_id,
+            pbx_id,
+            binding: &primary_binding,
+            codec: primary_codec,
+            pbx_video_formats: &request_video_formats,
+            assigned_ids,
+            requestor,
+            metadata: Some(metadata),
+            text: allocation_text,
+            owner: ChannelAllocationOwner::Asterisk,
+        },
     )
     .is_err()
     {
@@ -872,9 +871,7 @@ pub unsafe fn place_call(
         .lock_unpoisoned()
         .remove(&state.pbx_id);
     let Some((line, offers)) = controller_step(&access.shared.controller, |controller| {
-        let Some(call) = controller.pbx_call(state.pbx_id) else {
-            return None;
-        };
+        let call = controller.pbx_call(state.pbx_id)?;
         let offers = controller
             .inbound_offers_for_pbx(state.pbx_id)
             .into_iter()
@@ -1120,7 +1117,7 @@ pub unsafe fn indicate_channel(
             let Some(snapshot) = read_party_snapshot(channel_ptr) else {
                 return Err(ChannelOperationError::Invalid);
             };
-            RuntimeCallSignalKind::PartyUpdate(snapshot)
+            RuntimeCallSignalKind::PartyUpdate(Box::new(snapshot))
         }
         ChannelIndication::SourceUpdate
         | ChannelIndication::SourceChange

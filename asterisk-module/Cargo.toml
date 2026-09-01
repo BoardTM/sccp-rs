@@ -31,21 +31,39 @@ default = ["development"]
 development = []
 asterisk-22 = []
 asterisk-23 = []
+telemetry = [
+    "dep:base64",
+    "dep:futures-util",
+    "dep:prost",
+    "dep:prost-build",
+    "dep:protoc-bin-vendored",
+    "dep:sha2",
+    "dep:tokio-tungstenite",
+    "dep:uuid",
+]
 live-asterisk-tests = []
 
 [dependencies]
 sccp-protocol = { path = "../sccp-protocol" }
+base64 = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 form_urlencoded.workspace = true
+prost = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
+tokio-tungstenite = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [build-dependencies]
 bindgen = "0.72"
+prost-build = { workspace = true, optional = true }
+protoc-bin-vendored = { workspace = true, optional = true }
 
 [dev-dependencies]
 proc-macro2 = { version = "1", features = ["span-locations"] }

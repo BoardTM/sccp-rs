@@ -97,6 +97,8 @@ pub fn requestor_auto_answer_mode(
 
 pub fn ast_log(level: LogLevel, message: &str) {
     raw::system::log_message(level, message);
+    #[cfg(feature = "telemetry")]
+    crate::asterisk::telemetry::record_log(level, message);
 }
 
 fn read_snapshot_with<T, Borrowed, BorrowError, CopyError>(

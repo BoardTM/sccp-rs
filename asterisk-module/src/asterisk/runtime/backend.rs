@@ -28,16 +28,16 @@ use super::{
 };
 use super::{
     AsteriskRecording, BridgeBackend, CString, CallDirection, CallInfo, CallServiceBackend,
-    ChannelAllocationOwner, ChannelBackend, ChannelBinding, ConferenceDestinationOperation,
-    ConferenceTaskStartError, ForwardingOperation, ForwardingRouteReason, IpAddr, IpAddressType,
-    Ipv4Addr, LineBinding, LineInstance, MANAGER_CONTROL_DELIVERY_TIMEOUT, ManagementBackend,
-    ManagementEvent, MediaBackend, MediaEndpointAddress, MultimediaReceiveDescriptor,
-    MultimediaTransmitControl, MultimediaTransmitDescriptor, NORMAL_CLEARING, PbxVideoFormat,
-    PickupOutcome, ProtocolVersion, RecordingCallback, RecordingDirection, RecordingProvider,
-    RecordingSession, RecordingSessionControl, RecordingState, SupplementaryBackend,
-    TransferCompletion, VoicemailOperation, allocate_channel, call_event,
-    configured_video_traffic_class, native_pickup_result, prepare_channel_allocation_text, ptr,
-    with_channels, with_two_channels,
+    ChannelAllocationOwner, ChannelAllocationRequest, ChannelBackend, ChannelBinding,
+    ConferenceDestinationOperation, ConferenceTaskStartError, ForwardingOperation,
+    ForwardingRouteReason, IpAddr, IpAddressType, Ipv4Addr, LineBinding, LineInstance,
+    MANAGER_CONTROL_DELIVERY_TIMEOUT, ManagementBackend, ManagementEvent, MediaBackend,
+    MediaEndpointAddress, MultimediaReceiveDescriptor, MultimediaTransmitControl,
+    MultimediaTransmitDescriptor, NORMAL_CLEARING, PbxVideoFormat, PickupOutcome, ProtocolVersion,
+    RecordingCallback, RecordingDirection, RecordingProvider, RecordingSession,
+    RecordingSessionControl, RecordingState, SupplementaryBackend, TransferCompletion,
+    VoicemailOperation, allocate_channel, call_event, configured_video_traffic_class,
+    native_pickup_result, prepare_channel_allocation_text, ptr, with_channels, with_two_channels,
 };
 use crate::media::encryption::LocalEncryptionCapabilities;
 use crate::runtime::backend::PbxBackend as _;
@@ -150,7 +150,7 @@ pub async fn execute_call_transition_result(
     let line = controller_step(&access.shared.controller, |controller| {
         controller
             .active_or_primary_call_by_pbx(transition.target_pbx_id)
-            .map(|call| call.line.clone())
+            .map(|call| call.line)
     });
     let backend = AsteriskBackend::new(access);
     let mut progress = CallTransitionProgress::default();
@@ -1563,11 +1563,11 @@ pub async fn handle_effect_error(
                         | HandsetEffect::BeginOutboundMedia { .. }
                 ) {
                     let cleanup = controller_step(&access.shared.controller, |controller| {
-                        controller
-                            .barge_session(call_id)
-                            .is_some()
-                            .then(|| controller.abort_barge(call_id, true, true))
-                            .unwrap_or_default()
+                        if controller.barge_session(call_id).is_some() {
+                            controller.abort_barge(call_id, true, true)
+                        } else {
+                            Vec::new()
+                        }
                     });
                     if !cleanup.is_empty() {
                         let barger_pbx = cleanup.iter().find_map(|effect| match effect {

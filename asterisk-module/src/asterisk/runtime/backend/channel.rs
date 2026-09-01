@@ -2,9 +2,9 @@
 
 use super::{
     AsteriskBackend, AsteriskBackendError, AsteriskChannel, AsteriskChannelMetadata, CString,
-    CallId, ChannelAllocationOwner, ChannelBackend, Codec, LineBinding, NORMAL_CLEARING, NonNull,
-    PbxCallId, PbxVideoFormat, allocate_channel, c_string, controller_step, native_channel,
-    prepare_channel_allocation_text, ptr, with_channel,
+    CallId, ChannelAllocationOwner, ChannelAllocationRequest, ChannelBackend, Codec, LineBinding,
+    NORMAL_CLEARING, NonNull, PbxCallId, PbxVideoFormat, allocate_channel, c_string,
+    controller_step, native_channel, prepare_channel_allocation_text, ptr, with_channel,
 };
 
 struct RoutingText {
@@ -45,16 +45,18 @@ impl ChannelBackend for AsteriskBackend<'_> {
             .map_err(|source| AsteriskBackendError::ChannelAllocation { call_id, source })?;
         allocate_channel(
             self.access,
-            handset_call_id,
-            call_id,
-            binding,
-            codec,
-            &PbxVideoFormat::ALL,
-            ptr::null(),
-            ptr::null(),
-            None,
-            text,
-            ChannelAllocationOwner::Module,
+            ChannelAllocationRequest {
+                sccp_id: handset_call_id,
+                pbx_id: call_id,
+                binding,
+                codec,
+                pbx_video_formats: &PbxVideoFormat::ALL,
+                assigned_ids: ptr::null(),
+                requestor: ptr::null(),
+                metadata: None,
+                text,
+                owner: ChannelAllocationOwner::Module,
+            },
         )
         .map_err(|source| AsteriskBackendError::ChannelAllocation { call_id, source })
     }
@@ -72,16 +74,18 @@ impl ChannelBackend for AsteriskBackend<'_> {
         let created = with_channel(self.access, source_call_id, |source| {
             allocate_channel(
                 self.access,
-                handset_call_id,
-                call_id,
-                binding,
-                codec,
-                &PbxVideoFormat::ALL,
-                ptr::null(),
-                source.cast_const(),
-                None,
-                text,
-                ChannelAllocationOwner::Module,
+                ChannelAllocationRequest {
+                    sccp_id: handset_call_id,
+                    pbx_id: call_id,
+                    binding,
+                    codec,
+                    pbx_video_formats: &PbxVideoFormat::ALL,
+                    assigned_ids: ptr::null(),
+                    requestor: source.cast_const(),
+                    metadata: None,
+                    text,
+                    owner: ChannelAllocationOwner::Module,
+                },
             )
         })
         .ok_or(AsteriskBackendError::CallUnavailable {

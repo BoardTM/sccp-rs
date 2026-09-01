@@ -550,6 +550,19 @@ impl Module {
             dialplan_registrations: Mutex::new(Vec::new()),
             http_registrations: Mutex::new(Vec::new()),
         });
+        #[cfg(feature = "telemetry")]
+        let telemetry = crate::asterisk::telemetry::TelemetryReporter::start(
+            runtime.handle(),
+            Arc::downgrade(&shared),
+        );
+        #[cfg(feature = "telemetry")]
+        let server = match telemetry
+            .as_ref()
+            .and_then(crate::asterisk::telemetry::TelemetryReporter::observation_sender)
+        {
+            Some(sender) => server.with_observation_sender(sender),
+            None => server,
+        };
         let directory_registration = register_directory_http(
             RuntimeDirectoryProvider {
                 shared: Arc::downgrade(&shared),
@@ -711,6 +724,8 @@ impl Module {
             event_task,
             parking_subscription,
             sorcery_registration: None,
+            #[cfg(feature = "telemetry")]
+            telemetry,
         })
     }
 
@@ -737,7 +752,7 @@ impl Module {
         // handset cleanup commands below.
         self.event_task.abort();
         let phone = self.access.phone.clone();
-        let _ = self.runtime.block_on(async {
+        self.runtime.block_on(async {
             let _ = tokio::time::timeout(Duration::from_secs(2), &mut self.event_task).await;
             shutdown_conferences(&self.access).await;
             shutdown_remote_hangups(&self.access).await;
@@ -766,6 +781,10 @@ impl Module {
             );
         }
         self.parking_subscription.unsubscribe();
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &mut self.telemetry {
+            self.runtime.block_on(telemetry.shutdown());
+        }
         self.runtime.shutdown_timeout(Duration::from_secs(1));
     }
 }

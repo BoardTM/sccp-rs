@@ -424,8 +424,14 @@ pub(super) async fn handle_forwarding_soft_key(
         first_digit_timeout: Duration::from_millis(config.general.first_digit_timeout_ms),
         interdigit_timeout: Duration::from_millis(config.general.interdigit_timeout_ms),
     };
-    let dial_terminator = dial_terminator_digit(config.general.dial_terminator.character)
-        .expect("configuration parser validated the forwarding dial terminator");
+    let Ok(dial_terminator) = dial_terminator_digit(config.general.dial_terminator.character)
+    else {
+        ast_log(
+            LogLevel::Error,
+            "configured forwarding dial terminator is invalid",
+        );
+        return;
+    };
     drop(config);
     let Some(binding) = binding.filter(|_| enabled) else {
         return;

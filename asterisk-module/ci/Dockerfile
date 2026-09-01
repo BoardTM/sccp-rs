@@ -49,7 +49,8 @@ RUN cd /opt/asterisk-source \
 FROM asterisk-source AS artifact-build
 
 ARG ASTERISK_FEATURE
-ARG ASTERISK_ARTIFACT_LANE
+ARG ARTIFACT_VARIANT=normal
+ARG MODULE_VERSION
 ARG TARGETARCH
 
 WORKDIR /workspace
@@ -73,9 +74,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && grep -q ' T __internal_chan_sccp2_self$' /tmp/chan-sccp2-exported-symbols \
     && ! grep -Eq ' [TDB] (rust_sccp_|sccp_ast_)' /tmp/chan-sccp2-exported-symbols \
     && mkdir /output \
-    && artifact_lane="${ASTERISK_ARTIFACT_LANE:-${ASTERISK_VERSION%%.*}}" \
+    && [[ "${MODULE_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] \
+    && case "${ARTIFACT_VARIANT}" in \
+        normal) \
+            artifact_prefix=chan_sccp2-asterisk; \
+            ! strings target/release/libchan_sccp2.so | grep -F sccp.dbg.coral.works >/dev/null \
+            ;; \
+        debug) \
+            artifact_prefix=chan_sccp2-asterisk-debug; \
+            strings target/release/libchan_sccp2.so | grep -F sccp.dbg.coral.works >/dev/null \
+            ;; \
+        *) printf 'unsupported artifact variant: %s\n' "${ARTIFACT_VARIANT}" >&2; exit 2 ;; \
+    esac \
     && cp target/release/libchan_sccp2.so \
-        "/output/chan_sccp2-asterisk-${artifact_lane}-linux-${artifact_arch}.so"
+        "/output/${artifact_prefix}-linux-${artifact_arch}-${MODULE_VERSION}.so"
 
 FROM scratch AS artifact
 COPY --from=artifact-build /output/ /
