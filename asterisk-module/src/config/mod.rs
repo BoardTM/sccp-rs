@@ -511,10 +511,10 @@ enum GeneralOption {
     /// Orders primary and failover endpoints presented to stations.
     ServerPriority,
     /// Adds codecs to the default allowed media set.
-    /// Extends the codec policy inherited by SCCP lines and devices.
+    /// Starts that set from empty, so it replaces the built-in mapped codecs.
     Allow,
-    /// Removes codecs from the default allowed media set.
-    /// Restricts the codec policy inherited by SCCP lines and devices.
+    /// Removes codecs from the set being built for general configuration.
+    /// Applies in written order, so `all` clears the set before any allow.
     Disallow,
     #[serde(rename = "meetme")]
     /// Enables the default conference application integration.
@@ -721,10 +721,10 @@ enum LineOption {
     /// Controls which registration contexts gain an extension.
     RegistrationExtension,
     /// Adds codecs to the allowed media set for the line.
-    /// Extends the codec policy inherited from the device and general settings.
+    /// Starts that set from empty, so it replaces the inherited general set.
     Allow,
-    /// Removes codecs from the allowed media set for the line.
-    /// Restricts the codec policy inherited from the device and general settings.
+    /// Removes codecs from the set being built for the line.
+    /// Applies in written order, so `all` clears the set before any allow.
     Disallow,
     #[serde(alias = "videomode")]
     /// Sets how video is negotiated on the line.
@@ -986,10 +986,10 @@ enum DeviceOption {
     /// Rejects it and directs configuration to the force-DTMF option.
     ObsoleteDtmfMode,
     /// Adds codecs to the device's allowed media set.
-    /// Extends the codec policy inherited from general configuration.
+    /// Starts that set from empty, so it replaces the inherited general set.
     Allow,
-    /// Removes codecs from the device's allowed media set.
-    /// Restricts the codec policy inherited from general configuration.
+    /// Removes codecs from the set being built for the device.
+    /// Applies in written order, so `all` clears the set before any allow.
     Disallow,
     /// Adds a line appearance button to the device.
     /// Resolves the configured line and assigns its next device instance.

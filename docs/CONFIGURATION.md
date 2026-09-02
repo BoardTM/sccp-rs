@@ -90,9 +90,12 @@ deny =                       ; clear the inherited rules
 permit = 192.0.2.0/24
 ```
 
-Three `[general]` options are exempt from the duplicate check and simply take
-the last value written: `server_name`, `keepalive` and `secondary_keepalive`.
-Line `label`, `context` and `callerid` behave the same way.
+Some options are exempt from the duplicate check and simply take the last
+value written: `server_name`, `keepalive` and `secondary_keepalive` in
+`[general]`; `label`, `context` and `callerid` on a line; and `description` and
+`type` on a device. A repeat of any of these is accepted in place of the error
+the rule above would lead you to expect, and canonical output keeps both
+occurrences.
 
 ### Values
 
@@ -207,13 +210,16 @@ supplies. They cannot be combined with `configuration_source = sorcery`.
 | `bind` | `address:port` | `0.0.0.0:2000` | Combined clear-listener endpoint |
 | `bind_address` | IPv4 or IPv6 address | `0.0.0.0` | Clear-listener address |
 | `port` | 1–65535 | `2000` | Clear-listener port |
-| `tls_bind` | `address:port` | `0.0.0.0:2443` | Combined TLS-listener endpoint |
-| `tls_bind_address` | IPv4 or IPv6 address | `0.0.0.0` | TLS-listener address |
-| `tls_port` | 1–65535 | `2443` | TLS-listener port |
+| `tls_bind` | `address:port` | none | Combined TLS-listener endpoint |
+| `tls_bind_address` | IPv4 or IPv6 address | `0.0.0.0` when a TLS listener is configured | TLS-listener address |
+| `tls_port` | 1–65535 | `2443` when a TLS listener is configured | TLS-listener port |
 
 `bind` is a shorthand for `bind_address` plus `port`, and the two forms may not
 be combined. The same holds for `tls_bind` against `tls_bind_address` and
 `tls_port`. The clear and TLS listeners must not resolve to the same socket.
+There is no TLS listener unless one of the three TLS listener options is set,
+and setting any of them without complete [TLS credentials](#tls-credentials)
+rejects the file.
 
 ### TLS credentials
 
@@ -266,6 +272,10 @@ Rules are evaluated in the order written, so the usual shape is a broad `deny`
 followed by the specific `permit` entries. An empty value clears the rules
 accumulated so far. Devices may replace this list with their own.
 
+These rules are validated and retained but are not yet enforced on a live
+connection, so they must not be relied on as the only station admission
+control. Restrict reachability of the listener port at the network layer.
+
 ### Quality of service
 
 | Option | Type / values | Default | Meaning |
@@ -282,7 +292,10 @@ accumulated so far. Devices may replace this list with their own.
 
 A DSCP value is `0`–`63` or one of the names listed under
 [DSCP names](#dscp-names). A TOS byte is `0`–`255` or `0x00`–`0xff`, or a DSCP
-name, and is stored as the byte shifted right by two. Each traffic class has one
+name. A `*_tos` value is read as a DSCP first, so a DSCP name or a bare decimal
+`0`–`63` is stored unchanged; only a value that is not already a DSCP — hex, or
+decimal `64`–`255` — is shifted right by two. Write the legacy byte in hex to
+get the shift. Each traffic class has one
 DSCP slot, so `sccp_tos` and `sccp_dscp` may not both be set, and likewise for
 the audio and video pairs.
 
@@ -384,15 +397,16 @@ unique, and free of whitespace, `&` and `@`. Lines without an explicit
 
 | Option | Type / values | Default | Meaning |
 | --- | --- | --- | --- |
-| `hotline_enabled` | boolean | `yes` | Let unknown devices register onto a guest hotline |
+| `hotline_enabled` | boolean | `no` | Let unknown devices register onto a guest hotline |
 | `hotline_extension` | destination | `111` | Extension the hotline dials |
 | `hotline_context` | string | `default` | Context in which that extension is resolved |
 | `hotline_label` | string | `hotline` | Station-facing label for the hotline appearance |
 
-The guest hotline is **enabled by default**. A device that is not configured in
-`sccp.conf` can therefore register and reach `111@default` unless you turn it
-off. Set `hotline_enabled = no` to require every phone to be configured. When it
-is enabled, the extension, context and label must all be present.
+The guest hotline is **disabled by default**, so only configured phones may
+register. Set `hotline_enabled = yes` to let an unconfigured device register and
+reach the hotline extension; setting the extension, context or label alone does
+not enable it. When it is enabled, the extension, context and label must all be
+present.
 
 ### Media defaults
 
@@ -403,16 +417,18 @@ is enabled, the extension, context and label must all be present.
 | `echocancel` | boolean | `yes` | Default handset echo cancellation |
 | `silencesuppression` | boolean | `no` | Default voice-activity transmission |
 | `audio_encryption` | encryption policy | `off` | Default SRTP policy for audio channels |
-| `allow` | codec list, repeatable | all mapped audio codecs | Add codecs to the default set |
-| `disallow` | codec list, repeatable | — | Remove codecs from the default set |
+| `allow` | codec list, repeatable | all mapped audio codecs | Codecs allowed, replacing the default set |
+| `disallow` | codec list, repeatable | — | Codecs removed from the set being built |
 
 Keep `direct_media = no` while bringing a deployment up: anchoring RTP at
 Asterisk makes NAT and firewall problems far easier to diagnose.
 
 With no codec directives, each registered phone advertises its mapped audio
 formats and Asterisk chooses the best direct or translated path. Use
-`disallow`/`allow` only to restrict that set. See [Codecs](#codecs) and
-[Audio encryption](#audio-encryption).
+`disallow`/`allow` only to restrict that set. A scope that names any codec
+directive starts from an empty set rather than from the inherited one, so open
+with `disallow = all` and then list what the scope allows. See
+[Codecs](#codecs) and [Audio encryption](#audio-encryption).
 
 ### Jitter buffer
 
@@ -551,8 +567,8 @@ normalized to `reject`.
 | `early_media` | extended boolean | the general value | Open media before answer |
 | `force_dtmf_mode` | `auto` \| `rfc2833` \| `skinny` | `auto` | Force a DTMF transport |
 | `audio_encryption` | encryption policy | the general value | SRTP policy for this device |
-| `allow` | codec list, repeatable | the general set | Add codecs for this device |
-| `disallow` | codec list, repeatable | — | Remove codecs for this device |
+| `allow` | codec list, repeatable | the general set | Codecs allowed, replacing the general set |
+| `disallow` | codec list, repeatable | — | Codecs removed from the set being built |
 | `allow_overlap` | boolean | the general value | Overlap dialing for this device |
 
 ### Button assignment
@@ -668,10 +684,13 @@ all lines. PINs are redacted from diagnostics.
 | `echocancel` | boolean | the general value | Echo cancellation |
 | `silencesuppression` | boolean | the general value | Silence suppression |
 | `audio_encryption` | encryption policy | the general value | SRTP policy for this line |
-| `allow` | codec list, repeatable | the general set | Add codecs for this line |
-| `disallow` | codec list, repeatable | — | Remove codecs for this line |
+| `allow` | codec list, repeatable | the general set | Codecs allowed, replacing the inherited set |
+| `disallow` | codec list, repeatable | — | Codecs removed from the set being built |
 
-Codec policy resolves line first, then device, then general.
+Codec policy resolves line first, then device, then general. A scope inherits
+the next set up only while it names no codec directive at all; one `allow` or
+`disallow` makes that scope build its set from empty, which is why `disallow`
+on its own is rejected for leaving no audio codec.
 
 ## Buttons
 
@@ -695,6 +714,7 @@ button = empty
 | `speed_dial` | `speed_dial, <label>, <number>` |
 | `speed_dial` with presence | `speed_dial, <label>, <number>, <extension@context>` |
 | `blf` | `blf, <label>, <number>, <extension@context>` |
+| `blf_speed_dial` | Alternative spelling of `blf`, with the same fields |
 | `feature` | `feature, <label>, <feature>[, argument …]` |
 | `service` | `service, <label>, <url>` |
 | `addon` | `addon, <slot>, <type>` |
@@ -725,12 +745,13 @@ button = line, 1001, label=Main desk, caller_name=Reception, caller_number=1001,
 line = 1002
 ```
 
-An option key may not repeat within one button.
+An option key may not repeat within one button. `ring_mode` is accepted for
+`ring` and `subscription_identity` for `subscription`.
 
 ### Feature button arguments
 
-A `feature` button names one of the [feature names](#feature-names) and may take
-arguments:
+A `feature` button names one of the [feature names](#feature-names), or
+`monitor`, and may take arguments:
 
 - A `dnd` button takes `silent`, `reject` or `busy` (normalized to `reject`) to
   fix its mode. Omit the argument to cycle off, reject and silent.
@@ -753,10 +774,11 @@ feature_default = 1, off
 
 Instances are counted per button kind, not by physical position, so the first
 `feature` button on a device is instance 1 regardless of how many line or
-speed-dial buttons precede it. Two kinds share the feature counter: `blf`
-buttons, and the four-field `speed_dial` form with a hint. Those consume a
-feature instance but cannot be addressed by `feature_default`, so a device
-with a `blf` button ahead of its feature buttons starts numbering them at 2:
+speed-dial buttons precede it. Three kinds share the feature counter: `blf`
+buttons, the four-field `speed_dial` form with a hint, and the `monitor`
+recording button. Those consume a feature instance but cannot be addressed by
+`feature_default`, so a device with a `blf` button ahead of its feature buttons
+starts numbering them at 2:
 
 ```ini fragment=device
 button = blf, Warehouse, 2001, 2001@from-internal
@@ -818,7 +840,7 @@ the built-in defaults. List every mode you want populated.
 
 Tone options accept a tone name or a numeric value `0`–`255`, also written as
 `0x00`–`0xff`. Common names are `Inside Dial Tone`, `Outside Dial Tone`,
-`CallWaiting`, `Zip`, `Busy Tone`, `Reorder Tone`, `Alerting Tone` and
+`CallWaiting`, `Zip`, `Line Busy Tone`, `Reorder Tone`, `Alerting Tone` and
 `No Tone`. Name matching ignores case and punctuation, so `insidedialtone`
 works. Where the table above says `0` disables the tone, a numeric zero is the
 disable form.
@@ -857,13 +879,18 @@ names `lowdelay`, `throughput`, `reliability` and `mincost`.
 `queue`, `quality_report_tool` for `quality_report`, and
 `acoustic_echo_cancellation` for `echo_cancellation`.
 
+`monitor` is not in this list. A `feature` button naming it builds a recording
+button instead of an ordinary feature button, as described under
+[Feature button arguments](#feature-button-arguments).
+
 ### Addon types
 
 `7914`, `791512`, `791524`, `791612`, `791624`, `spa500s`, `spa500ds`,
 `spa932ds`.
 
-Each type also accepts a `cisco` or `addon` prefix, so `cisco7914` and
-`addon7914` name the same module as `7914`.
+The Cisco modules also accept a `cisco` or `ciscoaddon` prefix, so `cisco7914`
+and `ciscoaddon7914` name the same module as `7914`. The SPA modules accept an
+`addon` prefix instead, so `addonspa500s` names the same module as `spa500s`.
 
 ### Codecs
 
@@ -877,10 +904,11 @@ allow = ulaw, alaw, g722
 ```
 
 Audio codecs include `ulaw`, `alaw`, `gsm`, `g722`, `g7221`, `g723`, `g726`,
-`g728`, `g729`, `ilbc`, `isac`, `opus`, `slin16` and `amr`/`amrwb`. Video
-codecs include `h261`, `h263`, `h264` and `h265`. At most 32 preferences are
-accepted, at least one audio codec must remain, and every audio codec must have
-an Asterisk format mapping.
+`g729`, `ilbc`, `opus` and `slin16`. Video codecs include `h261`, `h263`,
+`h264` and `h265`. At most 32 preferences are accepted, and at least one audio
+codec must remain. Every audio codec must have an Asterisk format mapping, so
+the station-only names `g728`, `isac`, `amr` and `amrwb` are recognized but
+rejected with the format that is missing.
 
 ### Audio encryption
 
@@ -999,8 +1027,8 @@ callerid = "Reception" <1001>
 mailbox = 1001@default
 ```
 
-`hotline_enabled = no` is deliberate: the guest hotline is on by default, and
-turning it off means only configured phones can register.
+`hotline_enabled = no` is explicit rather than required: it is already the
+default, and it states that only configured phones may register.
 
 ### Phones behind NAT
 
@@ -1064,8 +1092,10 @@ context = from-sccp
 ```
 
 Replace the split certificate and key with a single `tls_combined_pem` if your
-PEM file holds both. This build serves only the clear listener; the TLS policy
-is validated and retained for it.
+PEM file holds both. The combined form excludes `tls_trust_store`, so drop that
+line from the example above as well; keeping it rejects the file. This build
+serves only the clear listener; the TLS policy is validated and retained for
+it.
 
 ### Templates and a shared line
 

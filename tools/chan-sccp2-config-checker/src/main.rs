@@ -221,16 +221,28 @@ mod tests {
     fn examples() -> Vec<Example> {
         let mut examples = Vec::new();
         let mut open: Option<(usize, &str)> = None;
+        let mut foreign_fence = false;
         let mut body = String::new();
         for (number, text) in REFERENCE.lines().enumerate() {
+            let fence = text.trim_end().strip_prefix("```");
+            if foreign_fence {
+                foreign_fence = !matches!(fence, Some(""));
+                continue;
+            }
             match open {
                 None => {
-                    if let Some(info) = text.strip_prefix("```ini") {
-                        open = Some((number + 1, info.trim()));
-                        body.clear();
+                    match fence {
+                        Some(info) if info.starts_with("ini") => {
+                            open = Some((number + 1, info["ini".len()..].trim()));
+                            body.clear();
+                        }
+                        // Another language's block must not be scanned for ini
+                        // fences, and its closing fence must not close ours.
+                        Some(info) if !info.is_empty() => foreign_fence = true,
+                        _ => {}
                     }
                 }
-                Some((line, info)) if text == "```" => {
+                Some((line, info)) if matches!(fence, Some("")) => {
                     let kind = match info {
                         "" => Kind::Complete,
                         "rejected" => Kind::Rejected,
@@ -258,6 +270,22 @@ mod tests {
         examples
     }
 
+    /// One example line with any trailing comment removed, as the parser reads
+    /// it. Scanning the raw text instead would fold a comment into a section
+    /// name or a button's line number, and a `;` inside a quoted value — which
+    /// the reference does use — is not a comment.
+    fn significant(text: &str) -> &str {
+        let mut quoted = false;
+        for (index, character) in text.char_indices() {
+            match character {
+                '"' => quoted = !quoted,
+                ';' if !quoted => return text[..index].trim(),
+                _ => {}
+            }
+        }
+        text.trim()
+    }
+
     /// Line names a fragment declares, so the completed file can assign them.
     ///
     /// A section is a line when it says so or when it inherits from a template
@@ -271,10 +299,15 @@ mod tests {
         }
 
         let mut sections: Vec<Section> = Vec::new();
-        for text in body.lines() {
-            let text = text.trim();
+        for (number, text) in body.lines().enumerate() {
+            let text = significant(text);
             if let Some(rest) = text.strip_prefix('[') {
-                let (name, suffix) = rest.split_once(']').expect("section header closes");
+                let (name, suffix) = rest.split_once(']').unwrap_or_else(|| {
+                    panic!(
+                        "example line {}: section header {text:?} does not close",
+                        number + 1
+                    )
+                });
                 let suffix = suffix.trim().trim_start_matches('(').trim_end_matches(')');
                 let entries: Vec<_> = suffix
                     .split(',')
@@ -291,7 +324,9 @@ mod tests {
                         .collect(),
                     line: false,
                 });
-            } else if text.replace(' ', "") == "type=line"
+            } else if text
+                .replace([' ', '\t'], "")
+                .eq_ignore_ascii_case("type=line")
                 && let Some(section) = sections.last_mut()
             {
                 section.line = true;
@@ -321,7 +356,7 @@ mod tests {
     fn referenced_lines(body: &str) -> Vec<String> {
         let mut names = Vec::new();
         for text in body.lines() {
-            let text = text.trim();
+            let text = significant(text);
             let Some((key, value)) = text.split_once('=') else {
                 continue;
             };
@@ -342,65 +377,89 @@ mod tests {
         names
     }
 
+    /// The minimal parts a fragment has to be wrapped in to become a file the
+    /// parser accepts. Naming them once keeps every scope's completion in step
+    /// with the parser's requirements.
+    const GENERAL: &str = "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n";
+    const DEVICE: &str = "[SEPAAAABBBBCCCC]\ntype = device\n";
+    const SPARE_LINE_NAME: &str = "9000";
+
+    fn line_section(name: &str) -> String {
+        format!("[{name}]\ntype = line\ncontext = from-sccp\n")
+    }
+
     fn complete(example: &Example) -> String {
-        let Kind::Fragment(scope) = &example.kind else {
-            return example.body.clone();
-        };
         let body = &example.body;
+        let spare_button = format!("button = line, {SPARE_LINE_NAME}\n");
+        let spare_line = line_section(SPARE_LINE_NAME);
+        let scope = match &example.kind {
+            Kind::Complete => return body.clone(),
+            // A rejected example shows one mistake, so it is given the device
+            // and line the parser also requires; otherwise missing scaffolding
+            // would satisfy the rejection whatever the example says.
+            Kind::Rejected => {
+                return if declared_lines(body).is_empty() {
+                    format!("{body}{DEVICE}{spare_button}{spare_line}")
+                } else {
+                    body.clone()
+                };
+            }
+            Kind::Fragment(scope) => scope,
+        };
         match scope {
-            Scope::General => format!(
-                "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n{body}\n\
-                 [SEPAAAABBBBCCCC]\ntype = device\nbutton = line, 9000\n\
-                 [9000]\ntype = line\ncontext = from-sccp\n"
-            ),
+            Scope::General => {
+                format!("{GENERAL}{body}\n{DEVICE}{spare_button}{spare_line}")
+            }
             Scope::Device => {
+                // The fragment's own buttons name lines that must exist, and
+                // the spare line is only added when the fragment did not
+                // already reference it.
                 let sections: String = referenced_lines(body)
                     .iter()
-                    .map(|name| format!("[{name}]\ntype = line\ncontext = from-sccp\n"))
+                    .filter(|name| *name != SPARE_LINE_NAME)
+                    .map(|name| line_section(name))
                     .collect();
-                format!(
-                    "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n\
-                     [SEPAAAABBBBCCCC]\ntype = device\nbutton = line, 9000\n{body}\n\
-                     [9000]\ntype = line\ncontext = from-sccp\n{sections}"
-                )
+                format!("{GENERAL}{DEVICE}{spare_button}{body}\n{spare_line}{sections}")
             }
-            Scope::Line => format!(
-                "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n\
-                 [SEPAAAABBBBCCCC]\ntype = device\nbutton = line, 9000\n\
-                 [9000]\ntype = line\ncontext = from-sccp\n{body}\n"
-            ),
+            Scope::Line => {
+                format!("{GENERAL}{DEVICE}{spare_button}{spare_line}{body}\n")
+            }
             Scope::Sections => {
+                // A sections fragment supplies its own lines; only when it
+                // declares none does the device need the spare one.
                 let declared = declared_lines(body);
-                let assigned = if declared.is_empty() {
-                    vec!["9000".to_owned()]
+                let (assigned, spare) = if declared.is_empty() {
+                    (vec![SPARE_LINE_NAME.to_owned()], spare_line.as_str())
                 } else {
-                    declared
+                    (declared, "")
                 };
                 let buttons: String = assigned
                     .iter()
                     .map(|name| format!("button = line, {name}\n"))
                     .collect();
-                let spare = if assigned == ["9000"] {
-                    "[9000]\ntype = line\ncontext = from-sccp\n"
-                } else {
-                    ""
-                };
-                format!(
-                    "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n{body}\n\
-                     [SEPAAAABBBBCCCC]\ntype = device\n{buttons}{spare}"
-                )
+                format!("{GENERAL}{body}\n{DEVICE}{buttons}{spare}")
             }
-            Scope::Directives => format!(
-                "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n\
-                 [SEPAAAABBBBCCCC]\ntype = device\nbutton = line, 9000\n\
-                 [9000]\ntype = line\ncontext = from-sccp\n{body}"
-            ),
+            Scope::Directives => {
+                format!("{GENERAL}{DEVICE}{spare_button}{spare_line}{body}")
+            }
         }
     }
 
     #[test]
     fn every_reference_example_matches_the_behavior_it_documents() {
         let examples = examples();
+        // Every fenced ini block is an example, so a fence the scanner fails
+        // to recognize shows up here rather than silently going unchecked.
+        let fenced = REFERENCE
+            .lines()
+            .filter(|text| text.trim_end().starts_with("```ini"))
+            .count();
+        assert_eq!(
+            examples.len(),
+            fenced,
+            "the reference has {fenced} ini blocks but {} were extracted",
+            examples.len()
+        );
         assert!(
             examples.len() >= 20,
             "the reference should keep its worked examples; found {}",

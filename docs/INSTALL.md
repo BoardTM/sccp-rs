@@ -301,7 +301,8 @@ technology followed by the logical line number:
 exten => 1006,1,NoOp(Ringing SCCP front desk)
  same => n,Dial(SCCP/1006,30)
  same => n,ExecIf($["${DIALSTATUS}" = "BUSY"]?Busy(5))
- same => n,Congestion(5)
+ same => n,ExecIf($["${DIALSTATUS}" = "CONGESTION"]?Congestion(5))
+ same => n,ExecIf($["${DIALSTATUS}" = "CHANUNAVAIL"]?Congestion(5))
  same => n,Hangup()
 ```
 
@@ -309,8 +310,11 @@ exten => 1006,1,NoOp(Ringing SCCP front desk)
 destination channel. A bare `Hangup()` at that point clears an SCCP handset
 without presenting a failure reason. The `Busy()`/`Congestion()` branches above
 send Asterisk's terminal indication to the channel first, allowing the handset
-to show and play the corresponding failure state. More complex dialplans can
-branch on every documented `DIALSTATUS` value instead.
+to show and play the corresponding failure state; each one ends the call, so
+only the matching branch runs. Test the specific `DIALSTATUS` value rather than
+falling through to `Congestion()`, which would otherwise play network
+congestion on the caller's handset after an ordinary `NOANSWER`. More complex
+dialplans can branch on every documented `DIALSTATUS` value instead.
 
 When a line appears on several phones, `SCCP/1006` addresses that logical line.
 To select a particular configured appearance, use the device-qualified form:

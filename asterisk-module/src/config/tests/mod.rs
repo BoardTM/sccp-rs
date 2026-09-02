@@ -1,5 +1,7 @@
 use super::*;
 
+mod reference;
+
 const CONFIG: &str = r#"
         [general]
         bind = 0.0.0.0:2000
@@ -3710,4 +3712,3 @@ fn canonical_serialization_is_deterministic_semantic_and_quote_safe() {
     assert!(first.contains("description = \"Desk; west\""));
     ModuleConfig::check_canonical(&first).unwrap();
 }
-mod reference;

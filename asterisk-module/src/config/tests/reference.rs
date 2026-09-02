@@ -14,11 +14,16 @@ use super::*;
 
 const REFERENCE: &str = include_str!("../../../../docs/CONFIGURATION.md");
 
-/// Heading that opens each scope's option tables, and the alias table for it.
+/// Heading that opens each scope's option tables, the alias table for it, and
+/// the schema that scope is held to.
+///
+/// The schema travels with the scope so that adding one cannot silently reuse
+/// another scope's option enum.
 struct Scope {
     label: &'static str,
     options_heading: &'static str,
     aliases_heading: &'static str,
+    spellings: fn() -> Vec<(String, String)>,
 }
 
 const SCOPES: [Scope; 3] = [
@@ -26,16 +31,19 @@ const SCOPES: [Scope; 3] = [
         label: "general",
         options_heading: "## `[general]` options",
         aliases_heading: "### `[general]` aliases",
+        spellings: spellings::<GeneralOption>,
     },
     Scope {
         label: "device",
         options_heading: "## Device options",
         aliases_heading: "### Device aliases",
+        spellings: spellings::<DeviceOption>,
     },
     Scope {
         label: "line",
         options_heading: "## Line options",
         aliases_heading: "### Line aliases",
+        spellings: spellings::<LineOption>,
     },
 ];
 
@@ -51,10 +59,14 @@ fn accepted_names<K: for<'de> Deserialize<'de>>() -> Vec<String> {
         .expect("a name no scope defines must be rejected")
         .to_string();
     let (_, expected) = error
-        .split_once("expected one of ")
+        .split_once("expected ")
         .expect("Serde reports the accepted spellings for an unknown variant");
+    // Serde writes `a`, or `a` or `b`, or one of `a`, `b`, `c` depending on
+    // how many names it has, so accept all three shapes.
+    let expected = expected.strip_prefix("one of ").unwrap_or(expected);
     expected
         .split(',')
+        .flat_map(|part| part.split(" or "))
         .map(|name| name.trim().trim_matches('`').to_owned())
         .filter(|name| !name.is_empty())
         .collect()
@@ -77,21 +89,27 @@ where
         .collect()
 }
 
-/// Text of the reference between `heading` and the next heading of its level.
+/// Text of the reference between `heading` and the next heading of its level
+/// or of any shallower level, so a subsection never runs past its section.
 fn body(heading: &str) -> &'static str {
     let level = heading
         .split(' ')
         .next()
-        .expect("a heading starts with its hashes");
+        .expect("a heading starts with its hashes")
+        .len();
     let start = REFERENCE
         .find(heading)
         .unwrap_or_else(|| panic!("the reference is missing the heading {heading:?}"));
     let rest = &REFERENCE[start + heading.len()..];
-    let terminator = format!("\n{level} ");
-    match rest.find(&terminator) {
-        Some(index) => &rest[..index],
-        None => rest,
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+        if offset > 0 && hashes > 0 && hashes <= level && line[hashes..].starts_with(' ') {
+            return &rest[..offset];
+        }
+        offset += line.len();
     }
+    rest
 }
 
 /// Option names in the first cell of every table row of a documentation body.
@@ -120,17 +138,30 @@ fn vocabulary(heading: &str) -> Vec<String> {
     quoted_terms(paragraph)
 }
 
-/// Every ``literal`` mentioned anywhere in a documentation body.
+/// Every ``literal`` mentioned anywhere in a documentation body, skipping
+/// fenced blocks so example text is never read as inline code.
 fn quoted_terms(body: &str) -> Vec<String> {
     let mut terms = Vec::new();
-    let mut rest = body;
-    while let Some(start) = rest.find('`') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find('`') else {
-            break;
-        };
-        terms.push(rest[..end].to_owned());
-        rest = &rest[end + 1..];
+    let mut fenced = false;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(start) = rest.find('`') {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find('`') else {
+                break;
+            };
+            if end > 0 {
+                terms.push(rest[..end].to_owned());
+            }
+            rest = &rest[end + 1..];
+        }
     }
     terms
 }
@@ -139,11 +170,7 @@ fn quoted_terms(body: &str) -> Vec<String> {
 fn the_reference_documents_every_option_of_every_scope() {
     for scope in &SCOPES {
         let documented = tabulated_names(body(scope.options_heading));
-        let schema: Vec<_> = match scope.label {
-            "general" => spellings::<GeneralOption>(),
-            "device" => spellings::<DeviceOption>(),
-            _ => spellings::<LineOption>(),
-        };
+        let schema = (scope.spellings)();
 
         for (name, canonical) in &schema {
             if name != canonical {
@@ -172,11 +199,7 @@ fn the_reference_documents_every_option_of_every_scope() {
 fn the_reference_lists_every_compatibility_alias() {
     for scope in &SCOPES {
         let table = body(scope.aliases_heading);
-        let schema = match scope.label {
-            "general" => spellings::<GeneralOption>(),
-            "device" => spellings::<DeviceOption>(),
-            _ => spellings::<LineOption>(),
-        };
+        let schema = (scope.spellings)();
 
         let mut documented = Vec::new();
         for line in table.lines().filter(|line| line.trim().starts_with("| `")) {
@@ -284,17 +307,57 @@ fn soft_key_mode_is_accepted(mode: &str) -> bool {
 
 #[test]
 fn the_reference_documents_every_feature_button_and_addon() {
-    for feature in vocabulary("### Feature names") {
+    let features = vocabulary("### Feature names");
+    assert!(!features.is_empty(), "the feature vocabulary is empty");
+    for feature in &features {
         assert!(
-            parse_feature(&feature).is_ok(),
+            parse_feature(feature).is_ok(),
             "the reference lists the feature `{feature}`, which the parser rejects"
         );
     }
-    for addon in vocabulary("### Addon types") {
+    let addons = vocabulary("### Addon types");
+    assert!(!addons.is_empty(), "the addon vocabulary is empty");
+    for addon in &addons {
         assert!(
-            parse_addon_type(&addon).is_ok(),
+            parse_addon_type(addon).is_ok(),
             "the reference lists the addon `{addon}`, which the parser rejects"
         );
+    }
+}
+
+/// Value vocabularies the parser owns but no option table can express.
+///
+/// Each section leads with the accepted spellings, so a name the reference
+/// invents is caught here rather than by an administrator whose whole file is
+/// rejected at load.
+#[test]
+fn the_reference_lists_only_values_the_parser_accepts() {
+    /// Whether the parser accepts one documented value.
+    type Accepts = fn(&str) -> bool;
+
+    let vocabularies: [(&str, Accepts); 4] = [
+        ("### Tones", |value| {
+            parse_tone("documented.tone", value).is_ok()
+        }),
+        ("### Ring types", |value| {
+            parse_ringer_mode("documented.ring", value).is_ok()
+        }),
+        ("### DSCP names", |value| {
+            parse_dscp("documented.dscp", value).is_ok()
+        }),
+        ("### NAT modes", |value| {
+            parse_nat_mode("documented.nat", value).is_ok()
+        }),
+    ];
+    for (heading, accepted) in vocabularies {
+        let documented = vocabulary(heading);
+        assert!(!documented.is_empty(), "{heading:?} lists no values");
+        for value in &documented {
+            assert!(
+                accepted(value),
+                "{heading:?} lists `{value}`, which the parser rejects"
+            );
+        }
     }
 }
 
@@ -314,9 +377,11 @@ fn sample_option_names() -> Vec<String> {
             let line = line.trim().trim_start_matches(';').trim();
             let (key, _) = line.split_once('=')?;
             let key = key.trim();
-            key.chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '_')
-                .then(|| key.to_ascii_lowercase())
+            (!key.is_empty()
+                && key
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_'))
+            .then(|| key.to_ascii_lowercase())
         })
         .collect()
 }
@@ -420,14 +485,20 @@ fn every_reference_link_reaches_the_section_it_names() {
                 break;
             };
             let target = &rest[open + 3..open + 3 + target_end];
-            if let Some(text_start) = text_start {
-                let text = &rest[text_start..open];
-                let (_, heading) = anchors
-                    .iter()
-                    .find(|(anchor, _)| anchor == target)
-                    .unwrap_or_else(|| {
-                        panic!("line {}: [{text}](#{target}) names no heading", number + 1)
-                    });
+            let text = text_start.map(|text_start| &rest[text_start..open]);
+            let (_, heading) = anchors
+                .iter()
+                .find(|(anchor, _)| anchor == target)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "line {}: [{}](#{target}) names no heading",
+                        number + 1,
+                        text.unwrap_or("…")
+                    )
+                });
+            // A link whose text wrapped onto this line cannot be compared
+            // against the heading, but its anchor still had to resolve.
+            if let Some(text) = text {
                 assert_eq!(
                     heading_slug(text),
                     heading_slug(heading),
@@ -435,11 +506,18 @@ fn every_reference_link_reaches_the_section_it_names() {
                      link text does not name",
                     number + 1
                 );
-                checked += 1;
             }
+            checked += 1;
             rest = &rest[open + 3 + target_end..];
         }
     }
+    // Pinning the count to the anchors actually written keeps a link the scan
+    // fails to recognize from passing as one it deliberately skipped.
+    assert_eq!(
+        checked,
+        REFERENCE.matches("](#").count(),
+        "the reference has anchor links this scan did not reach"
+    );
     assert!(
         checked >= 10,
         "the reference should cross-link its sections; checked {checked}"

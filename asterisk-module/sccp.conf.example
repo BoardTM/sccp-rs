@@ -222,7 +222,10 @@ allow_overlap = no
 force_dtmf_mode = auto
 direct_media = no
 early_media = yes
-audio_encryption = off
+; Uncomment to pin this template's SRTP policy. While it stays commented, every
+; device built from the template follows the `[general]` value; setting it here
+; overrides `[general]` for all of them.
+; audio_encryption = off
 ; Text encoding used for legacy display messages on older handsets.
 phone_code_page = ISO8859-1
 ; Device codec restrictions remain accepted for compatibility. Omitted policy
@@ -251,7 +254,9 @@ meetmenum = 700
 meetmeopts = Mac
 adhoc_number =
 video_mode = auto
-audio_encryption = off
+; Uncomment to pin this template's SRTP policy. While it stays commented, every
+; line built from the template follows the `[general]` value.
+; audio_encryption = off
 echocancel = yes
 silencesuppression = no
 ; Optional example restriction:

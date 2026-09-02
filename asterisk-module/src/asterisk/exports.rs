@@ -556,22 +556,24 @@ pub unsafe fn request_channel(
             .collect::<Vec<_>>()
     });
     let bindings = access.inbound_line_bindings(dial_request.target());
-    let ring_enabled = bindings
-        .iter()
-        .filter(|binding| binding.appearance.ring_mode != AppearanceRingMode::Disabled)
-        .count();
-    let eligible_bindings = bindings
-        .iter()
-        .filter(|binding| {
-            binding.appearance.ring_mode != AppearanceRingMode::Disabled
-                && registered.contains(&binding.device_id)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let registered_ring_enabled = eligible_bindings.len();
+    // Tally the stages the eligibility filter rejects at so an unanswered
+    // target can be diagnosed without walking the bindings a second time.
+    let configured_appearances = !bindings.is_empty();
+    let mut ring_enabled_count = 0usize;
+    let mut registered_ring_enabled_count = 0usize;
     let candidates = plan_inbound_bindings(
-        eligible_bindings,
-        |_| true,
+        bindings,
+        |binding| {
+            if binding.appearance.ring_mode == AppearanceRingMode::Disabled {
+                return false;
+            }
+            ring_enabled_count += 1;
+            if !registered.contains(&binding.device_id) {
+                return false;
+            }
+            registered_ring_enabled_count += 1;
+            true
+        },
         || access.phone.reserve_call_id(),
         |binding| {
             let selected = unsafe {
@@ -599,11 +601,11 @@ pub unsafe fn request_channel(
         },
     );
     if candidates.is_empty() {
-        let reason = if bindings.is_empty() {
+        let reason = if !configured_appearances {
             "target has no configured SCCP appearance".to_owned()
-        } else if ring_enabled == 0 {
+        } else if ring_enabled_count == 0 {
             "all configured SCCP appearances have ringing disabled".to_owned()
-        } else if registered_ring_enabled == 0 {
+        } else if registered_ring_enabled_count == 0 {
             "no ring-enabled SCCP appearance is registered".to_owned()
         } else {
             format!(
