@@ -186,6 +186,258 @@ mod tests {
 
     const SAMPLE: &str = include_str!("../../../asterisk-module/sccp.conf.example");
     const DEPLOYMENT_SAMPLE: &str = include_str!("../../../docs/sccp-example-config.conf");
+    const REFERENCE: &str = include_str!("../../../docs/CONFIGURATION.md");
+
+    /// One example extracted from a fenced block in the configuration reference.
+    ///
+    /// The fence info string declares how the block must be validated, because a
+    /// reference documents settings in isolation as well as whole files.
+    struct Example {
+        line: usize,
+        kind: Kind,
+        body: String,
+    }
+
+    enum Kind {
+        /// A complete `sccp.conf` that must parse and already be canonical.
+        Complete,
+        /// A deliberate mistake whose rejection is the point of the example.
+        Rejected,
+        /// Settings belonging inside the named scope of an otherwise minimal file.
+        Fragment(Scope),
+    }
+
+    enum Scope {
+        General,
+        Device,
+        Line,
+        /// Whole sections, completed with a general section and any missing
+        /// device or line the parser requires.
+        Sections,
+        /// Preprocessor directives, which name files that do not exist here.
+        Directives,
+    }
+
+    fn examples() -> Vec<Example> {
+        let mut examples = Vec::new();
+        let mut open: Option<(usize, &str)> = None;
+        let mut body = String::new();
+        for (number, text) in REFERENCE.lines().enumerate() {
+            match open {
+                None => {
+                    if let Some(info) = text.strip_prefix("```ini") {
+                        open = Some((number + 1, info.trim()));
+                        body.clear();
+                    }
+                }
+                Some((line, info)) if text == "```" => {
+                    let kind = match info {
+                        "" => Kind::Complete,
+                        "rejected" => Kind::Rejected,
+                        "fragment=general" => Kind::Fragment(Scope::General),
+                        "fragment=device" => Kind::Fragment(Scope::Device),
+                        "fragment=line" => Kind::Fragment(Scope::Line),
+                        "fragment=sections" => Kind::Fragment(Scope::Sections),
+                        "fragment=directives" => Kind::Fragment(Scope::Directives),
+                        other => panic!("line {line}: unknown ini fence info {other:?}"),
+                    };
+                    examples.push(Example {
+                        line,
+                        kind,
+                        body: body.clone(),
+                    });
+                    open = None;
+                }
+                Some(_) => {
+                    body.push_str(text);
+                    body.push('\n');
+                }
+            }
+        }
+        assert!(open.is_none(), "unterminated ini block in the reference");
+        examples
+    }
+
+    /// Line names a fragment declares, so the completed file can assign them.
+    ///
+    /// A section is a line when it says so or when it inherits from a template
+    /// that does, which is the shape the template examples use.
+    fn declared_lines(body: &str) -> Vec<String> {
+        struct Section {
+            name: String,
+            template: bool,
+            parents: Vec<String>,
+            line: bool,
+        }
+
+        let mut sections: Vec<Section> = Vec::new();
+        for text in body.lines() {
+            let text = text.trim();
+            if let Some(rest) = text.strip_prefix('[') {
+                let (name, suffix) = rest.split_once(']').expect("section header closes");
+                let suffix = suffix.trim().trim_start_matches('(').trim_end_matches(')');
+                let entries: Vec<_> = suffix
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .collect();
+                sections.push(Section {
+                    name: name.to_owned(),
+                    template: entries.contains(&"!"),
+                    parents: entries
+                        .iter()
+                        .filter(|entry| **entry != "!")
+                        .map(|entry| (*entry).to_owned())
+                        .collect(),
+                    line: false,
+                });
+            } else if text.replace(' ', "") == "type=line"
+                && let Some(section) = sections.last_mut()
+            {
+                section.line = true;
+            }
+        }
+
+        let templates: Vec<_> = sections
+            .iter()
+            .filter(|section| section.template && section.line)
+            .map(|section| section.name.clone())
+            .collect();
+        sections
+            .iter()
+            .filter(|section| {
+                !section.template
+                    && (section.line
+                        || section
+                            .parents
+                            .iter()
+                            .any(|parent| templates.contains(parent)))
+            })
+            .map(|section| section.name.clone())
+            .collect()
+    }
+
+    /// Line names a device fragment puts on a button, so they can be defined.
+    fn referenced_lines(body: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for text in body.lines() {
+            let text = text.trim();
+            let Some((key, value)) = text.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            let name = match key.trim() {
+                "line" => value.split(',').next().unwrap_or_default(),
+                "button" => match value.split(',').map(str::trim).collect::<Vec<_>>()[..] {
+                    ["line", name, ..] => name,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let name = name.trim();
+            if !name.is_empty() && !names.iter().any(|known| known == name) {
+                names.push(name.to_owned());
+            }
+        }
+        names
+    }
+
+    fn complete(example: &Example) -> String {
+        let Kind::Fragment(scope) = &example.kind else {
+            return example.body.clone();
+        };
+        let body = &example.body;
+        match scope {
+            Scope::General => format!(
+                "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n{body}\n\
+                 [SEPAAAABBBBCCCC]\ntype = device\nbutton = line, 9000\n\
+                 [9000]\ntype = line\ncontext = from-sccp\n"
+            ),
+            Scope::Device => {
+                let sections: String = referenced_lines(body)
+                    .iter()
+                    .map(|name| format!("[{name}]\ntype = line\ncontext = from-sccp\n"))
+                    .collect();
+                format!(
+                    "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n\
+                     [SEPAAAABBBBCCCC]\ntype = device\nbutton = line, 9000\n{body}\n\
+                     [9000]\ntype = line\ncontext = from-sccp\n{sections}"
+                )
+            }
+            Scope::Line => format!(
+                "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n\
+                 [SEPAAAABBBBCCCC]\ntype = device\nbutton = line, 9000\n\
+                 [9000]\ntype = line\ncontext = from-sccp\n{body}\n"
+            ),
+            Scope::Sections => {
+                let declared = declared_lines(body);
+                let assigned = if declared.is_empty() {
+                    vec!["9000".to_owned()]
+                } else {
+                    declared
+                };
+                let buttons: String = assigned
+                    .iter()
+                    .map(|name| format!("button = line, {name}\n"))
+                    .collect();
+                let spare = if assigned == ["9000"] {
+                    "[9000]\ntype = line\ncontext = from-sccp\n"
+                } else {
+                    ""
+                };
+                format!(
+                    "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n{body}\n\
+                     [SEPAAAABBBBCCCC]\ntype = device\n{buttons}{spare}"
+                )
+            }
+            Scope::Directives => format!(
+                "[general]\nbind = 0.0.0.0:2000\nadvertised_ipv4 = 192.0.2.10\n\
+                 [SEPAAAABBBBCCCC]\ntype = device\nbutton = line, 9000\n\
+                 [9000]\ntype = line\ncontext = from-sccp\n{body}"
+            ),
+        }
+    }
+
+    #[test]
+    fn every_reference_example_matches_the_behavior_it_documents() {
+        let examples = examples();
+        assert!(
+            examples.len() >= 20,
+            "the reference should keep its worked examples; found {}",
+            examples.len()
+        );
+
+        for example in &examples {
+            let line = example.line;
+            if let Kind::Fragment(Scope::Directives) = example.kind {
+                for directive in example.body.lines().filter(|text| !text.trim().is_empty()) {
+                    let directive = directive.trim();
+                    assert!(
+                        directive.starts_with("#include") || directive.starts_with("#tryinclude"),
+                        "line {line}: {directive:?} is not an include directive"
+                    );
+                }
+                continue;
+            }
+
+            let source = complete(example);
+            let outcome = ModuleConfig::parse(&source);
+            match example.kind {
+                Kind::Rejected => assert!(
+                    outcome.is_err(),
+                    "line {line}: example documents a rejection but parsed cleanly"
+                ),
+                _ => {
+                    outcome.unwrap_or_else(|error| {
+                        panic!("line {line}: example is not valid: {error}\n{source}")
+                    });
+                    ModuleConfig::check_canonical(&source).unwrap_or_else(|error| {
+                        panic!("line {line}: example is not canonical: {error}\n{source}")
+                    });
+                }
+            }
+        }
+    }
 
     fn invoke(arguments: &[&str]) -> (u8, String, String) {
         let mut stdout = Vec::new();

@@ -203,8 +203,11 @@ direct_media = no
 Keep `direct_media = no` during initial setup. This keeps RTP anchored through
 Asterisk and makes NAT and firewall problems easier to diagnose. More advanced
 multi-network and NAT installations can use `localnet`, `externip` or
-`externhost`, and related options documented in the more exhaustive
-[`asterisk-module/sccp.conf.example`](../asterisk-module/sccp.conf.example).
+`externhost`. Every option this guide does not cover — its accepted values, its
+default, and its compatibility aliases — is documented in the
+[configuration reference](CONFIGURATION.md), and the annotated
+[`asterisk-module/sccp.conf.example`](../asterisk-module/sccp.conf.example)
+shows them all in place.
 
 The standalone checker accepts the same ordered, repeated-key configuration
 dialect as the module:

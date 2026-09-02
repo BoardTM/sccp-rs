@@ -20,6 +20,10 @@ on:
       - ".github/workflows/asterisk-distro-compatibility.yml"
       - "!**/*.md"
       - "!**/LICENSE*"
+      # Re-included after the Markdown exclusion: the configuration reference
+      # is held to the parser schema by tests in this workflow, so editing it
+      # must run them.
+      - "docs/CONFIGURATION.md"
   pull_request:
     paths:
       - "asterisk-module/**"
@@ -35,6 +39,10 @@ on:
       - ".github/workflows/asterisk-distro-compatibility.yml"
       - "!**/*.md"
       - "!**/LICENSE*"
+      # Re-included after the Markdown exclusion: the configuration reference
+      # is held to the parser schema by tests in this workflow, so editing it
+      # must run them.
+      - "docs/CONFIGURATION.md"
 
 jobs:
   realtime:

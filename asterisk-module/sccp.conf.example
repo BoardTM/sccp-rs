@@ -1,6 +1,8 @@
 ; This sample uses one canonical spelling for each supported semantic option.
-; Accepted compatibility aliases are documented in README.md instead of being
-; duplicated here, because aliases for one setting may not be combined.
+; Options that are alternative spellings of one setting appear as commented
+; alternatives, because the two forms may not be combined. The complete option
+; reference, including every accepted compatibility alias, is in
+; docs/CONFIGURATION.md.
 [general]
 ; Set to sorcery when concrete devices and lines are managed through Asterisk's
 ; dynamic configuration API. General policy and templates remain in this file.
@@ -9,15 +11,21 @@ configuration_source = file
 ; this file. A failed query or invalid merged candidate leaves the live
 ; configuration unchanged. No SQL schemas are bundled; these are Asterisk
 ; realtime family names supplied by the deployment.
-; devicetable = sccp_devices
-; linetable = sccp_lines
-; `bind = 0.0.0.0:2000` is the equivalent compact clear-listener form.
+; device_table = sccp_devices
+; line_table = sccp_lines
+; `bind` is the equivalent compact clear-listener form and may not be combined
+; with the split pair below.
+; bind = 0.0.0.0:2000
 bind_address = 0.0.0.0
 port = 2000
 ; Addresses placed in media and server responses. At least one family must be
 ; reachable by the phones. Use `none` to clear one family explicitly.
 advertised_ipv4 = 192.0.2.10
 advertised_ipv6 = 2001:db8::10
+; `advertised_address` is the single-family form of the two names above. It
+; sets whichever family it names, clears the other, and may not be combined
+; with them.
+; advertised_address = 192.0.2.10
 ; Ordered general ACL and the networks considered local for NAT selection.
 ; NAT/address selection is active. ACL admission, QoS socket marking, and
 ; per-device transport enforcement are validated policy but not runtime yet.
@@ -27,10 +35,16 @@ permit = 2001:db8:100::/64
 localnet = internal
 localnet = 2001:db8:100::/64
 ; Use either externip or externhost. externrefresh is valid only for a host.
+; externip = 198.51.100.10
 externhost = pbx.example.test
 externrefresh = 60
 nat = auto
-; Signaling/audio/video DSCP are 0..63 or a standard name; COS is 0..7.
+; Signaling/audio/video DSCP are 0..63 or a standard name; COS is 0..7. The
+; `*_tos` names below are the legacy byte form of the same three settings and
+; may not be combined with their DSCP counterparts.
+; sccp_tos = 0x60
+; audio_tos = 0xb8
+; video_tos = 0x88
 sccp_dscp = CS3
 sccp_cos = 4
 audio_dscp = EF
@@ -39,11 +53,16 @@ video_dscp = AF41
 video_cos = 5
 ; TLS policy is validated and retained, but this build currently serves only
 ; the clear listener above. These values are ready for the future TLS listener
-; and may instead use one combined `certfile` containing certificate and key.
+; and may instead use one combined `tls_combined_pem` holding both.
 tls_bind = 0.0.0.0:2443
+; `tls_bind_address` and `tls_port` are the split form of `tls_bind`.
+; tls_bind_address = 0.0.0.0
+; tls_port = 2443
 tls_certificate = /etc/asterisk/tls/server.crt
 tls_private_key = /etc/asterisk/tls/server.key
 tls_trust_store = /etc/asterisk/tls/ca.pem
+; A single PEM holding both certificate and key replaces the three names above.
+; tls_combined_pem = /etc/asterisk/tls/server.pem
 server_name = Asterisk SCCP
 ; Station date/time presentation. `dateformat` uses the validated SCCP template
 ; alphabet; `tzoffset` is whole hours from UTC in the range -14..14.
@@ -61,8 +80,9 @@ secondary_keepalive = 30
 ; Seconds to wait for the first digit and between subsequent digits.
 first_digit_timeout = 10
 digit_timeout = 5
-; Use `interdigit_timeout_ms = 1250` instead of `digit_timeout` when sub-second
-; precision is required; configuring both forms is rejected.
+; Use the millisecond form instead of `digit_timeout` when sub-second precision
+; is required; configuring both forms is rejected.
+; interdigit_timeout_ms = 1250
 digit_timeout_char = #
 record_digit_timeout_char = no
 simulate_enbloc = yes
@@ -103,6 +123,9 @@ hotline_context = from-sccp
 hotline_label = Guest hotline
 direct_media = no
 early_media = yes
+; Default SRTP policy: off, or optional/required followed by one or more
+; profiles. Devices and lines may narrow or widen this.
+audio_encryption = off
 ; Handset audio-processing defaults. Lines may override either setting.
 echocancel = yes
 silencesuppression = no
@@ -116,6 +139,8 @@ jb_implementation = fixed
 ; With no codec directives, each registered phone advertises its mapped audio
 ; formats and Asterisk chooses the best direct or translated path. Use
 ; disallow/allow only when an administrator needs to restrict that set.
+; disallow = all
+; allow = ulaw, alaw, g722
 ; Defaults for destination-based conference dialing. `meetmeopts` is passed to
 ; the selected conference application; `Mac` is suitable for ConfBridge.
 meetme = yes
@@ -154,7 +179,11 @@ permit_host = phone.example.test
 nat = auto
 ; clear, tls, or either. TLS requires complete general TLS credentials.
 transport = either
-; Device QoS values override only the named traffic class.
+; Device QoS values override only the named traffic class. The legacy `*_tos`
+; byte form of each is accepted instead of, never alongside, the DSCP name.
+; sccp_tos = 0x60
+; audio_tos = 0xb8
+; video_tos = 0x88
 sccp_dscp = CS3
 sccp_cos = 4
 audio_dscp = EF
@@ -193,8 +222,14 @@ allow_overlap = no
 force_dtmf_mode = auto
 direct_media = no
 early_media = yes
+audio_encryption = off
+; Text encoding used for legacy display messages on older handsets.
+phone_code_page = ISO8859-1
 ; Device codec restrictions remain accepted for compatibility. Omitted policy
-; leaves this template phone-driven.
+; leaves this template phone-driven. The same disallow/allow pair shown for
+; lines below is accepted here.
+; disallow = all
+; allow = ulaw, alaw, g722
 
 [standard-line](!)
 type = line
@@ -216,6 +251,7 @@ meetmenum = 700
 meetmeopts = Mac
 adhoc_number =
 video_mode = auto
+audio_encryption = off
 echocancel = yes
 silencesuppression = no
 ; Optional example restriction:

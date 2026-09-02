@@ -16,13 +16,17 @@
 //! the feature-gated `reload` module plans transactional application without
 //! weakening parser rules.
 //!
-//! The repository's `sccp.conf.example` uses one canonical spelling for every
-//! supported semantic option. Compatibility aliases are parser inputs, not
-//! additional settings, so mutually exclusive aliases are described in
-//! owning type/field documentation instead of being combined in the sample.
-//! Parser tests load that distributed sample and assert representative values
-//! at general, device, line, button, media, feature, registration, date/time,
-//! and MWI scopes.
+//! The repository's `sccp.conf.example` shows every supported semantic option
+//! in its canonical spelling, as a live setting or, where two names are
+//! mutually exclusive forms of one setting, as a commented alternative. The two
+//! obsolete names that are recognized only to report a migration error are the
+//! exception, since a sample containing either would not load. Compatibility
+//! aliases are parser inputs rather than additional settings and are listed in
+//! `docs/CONFIGURATION.md`, which documents the whole option surface. Tests in
+//! `config::tests::reference` hold both that reference and the sample to this
+//! schema, and parser tests load the distributed sample and assert
+//! representative values at general, device, line, button, media, feature,
+//! registration, date/time, and MWI scopes.
 //!
 //! # Network policy boundary
 //!
@@ -609,66 +613,134 @@ enum GeneralOption {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum LineOption {
+    /// Declares the section as an SCCP line definition.
+    /// Selects line parsing and validation for the section.
     Type,
+    /// Sets the station-facing label for the line.
+    /// Provides the text shown beside a line appearance.
     Label,
+    /// Sets the dialplan context for calls from the line.
+    /// Controls where dialed numbers are resolved.
     Context,
     #[serde(rename = "callerid")]
+    /// Sets the outbound caller identity for the line.
+    /// Supplies the name and number presented to the called party.
     CallerId,
     #[serde(alias = "incominglimit")]
+    /// Sets the concurrent inbound call limit for the line.
+    /// Bounds how many logical PBX calls the line accepts at once.
     IncomingLimit,
+    /// Sets the Asterisk language for calls on the line.
+    /// Overrides the inherited language for prompt selection.
     Language,
     #[serde(rename = "accountcode")]
+    /// Sets the Asterisk account code for calls on the line.
+    /// Provides the billing or CDR identifier for line channels.
     AccountCode,
     #[serde(rename = "setvar")]
+    /// Adds an Asterisk channel variable for calls on the line.
+    /// Applies the name and value after any device variables.
     SetVariable,
+    /// Sets the voicemail mailbox monitored for the line.
+    /// Drives the message-waiting indication shown on the station.
     Mailbox,
     #[serde(alias = "vmnum", alias = "voicemailnumber")]
+    /// Sets the destination dialed by the messages key.
+    /// Provides the number used to reach voicemail from the line.
     VoicemailNumber,
     #[serde(
         alias = "trnsfvm",
         alias = "voicemailtransfer",
         alias = "transfertovoicemail"
     )]
+    /// Sets the destination used to transfer a call to voicemail.
+    /// Provides the target for the transfer-to-voicemail action.
     VoicemailTransfer,
     #[serde(alias = "callgroup")]
+    /// Adds the line to numeric call groups.
+    /// Determines which pickup groups may answer its calls.
     CallGroup,
     #[serde(alias = "pickupgroup")]
+    /// Adds the line to numeric pickup groups.
+    /// Determines which call groups the line may answer.
     PickupGroup,
     #[serde(alias = "namedcallgroup")]
+    /// Adds the line to named call groups.
+    /// Determines which named pickup groups may answer its calls.
     NamedCallGroup,
     #[serde(alias = "namedpickupgroup")]
+    /// Adds the line to named pickup groups.
+    /// Determines which named call groups the line may answer.
     NamedPickupGroup,
     #[serde(alias = "directedpickup")]
+    /// Enables directed pickup of calls ringing on the line.
+    /// Controls whether another station may answer by extension.
     DirectedPickup,
     #[serde(alias = "directedpickupcontext")]
+    /// Sets the context searched for directed pickup.
+    /// Restricts directed pickup to extensions in that context.
     DirectedPickupContext,
     #[serde(alias = "pickupmodeanswer", alias = "directedpickupmodeanswer")]
+    /// Controls whether a picked-up call is answered directly.
+    /// Selects between answering immediately and presenting the call.
     PickupModeAnswer,
     #[serde(rename = "parkinglot")]
+    /// Selects the parking lot used by the line.
+    /// Controls where calls parked from this line are held.
     ParkingLot,
     #[serde(rename = "meetme")]
+    /// Enables conference dialing on the line.
+    /// Controls whether the line may invoke the conference application.
     ConferenceEnabled,
     #[serde(rename = "meetmenum")]
+    /// Sets the conference destination dialed for the line.
+    /// Supplies the room number passed to the conference application.
     ConferenceNumber,
     #[serde(rename = "meetmeopts")]
+    /// Sets options passed to the conference application.
+    /// Overrides the inherited conference behavior for this line.
     ConferenceOptions,
     #[serde(alias = "adhocnumber")]
+    /// Sets the hotline destination dialed for the line.
+    /// Routes an off-hook appearance straight to that destination.
     AdhocNumber,
+    /// Sets the tone played when the line goes off hook.
+    /// Controls the audible prompt before digits are collected.
     InitialDialtoneTone,
+    /// Sets the dialed prefix that switches the dial tone.
+    /// Starts the secondary tone on an exact prefix match.
     SecondaryDialtoneDigits,
+    /// Sets the tone played after the secondary prefix matches.
+    /// Signals that an outside or special route was selected.
     SecondaryDialtoneTone,
+    /// Sets the mobility login PIN for the line.
+    /// Authorizes mobility login from another registered station.
     Pin,
     #[serde(rename = "regexten")]
+    /// Sets the extensions created when the line registers.
+    /// Controls which registration contexts gain an extension.
     RegistrationExtension,
+    /// Adds codecs to the allowed media set for the line.
+    /// Extends the codec policy inherited from the device and general settings.
     Allow,
+    /// Removes codecs from the allowed media set for the line.
+    /// Restricts the codec policy inherited from the device and general settings.
     Disallow,
     #[serde(alias = "videomode")]
+    /// Sets how video is negotiated on the line.
+    /// Controls whether video channels open automatically or on request.
     VideoMode,
     #[serde(alias = "audioencryption")]
+    /// Sets the audio-encryption policy for the line.
+    /// Controls whether line audio channels negotiate encrypted media.
     AudioEncryption,
     #[serde(rename = "echocancel")]
+    /// Sets the station echo-cancellation mode for the line.
+    /// Overrides the inherited behavior when opening audio channels.
     EchoCancel,
     #[serde(rename = "silencesuppression")]
+    /// Sets the silence-suppression mode for the line.
+    /// Controls voice-activity transmission on line audio streams.
     SilenceSuppression,
 }
 

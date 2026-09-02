@@ -114,6 +114,9 @@ A physical recording button is not required for the soft key or AMI action.
 Without a physical button, however, there is no off-call arming control or
 device-wide recording lamp.
 
+The soft-key modes and button syntax used above are documented in full in the
+[configuration reference](CONFIGURATION.md).
+
 After editing `sccp.conf`, validate and reload it:
 
 ```sh

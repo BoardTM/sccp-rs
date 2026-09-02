@@ -40,7 +40,9 @@ connected = hold, end_call, transfer
 
 `configuration_source` defaults to `file`. In file mode, device and line
 sections continue to come from `sccp.conf`. In Sorcery mode, device and line
-sections in that file are not a second source of truth.
+sections in that file are not a second source of truth. The `[general]` and
+soft-key-profile options that remain in the file are documented in the
+[configuration reference](CONFIGURATION.md).
 
 The module defaults both object types to Asterisk's writable AstDB Sorcery
 wizard with the prefix `chan_sccp2`. An explicit equivalent mapping in

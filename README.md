@@ -39,7 +39,7 @@ You can find the latest [pre-compiled release](https://github.com/coral/sccp-rs/
 ./asterisk-module/build-linux-x86_64.sh 23
 ```
 
-The local artifact is written to `dist/chan_sccp2-asterisk-linux-x86_64-v<module-version>.so`. Published releases contain versioned normal and opt-in debug telemetry modules for both architectures. Install the selected artifact in Asterisk's module directory as `chan_sccp2.so`, copy `asterisk-module/sccp.conf.example` ( or [copy it from here](https://github.com/coral/sccp-rs/blob/master/asterisk-module/sccp.conf.example)) to Asterisk's configuration directory as `sccp.conf`, and edit the example device and line definitions for your phones.
+The local artifact is written to `dist/chan_sccp2-asterisk-linux-x86_64-v<module-version>.so`. Published releases contain versioned normal and opt-in debug telemetry modules for both architectures. Install the selected artifact in Asterisk's module directory as `chan_sccp2.so`, copy `asterisk-module/sccp.conf.example` ( or [copy it from here](https://github.com/coral/sccp-rs/blob/master/asterisk-module/sccp.conf.example)) to Asterisk's configuration directory as `sccp.conf`, and edit the example device and line definitions for your phones. Every option, its accepted values, its default, and its compatibility aliases are documented in the [configuration reference](docs/CONFIGURATION.md).
 
 *Why is there only one .so file? Doesn't Asterisk modules normally need to be compiled for each distribution and exact Asterisk build?*
 

@@ -3709,3 +3709,4 @@ fn canonical_serialization_is_deterministic_semantic_and_quote_safe() {
     assert!(first.contains("description = \"Desk; west\""));
     ModuleConfig::check_canonical(&first).unwrap();
 }
+mod reference;
