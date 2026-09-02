@@ -2410,6 +2410,7 @@ fn auto_answer_hotline_and_media_defaults_are_normalized() {
 
     assert_eq!(config.auto_answer(), &AutoAnswerConfig::default());
     assert_eq!(config.guest_hotline(), &GuestHotlineConfig::default());
+    assert!(!config.guest_hotline().enabled);
     assert_eq!(config.general.jitter_buffer, JitterBufferConfig::default());
     assert_eq!(
         config.hotline_for_line("1001"),
@@ -2704,9 +2705,9 @@ fn rejects_invalid_auto_answer_and_hotline_ranges() {
         "remotehangup_tone = teleport".to_owned(),
         "remotehangup_tone = Zip\nremotehangup_tone = ZipZip".to_owned(),
         "hotline_enabled = perhaps".to_owned(),
-        "hotline_extension =".to_owned(),
-        "hotline_context =".to_owned(),
-        "hotline_label =".to_owned(),
+        "hotline_enabled = yes\nhotline_extension =".to_owned(),
+        "hotline_enabled = yes\nhotline_context =".to_owned(),
+        "hotline_enabled = yes\nhotline_label =".to_owned(),
         format!(
             "hotline_extension = {}",
             "1".repeat(MAX_HOTLINE_FIELD_BYTES + 1)

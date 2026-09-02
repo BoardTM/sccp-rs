@@ -555,12 +555,23 @@ pub unsafe fn request_channel(
             .map(|(device_id, _)| device_id.clone())
             .collect::<Vec<_>>()
     });
-    let candidates = plan_inbound_bindings(
-        access.inbound_line_bindings(dial_request.target()),
-        |binding| {
+    let bindings = access.inbound_line_bindings(dial_request.target());
+    let ring_enabled = bindings
+        .iter()
+        .filter(|binding| binding.appearance.ring_mode != AppearanceRingMode::Disabled)
+        .count();
+    let eligible_bindings = bindings
+        .iter()
+        .filter(|binding| {
             binding.appearance.ring_mode != AppearanceRingMode::Disabled
                 && registered.contains(&binding.device_id)
-        },
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let registered_ring_enabled = eligible_bindings.len();
+    let candidates = plan_inbound_bindings(
+        eligible_bindings,
+        |_| true,
         || access.phone.reserve_call_id(),
         |binding| {
             let selected = unsafe {
@@ -588,11 +599,22 @@ pub unsafe fn request_channel(
         },
     );
     if candidates.is_empty() {
+        let reason = if bindings.is_empty() {
+            "target has no configured SCCP appearance".to_owned()
+        } else if ring_enabled == 0 {
+            "all configured SCCP appearances have ringing disabled".to_owned()
+        } else if registered_ring_enabled == 0 {
+            "no ring-enabled SCCP appearance is registered".to_owned()
+        } else {
+            format!(
+                "no registered ring-enabled SCCP appearance supports a configured station codec for requested formats {request_formats:?}"
+            )
+        };
         ast_log(
             LogLevel::Warning,
             &format!(
-                "unable to offer inbound SCCP target {}: no registered ring-enabled appearance supports a configured station codec for requested formats {request_formats:?}",
-                dial_request.target()
+                "unable to offer inbound SCCP target {}: {reason}",
+                dial_request.target(),
             ),
         );
         return Err(ChannelRequestError {
