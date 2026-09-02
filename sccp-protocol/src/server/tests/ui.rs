@@ -78,6 +78,85 @@ fn every_call_state_and_soft_key_has_an_explicit_availability_result() {
     }
 }
 
+#[tokio::test]
+async fn terminal_failure_states_reach_the_handset_with_a_visible_prompt() {
+    let config = ServerConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        advertised_address: Ipv4Addr::LOCALHOST,
+        ..ServerConfig::default()
+    };
+    let (server, handle, mut events) = Server::bind(config, [definition()]).await.unwrap();
+    let address = server.local_addr().unwrap();
+    let task = tokio::spawn(server.run());
+    let mut phone = TcpStream::connect(address).await.unwrap();
+    let mut decoder = FrameDecoder::new();
+    let protocol = ProtocolVersion::V22;
+    let device_id = DeviceId::new("SEP001122334455").unwrap();
+
+    phone.write_all(&register_bytes(protocol)).await.unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::CAPABILITIES_REQ).await;
+    assert!(matches!(
+        events.recv().await,
+        Some(Event::Device(DeviceEvent {
+            event: DeviceEventKind::Registered(_),
+            ..
+        }))
+    ));
+
+    let call_id = CallId(77);
+    handle
+        .send_confirmed(Command::new(
+            device_id.clone(),
+            CommandAction::BeginCall {
+                line_instance: LineInstance(1),
+                call_id,
+                codec: Codec::Pcmu,
+            },
+        ))
+        .await
+        .unwrap();
+    read_until_message(&mut phone, &mut decoder, wire_id::SELECT_SOFT_KEYS).await;
+
+    for (state, expected_prompt) in [
+        (CallState::Busy, "Busy"),
+        (CallState::Congestion, "Network congestion"),
+        (CallState::InvalidNumber, "Unknown number"),
+    ] {
+        handle
+            .send_confirmed(Command::new(
+                device_id.clone(),
+                CommandAction::SetCallState { call_id, state },
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_message(
+            &mut phone,
+            &mut decoder,
+            wire_id::DISPLAY_DYNAMIC_PROMPT_STATUS,
+        )
+        .await;
+        assert!(frames.iter().any(|frame| matches!(
+            ServerMessage::decode(frame.clone(), protocol),
+            Ok(ServerMessage::CallState {
+                state: actual,
+                call_reference,
+                ..
+            }) if actual == state && call_reference == 77
+        )));
+        assert!(frames.iter().any(|frame| matches!(
+            ServerMessage::decode(frame.clone(), protocol),
+            Ok(ServerMessage::DisplayPrompt {
+                ref text,
+                call_reference,
+                ..
+            }) if text == expected_prompt && call_reference == 77
+        )));
+    }
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
 #[test]
 fn do_not_disturb_defaults_to_off() {
     assert_eq!(DoNotDisturbMode::default(), DoNotDisturbMode::Off);

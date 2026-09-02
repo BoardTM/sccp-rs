@@ -203,7 +203,7 @@ impl Default for AutoAnswerConfig {
 impl Default for GuestHotlineConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             extension: Some(
                 HotlineDestination::new("111").expect("built-in guest-hotline extension is valid"),
             ),
