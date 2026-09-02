@@ -302,6 +302,9 @@ the audio and video pairs.
 | `autoanswer_ring_time` | seconds | `1` | Alerting delay before an auto-answer call connects |
 | `autoanswer_tone` | tone | `Zip` | Tone warning that a call answered automatically |
 
+The two auto-answer settings apply only to calls the dialplan asks to answer
+automatically; see [Auto-answer and intercom](#auto-answer-and-intercom).
+
 `dateformat` is at most seven bytes. It must contain `D`, `M` and either `Y` or
 `YY` exactly once each, separated by two characters drawn from `/`, `.`, `-` or
 space, and may end with `A` to select 12-hour presentation. `tzoffset` is whole
@@ -899,6 +902,70 @@ credential — names containing `password`, `passwd`, `secret`, `token`,
 `authorization` or `credential` are rejected. A value is nonempty and at most
 1024 bytes. A section may set at most 32 variables totalling 8192 bytes, and
 names must be unique within the section. Values are redacted from diagnostics.
+
+## Auto-answer and intercom
+
+Auto-answer is a property of an individual call rather than of a line or a
+device, so it is requested from the dialplan and has no `sccp.conf` setting that
+turns it on permanently. Two `[general]` options shape it once it is requested:
+`autoanswer_ring_time` sets how long the call alerts first, and
+`autoanswer_tone` sets the warning played before the media path opens.
+
+### Requesting it
+
+Append the mode to the SCCP dial string:
+
+```text
+SCCP/<line>/aa1w        one way: the handset speaker opens, its microphone stays muted
+SCCP/<line>/aa2w        two way: full duplex, as though the call were answered
+```
+
+`aa=1w` and `aa=2w` are accepted spellings of the same two modes, and the
+option is matched without regard to case. The target is a line name, or
+`<device>/<line>` to reach one specific appearance rather than every device
+that has the line.
+
+An optional final letter sets the cause reported when the target cannot
+auto-answer: `b` for busy, `u` for unavailable, and `c` for congestion.
+
+```text
+exten => 7001,1,Dial(SCCP/1001/aa1wb)
+```
+
+Setting the `AUTO_ANSWER` channel variable on the calling channel does the same
+thing and takes precedence over the dial-string option. It accepts `1way`,
+`1w`, `2way` and `2w`.
+
+```text
+exten => 7001,1,Set(AUTO_ANSWER=2w)
+ same  =>       n,Dial(SCCP/1001)
+```
+
+### Intercom and paging
+
+One-way auto-answer is intercom: the station is placed in its one-way intercom
+call state and the microphone is explicitly disabled, so the caller is heard
+but the called party is not. That makes `aa1w` the mode for paging and
+announcements, and `aa2w` the mode for a two-way intercom.
+
+```text
+; Page one phone
+exten => 7001,1,Dial(SCCP/1001/aa1w)
+
+; Page a group
+exten => 7000,1,Page(SCCP/1001/aa1w&SCCP/1002/aa1w&SCCP/1003/aa1w)
+
+; Two-way intercom to one specific handset
+exten => 7101,1,Dial(SCCP/SEP001122334455/1001/aa2w)
+```
+
+There is no intercom button kind. Give a phone one-touch intercom with a
+speed dial to the dialplan extension that places the call:
+
+```ini fragment=device
+button = speed_dial, Page all, 7000
+button = speed_dial, Intercom reception, 7101
+```
 
 ## Examples
 
