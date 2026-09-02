@@ -394,7 +394,7 @@ The guest hotline is **enabled by default**. A device that is not configured in
 off. Set `hotline_enabled = no` to require every phone to be configured. When it
 is enabled, the extension, context and label must all be present.
 
-### Media
+### Media defaults
 
 | Option | Type / values | Default | Meaning |
 | --- | --- | --- | --- |
@@ -478,7 +478,7 @@ template. `transport = tls` requires complete general TLS credentials.
 `transport` also accepts `tcp` for `clear`, `secure` for `tls`, and `any` for
 `either`.
 
-### Quality of service
+### Quality of service overrides
 
 | Option | Type / values | Default | Meaning |
 | --- | --- | --- | --- |
@@ -529,7 +529,7 @@ normalized to `reject`.
 | `mwi_lamp` | `off` \| `on` \| `wink` \| `flash` \| `blink` | `on` | Message-waiting lamp mode |
 | `mwi_on_call` | boolean | `no` | Keep the indicator visible during a call |
 
-### Parking and conferencing
+### Parking and conference control
 
 | Option | Type / values | Default | Meaning |
 | --- | --- | --- | --- |
@@ -543,7 +543,7 @@ normalized to `reject`.
 | `meetme` | boolean | the general value | Enable destination-based conference dialing |
 | `meetmeopts` | string | the general value | Options passed to the conference application |
 
-### Media
+### Media and DTMF
 
 | Option | Type / values | Default | Meaning |
 | --- | --- | --- | --- |
@@ -555,7 +555,7 @@ normalized to `reject`.
 | `disallow` | codec list, repeatable | — | Remove codecs for this device |
 | `allow_overlap` | boolean | the general value | Overlap dialing for this device |
 
-### Buttons
+### Button assignment
 
 | Option | Type / values | Default | Meaning |
 | --- | --- | --- | --- |
@@ -566,10 +566,10 @@ normalized to `reject`.
 Buttons are provisioned in the order written, and `line` keeps its position
 relative to surrounding `button` entries. `feature_default` addresses feature
 instances, not physical button positions — see
-[Feature button arguments](#feature-button-arguments) for how those are counted.
+[Feature button instances](#feature-button-instances) for how those are counted.
 See [Buttons](#buttons) for the full grammar.
 
-### Rejected options
+### Rejected device options
 
 | Option | Behavior |
 | --- | --- |
@@ -623,7 +623,7 @@ the destinations, `none`, `off`, `disabled` and an empty value all mean unset.
 Numeric groups are a comma-separated list of values `0`–`63` and ascending
 ranges, such as `1, 3-4`. Entries must be unique.
 
-### Parking and conferencing
+### Parking lot and conference destination
 
 | Option | Type / values | Default | Meaning |
 | --- | --- | --- | --- |
@@ -660,7 +660,7 @@ without whitespace, `&` or `@`, and 255 bytes in total. `regexten` requires a
 nonempty general `regcontext`, and the resolved targets must be unique across
 all lines. PINs are redacted from diagnostics.
 
-### Media
+### Media and codecs
 
 | Option | Type / values | Default | Meaning |
 | --- | --- | --- | --- |
@@ -740,6 +740,8 @@ arguments:
   `AlwaysShowMenu` forces the menu even for a single call.
 - A `monitor` button is a recording button rather than an ordinary feature
   button, and takes no argument. See [Call recording](RECORDING.md).
+
+### Feature button instances
 
 `feature_default` sets the initial state of a feature button by instance:
 
@@ -933,8 +935,10 @@ exten => 7001,1,Dial(SCCP/1001/aa1wb)
 ```
 
 Setting the `AUTO_ANSWER` channel variable on the calling channel does the same
-thing and takes precedence over the dial-string option. It accepts `1way`,
-`1w`, `2way` and `2w`.
+thing and accepts `1way`, `1w`, `2way` and `2w`. It overrides the mode chosen by
+the dial-string option, but not the cause: a cause letter in the dial string
+survives, so `Dial(SCCP/1001/aa1wb)` from a channel with `AUTO_ANSWER=2w`
+answers two-way and still reports busy when it cannot.
 
 ```text
 exten => 7001,1,Set(AUTO_ANSWER=2w)

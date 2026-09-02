@@ -341,3 +341,107 @@ fn the_distributed_sample_shows_every_option_it_claims_to() {
         }
     }
 }
+
+/// Anchor a Markdown heading resolves to, following GitHub's slug rules.
+///
+/// Punctuation is dropped, spaces become hyphens, and a slug already taken by
+/// an earlier heading gains a numeric suffix. That suffix is why a duplicated
+/// heading silently steals links written against the plain slug.
+fn heading_slug(heading: &str) -> String {
+    heading
+        .replace('`', "")
+        .chars()
+        .filter(|character| character.is_alphanumeric() || matches!(character, ' ' | '-' | '_'))
+        .collect::<String>()
+        .trim()
+        .replace(' ', "-")
+        .to_lowercase()
+}
+
+/// Every heading of the reference outside fenced blocks, as (anchor, heading).
+fn headings() -> Vec<(String, String)> {
+    let mut anchors: Vec<(String, String)> = Vec::new();
+    let mut fenced = false;
+    for line in REFERENCE.lines() {
+        if line.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || !line.starts_with('#') {
+            continue;
+        }
+        let heading = line.trim_start_matches('#').trim();
+        let base = heading_slug(heading);
+        let taken = anchors
+            .iter()
+            .filter(|(_, existing)| heading_slug(existing) == base)
+            .count();
+        let anchor = if taken == 0 {
+            base
+        } else {
+            format!("{base}-{taken}")
+        };
+        anchors.push((anchor, heading.to_owned()));
+    }
+    anchors
+}
+
+#[test]
+fn no_two_reference_headings_claim_the_same_anchor() {
+    let mut bases: Vec<String> = Vec::new();
+    for (_, heading) in headings() {
+        let base = heading_slug(&heading);
+        assert!(
+            !bases.contains(&base),
+            "two headings both slug to `{base}`, so links written against it \
+             reach whichever comes first; rename one"
+        );
+        bases.push(base);
+    }
+}
+
+#[test]
+fn every_reference_link_reaches_the_section_it_names() {
+    let anchors = headings();
+    let mut fenced = false;
+    let mut checked = 0;
+    for (number, line) in REFERENCE.lines().enumerate() {
+        if line.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(open) = rest.find("](#") {
+            let text_start = rest[..open].rfind('[').map(|index| index + 1);
+            let Some(target_end) = rest[open + 3..].find(')') else {
+                break;
+            };
+            let target = &rest[open + 3..open + 3 + target_end];
+            if let Some(text_start) = text_start {
+                let text = &rest[text_start..open];
+                let (_, heading) = anchors
+                    .iter()
+                    .find(|(anchor, _)| anchor == target)
+                    .unwrap_or_else(|| {
+                        panic!("line {}: [{text}](#{target}) names no heading", number + 1)
+                    });
+                assert_eq!(
+                    heading_slug(text),
+                    heading_slug(heading),
+                    "line {}: [{text}](#{target}) reaches {heading:?}, which the \
+                     link text does not name",
+                    number + 1
+                );
+                checked += 1;
+            }
+            rest = &rest[open + 3 + target_end..];
+        }
+    }
+    assert!(
+        checked >= 10,
+        "the reference should cross-link its sections; checked {checked}"
+    );
+}
