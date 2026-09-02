@@ -1390,6 +1390,10 @@ pub fn line_device_state(line: &str) -> DeviceState {
     device_state(&access, line)
 }
 
+pub fn execute_version_cli(fd: c_int) {
+    raw::system::cli_write(fd, concat!(env!("CARGO_PKG_VERSION"), "\n"));
+}
+
 pub fn execute_reload_cli(fd: c_int, arguments: &[String]) {
     let Some(access) = module_access() else {
         return;

@@ -15,8 +15,8 @@
 //!
 //! # Native CLI
 //!
-//! The module registers exactly `sccp show devices`, `sccp show lines`,
-//! `sccp show channels`, `sccp reload`, `sccp reset <device|all>`,
+//! The module registers exactly `sccp version`, `sccp show devices`,
+//! `sccp show lines`, `sccp show channels`, `sccp reload`, `sccp reset <device|all>`,
 //! `sccp restart <device|all>`, bounded DND/message/call controls, and
 //! `sccp set forwarding <device> <line> <all|busy|noanswer>
 //! <destination|off>`. The three show commands provide bounded, deterministic

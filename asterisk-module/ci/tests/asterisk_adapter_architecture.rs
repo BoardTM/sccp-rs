@@ -278,6 +278,7 @@ fn every_rust_defined_c_callback_is_an_actual_asterisk_entrypoint() {
             ("direct/channel_driver.rs", "fixup"),
             ("direct/channel_driver.rs", "device_state"),
             ("direct/channel_driver.rs", "call_completion"),
+            ("direct/cli.rs", "cli_version"),
             ("direct/cli.rs", "cli_reload"),
             ("direct/cli.rs", "cli_forwarding"),
             ("direct/cli.rs", "cli_devices"),

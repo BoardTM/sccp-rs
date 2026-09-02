@@ -20,12 +20,13 @@ use super::super::exports::{
     ControlCliCommand, complete_control_cli, complete_device_control_cli, complete_diagnostic_cli,
     complete_inventory_cli, complete_reload_cli, execute_control_cli, execute_device_control_cli,
     execute_diagnostic_cli, execute_forwarding_cli, execute_inventory_cli, execute_reload_cli,
+    execute_version_cli,
 };
 
 #[cfg(not(feature = "live-asterisk-tests"))]
-const CLI_ENTRY_COUNT: usize = 15;
-#[cfg(feature = "live-asterisk-tests")]
 const CLI_ENTRY_COUNT: usize = 16;
+#[cfg(feature = "live-asterisk-tests")]
+const CLI_ENTRY_COUNT: usize = 17;
 
 static CLI_ENTRIES: StaticDescriptor<[sys::ast_cli_entry; CLI_ENTRY_COUNT]> =
     StaticDescriptor::uninit();
@@ -178,6 +179,49 @@ fn cli_completion(candidate: Option<String>) -> *mut c_char {
         .map_or(ptr::null_mut(), |candidate| {
             crate::asterisk::raw::system::cli_completion(&candidate)
         })
+}
+
+unsafe fn run_version_cli(
+    entry: Option<NonNull<sys::ast_cli_entry>>,
+    phase: CliPhase,
+    arguments: Option<CliArgs<'_>>,
+) -> CliDisposition {
+    match phase {
+        CliPhase::Initialize => {
+            if let Some(mut entry) = entry {
+                unsafe {
+                    entry.as_mut().command = c"sccp version".as_ptr().cast_mut();
+                    entry.as_mut().usage = c"Usage: sccp version\n".as_ptr();
+                }
+            }
+            CliDisposition::Complete
+        }
+        CliPhase::Generate => CliDisposition::Complete,
+        CliPhase::Execute => {
+            let Some(arguments) = arguments else {
+                return CliDisposition::ShowUsage;
+            };
+            let Ok(invocation) = arguments.invocation(2, |count| count == 0, |_| None) else {
+                return CliDisposition::ShowUsage;
+            };
+            execute_version_cli(invocation.fd);
+            CliDisposition::Complete
+        }
+    }
+}
+
+unsafe extern "C" fn cli_version(
+    entry: *mut sys::ast_cli_entry,
+    command: c_int,
+    arguments: *mut sys::ast_cli_args,
+) -> *mut c_char {
+    callback_guard(ptr::null_mut(), || unsafe {
+        cli_disposition_pointer(run_version_cli(
+            NonNull::new(entry),
+            CliPhase::from_raw(command),
+            CliArgs::from_raw(arguments),
+        ))
+    })
 }
 
 unsafe fn run_reload_cli(
@@ -695,6 +739,7 @@ fn cli_entry(
 pub(super) unsafe fn entries() -> NonNull<[sys::ast_cli_entry; CLI_ENTRY_COUNT]> {
     unsafe {
         NonNull::new_unchecked(CLI_ENTRIES.write([
+            cli_entry(b"Show the SCCP module version\0", cli_version),
             cli_entry(b"Show registered SCCP devices\0", cli_devices),
             cli_entry(b"Show configured SCCP lines\0", cli_lines),
             cli_entry(b"Show active SCCP channels\0", cli_channels),

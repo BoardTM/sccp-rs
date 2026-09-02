@@ -442,6 +442,7 @@ anchored through Asterisk, and a known-working dialplan destination.
 Useful runtime commands include:
 
 ```text
+sccp version
 sccp show sessions
 sccp show devices
 sccp show lines
